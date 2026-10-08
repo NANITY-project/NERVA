@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nebula Studio</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,600;1,300;1,400&family=JetBrains+Mono:wght@300;400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/web/style.css">
+<script type="importmap">
+{ "imports": { "three": "/vendor/three/build/three.module.min.js", "three/addons/": "/vendor/three/examples/jsm/" } }
+</script>
+</head>
+<body>
+<div class="grain" aria-hidden="true"></div>
+<div class="glow" aria-hidden="true"></div>
+
+<div class="app">
+  <header class="topbar glass">
+    <div class="brand"><span class="word">Nebula</span><span class="sub">Studio</span></div>
+    <div class="pills">
+      <span class="pill" id="conn"><i class="dot"></i><span id="conn-text">connecting</span></span>
+      <span class="pill" id="mode" title="Which brain drives the characters">mock agent</span>
+      <span class="pill mono" id="simtime">00:00.0</span>
+    </div>
+    <div class="actions">
+      <button class="btn-ghost btn-sm" id="btn-guide">Guide</button>
+      <button class="btn-ghost btn-sm" id="btn-import">Import environment</button>
+      <input type="file" id="file-import" accept=".glb,.gltf,model/gltf-binary,model/gltf+json" hidden>
+      <button class="btn-ghost btn-sm" id="btn-clear">Clear scene</button>
+      <button class="btn-ghost btn-sm" id="btn-settings">Model</button>
+    </div>
+  </header>
+
+  <aside class="left glass">
+    <section>
+      <div class="label-row"><h2>Characters</h2><button class="btn-ghost btn-sm" id="btn-add-char">+</button></div>
+      <ul class="list" id="chars-list"></ul>
+    </section>
+    <section>
+      <div class="label-row"><h2>Props</h2><button class="btn-ghost btn-sm" id="btn-add-prop">+</button></div>
+      <ul class="list" id="props-list"></ul>
+    </section>
+  </aside>
+
+  <main class="stage">
+    <canvas id="viewport"></canvas>
+    <div id="labels"></div>
+    <div id="viewport-note" class="note" hidden>3D viewport unavailable (WebGL?). Everything else still works.</div>
+    <div id="empty-state" class="empty-state" hidden>
+      <h3>An empty stage</h3>
+      <p>Add a character, import an environment, or open the Guide for a walkthrough and a demo scene.</p>
+      <div class="row"><button class="btn-submit" id="es-char">Add character</button><button class="btn-ghost" id="es-import">Import environment</button><button class="btn-ghost" id="es-guide">Open Guide</button></div>
+    </div>
+    <div class="hint mono">click select · shift+click ground: walk · alt+click prop: grab · drag: orbit</div>
+    <div id="drop" class="drop" hidden>Drop a .glb to import the environment</div>
+  </main>
+
+  <aside class="right glass">
+    <section id="inspector"><p class="empty">Select a character or prop.</p></section>
+    <section class="logwrap">
+      <h2>Transcript</h2>
+      <div id="log" class="log"></div>
+    </section>
+  </aside>
+
+  <footer class="bottom glass">
+    <div class="timeline">
+      <button class="rec" id="btn-rec" title="Record a take"><i></i><span>Rec</span></button>
+      <span class="mono rec-time" id="rec-indicator" hidden>● recording</span>
+      <select id="takes" aria-label="Takes"><option value="">no takes</option></select>
+      <button class="btn-ghost btn-sm" id="btn-play" disabled>Play</button>
+      <input type="range" id="scrub" min="0" max="0" value="0" disabled>
+      <span class="mono" id="scrub-time">—</span>
+      <button class="btn-ghost btn-sm" id="btn-live" disabled>Live</button>
+      <button class="btn-ghost btn-sm" id="btn-export" disabled>Export JSON</button>
+    </div>
+    <div class="director">
+      <select id="director-target" aria-label="Who"><option value="all">Everyone</option></select>
+      <input id="director-text" type="text" maxlength="500" placeholder="Direct the scene — e.g. “give the cup to Bob”" autocomplete="off">
+      <button class="btn-submit" id="btn-direct">Direct</button>
+    </div>
+  </footer>
+</div>
+
+<div class="modal" id="modal" hidden><div class="modal-card glass" id="modal-card"></div></div>
+<div class="toast" id="toast" hidden></div>
+
+<script type="module">
+  import { boot } from '/web/app.js';
+  let createViewport = null, viewportError = '';
+  try { ({ createViewport } = await import('/web/viewport.js')); } catch (e) { viewportError = 'the 3D module failed to load: ' + (e && e.message || e); console.error('viewport unavailable:', e); }
+  window.nebula = await boot({ document, window, fetch: window.fetch.bind(window), EventSource: window.EventSource, createViewport, viewportError });
+</script>
+</body>
+</html>
