@@ -1,5 +1,5 @@
 # Nebula IK engine
-
+(NERVA is Nebula... Naming mixed up as its not in release or for use yet.)
 > **New:** [`studio/`](studio/README.md) — a local studio where language-model characters (driven by your NEON models) act in a scene through this engine,
 > and [`blender/`](blender/) — a Blender add-on that drives a rig with it and bakes keyframes.
 > Both use the same shared library (`make lib`) via the C API in [`capi/`](capi/nebula_capi.h).
