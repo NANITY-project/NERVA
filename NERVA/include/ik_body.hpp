@@ -120,6 +120,13 @@ public:
     // ------------------------------------------------------------------ world
     void add_surface(float x0, float x1, float z0, float z1, float y) { surfaces_.push_back({std::min(x0, x1), std::max(x0, x1), std::min(z0, z1), std::max(z0, z1), y}); }
     void clear_surfaces() { surfaces_.clear(); }
+    // Highest surface under (x,z) that a foot standing at height `ref_y` could be on: tops above ref_y + max_step_up are NOT floors
+    // (a window top far above you is something to walk under/in front of, not ground that snaps your foot up to it).
+    float surface_at(float x, float z, float ref_y) const {
+        float y = 0.f, lim = ref_y + params.max_step_up * params.scale + 1e-3f;
+        for (const auto& s : surfaces_) if (s.y <= lim && x >= s.x0 && x <= s.x1 && z >= s.z0 && z <= s.z1) y = std::max(y, s.y);
+        return y;
+    }
     float surface_at(float x, float z) const {
         float y = 0.f;
         for (const auto& s : surfaces_) if (x >= s.x0 && x <= s.x1 && z >= s.z0 && z <= s.z1) y = std::max(y, s.y);
@@ -386,7 +393,7 @@ private:
         for (int s = 0; s < 2; ++s) {
             Foot& f = feet_[s]; Vec3 l = body_detail::lft(yaw_);
             f.sole = Vec3(pelvis_.x, 0, pelvis_.z) + l * (sg(s) * D.hip_w); f.yaw = yaw_; f.pitch = 0; f.toe = 0;
-            f.surface = surface_at(f.sole.x, f.sole.z); f.sole.y = f.surface; f.state = FootState::Planted;
+            f.surface = surface_at(f.sole.x, f.sole.z, std::max(feet_[0].surface, feet_[1].surface)); f.sole.y = f.surface; f.state = FootState::Planted;
         }
         pelvis_.y = std::max(feet_[0].surface, feet_[1].surface) + D.ankle_h + 0.985f * (D.thigh + D.shin); pvel_ = Vec3();
         com_init_ = false;
@@ -401,7 +408,7 @@ private:
         float stride = std::hypot(c.target.x - sup.sole.x, c.target.z - sup.sole.z), maxs = params.max_stride * params.scale;
         if (stride > maxs) { std::snprintf(b, sizeof b, "%s foot step rejected: step too long (%.2f m from the support foot, max %.2f m)", side_name(c.side).c_str(), stride, maxs); why = b; return false; }
         if (stride < 0.07f * params.scale) { std::snprintf(b, sizeof b, "%s foot step rejected: target is %.0f cm from the other foot (feet would collide)", side_name(c.side).c_str(), stride * 100.f); why = b; return false; }
-        float s = surface_at(c.target.x, c.target.z); end = c.target; planted = true; surf = s;
+        float s = surface_at(c.target.x, c.target.z, sup.surface); end = c.target; planted = true; surf = s;
         if (end.y < s - 1e-3f) { event(side_name(c.side) + " foot target was below the surface: raised to it"); end.y = s; }
         if (end.y <= s + 0.02f) {
             end.y = s;
@@ -475,7 +482,7 @@ private:
                 continue;
             }
             f.sole = f.traj.position(f.traj.t);
-            f.sole.y = std::max(f.sole.y, surface_at(f.sole.x, f.sole.z));          // never through a surface
+            f.sole.y = std::max(f.sole.y, surface_at(f.sole.x, f.sole.z, feet_[1 - s].surface));          // never through a surface
             f.yaw = f.yaw0 + (f.yaw1 - f.yaw0) * minimum_jerk_s(tau);
             f.pitch = body_detail::swing_pitch(tau); f.toe = std::max(0.f, -f.pitch) * 0.8f;
         }
