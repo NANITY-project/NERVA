@@ -23,7 +23,7 @@ make overlay-test                              # unit checks (ASan+UBSan) + inte
 Commands are held until the surface knows the real output size; closing stdin does not stop the overlay (SIGTERM / `QUIT` does).
 
 ## What the model writes and reads
-`docs/ACTIONS.md` is the **action language** (`<click>838 351</click>`, `<find>save</find>`, `<hand>right 0.3 1.2 0.4</hand>`, ...), the observation format, the prompts, the behaviour table and the training-data format. `tools/nerva_actions.py` parses, validates (`lint`), compiles and renders it, and `Session` runs a model turn against a real overlay to record true observations. `tools/examples/episodes.jsonl` has 9 episodes recorded from the real thing.
+[`docs/ACTIONS.md`](../docs/ACTIONS.md) is the **action language** (`<click>838 351</click>`, `<find>save</find>`, `<hand>right 0.3 1.2 0.4</hand>`, ...), the observation format, the prompts, the behaviour table and the training-data format. `tools/nerva_actions.py` parses, validates (`lint`), compiles and renders it, and `Session` runs a model turn against a real overlay to record true observations. `tools/examples/episodes.jsonl` has 9 episodes recorded from the real thing.
 
 ## The AI pointer (off by default)
 `--mouse` enables it, and even then **nothing works until you grant one window**. The model cannot grant: grants come only from the control

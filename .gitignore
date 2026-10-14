@@ -1,0 +1,21 @@
+# build output
+build/
+ik_demo
+ik_bench
+ik_quality
+ik_body_test
+ik_demo_san
+ik_body_san
+overlay/build/
+renderer/build/
+*.o
+*.so
+# python
+__pycache__/
+*.pyc
+# node (studio UI tests)
+node_modules/
+# local run output
+rollouts.jsonl
+neon_bridge.log
+*.log

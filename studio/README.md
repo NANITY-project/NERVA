@@ -33,7 +33,9 @@ says which one is driving. Command line equivalents: `--neon-bin PATH`, `--neon-
 
 How Studio talks to NEON (read from `NEON-3.cpp`): one subprocess, JSON per line on stdin
 (`{"messages":[...],"max_tokens":N,"temperature":T,"top_p":P}`), `{"token":...}` lines back, then `{"done":true}`;
-ready when stderr prints `[Mode] Interactive stdin/stdout loop — ready.` NEON serves one request at a time, so
+ready when stderr prints `[Mode] Interactive stdin/stdout loop — ready.` **Chat template.** NEON's `messages` input is rendered with a `<|system|>...<|end|><|user|>...<|end|><|assistant|>` template (read from `NEON-3.cpp`),
+**not ChatML**. Models trained or converted for ChatML (SmolLM2, Qwen-style) will see the wrong format through `messages`; for those, send a raw
+`{"prompt": ...}` instead, as [`nerva_bridge.py`](../nerva_bridge.py) does. NEON serves one request at a time, so
 characters thinking together are queued. Prompts are budgeted against the model's real context length (oldest history
 dropped first; if even the minimum doesn't fit, the transcript says so and names the numbers). NEON takes no grammar, so
 that option is ignored for it.

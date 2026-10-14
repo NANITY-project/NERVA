@@ -1,16 +1,14 @@
-# Nebula IK engine
+# Nebula IK engine (reference)
 
-> **New:** [`studio/`](studio/README.md) — a local studio where language-model characters (driven by your NEON models) act in a scene through this engine,
-> and [`blender/`](blender/) — a Blender add-on that drives a rig with it and bakes keyframes.
-> Both use the same shared library (`make lib`) via the C API in [`capi/`](capi/nebula_capi.h).
-
+The engine half of NERVA: header-only C++17 IK, no dependencies. See the [top-level README](../README.md) for the whole project.
 
 From-scratch C++17 IK animation engine. Header-only, no dependencies (no glm,
 no Eigen). Built to be driven by a model through a one-line text protocol.
 
 ```
-make            # builds ik_demo (tests), ik_bench, ik_quality
+make            # builds ik_demo (tests), ik_bench, ik_quality, ik_body_test and build/libnebula.so
 make test       # 37 checks, non-zero exit on failure
+make body-test  # 148 checks for the full-body layer (docs/BODY.md)
 make bench      # speed
 make sanitize   # tests under ASan + UBSan
 NATIVE=0 make   # portable binary instead of -march=native
@@ -25,9 +23,11 @@ NATIVE=0 make   # portable binary instead of -march=native
 | `include/ik_solver_analytic.hpp` | closed-form 2-bone IK (law of cosines), elbow angle limits |
 | `include/ik_solver_fabrik.hpp` | FABRIK for longer chains, with per-joint cone limits |
 | `include/ik_engine.hpp` | `IKEngine`: named/ID chains, task-space motion, text protocol |
-| `src/main.cpp` | test suite + usage examples |
+| `include/ik_body.hpp` | full humanoid: feet, balance, arms, head, text protocol (see [BODY.md](BODY.md)) |
+| `capi/` | C API (`libnebula.so`) used by Studio and the Blender add-on |
+| `src/main.cpp`, `src/body_test.cpp` | engine test suite + usage examples, full-body tests |
 | `src/bench.cpp`, `src/quality.cpp` | speed benchmark, realism metrics |
-| `renderer/` | Vulkan bootstrap (separate; see `renderer/README.md`) |
+| `../renderer/` | Vulkan bootstrap (separate; see `renderer/README.md`) |
 
 ## How motion works
 

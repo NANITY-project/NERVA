@@ -3,7 +3,7 @@
 This is the foundation of the embodiment renderer: instance -> physical
 device -> logical device -> an offscreen render target -> a graphics
 pipeline -> a real draw call -> readback. Deliberately separate from the
-NEON inference runtime (which doesn't support Vulkan yet) -- this has no
+NEON inference runtime (whose own Vulkan compute backend is a separate, experimental effort) -- this has no
 dependency on it and never will need one; the model talks to the IK
 engine via the text command protocol, the IK engine's joint rotations
 feed the renderer, and none of that requires NEON to know Vulkan exists.

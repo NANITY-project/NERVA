@@ -66,6 +66,19 @@ blender-test: lib
 	./blender/build_addon.sh
 	blender -b --factory-startup --python blender/test_addon.py
 
-test-all: test body-test studio-test blender-test
+# --- Overlay (Wayland / Hyprland desktop overlay) -------------------------------
+# Needs g++, make, wayland + wayland-protocols; its integration tests also want sway, grim, dbus, python3-gobject, at-spi2-core.
+overlay:
+	$(MAKE) -C overlay
 
-.PHONY: all test bench sanitize clean lib studio studio-test blender-test test-all body-test
+overlay-test:
+	$(MAKE) -C overlay test
+
+# Validates the action language docs/examples (no Wayland needed).
+actions-test:
+	python3 overlay/tests/test_actions.py
+	python3 overlay/tools/nerva_actions.py lint overlay/tools/examples/episodes.jsonl
+
+test-all: test body-test studio-test blender-test overlay-test
+
+.PHONY: all test bench sanitize clean lib studio studio-test blender-test test-all body-test overlay overlay-test actions-test
