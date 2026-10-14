@@ -83,7 +83,7 @@ class NeonClient:
         return RuntimeError("neon %s (exit code %s). Last lines of its log (%s):\n%s"
                             % (why, code, self.log_path, self.tail()))
 
-    def complete(self, prompt, max_tokens=160, temperature=0.2, top_p=0.9):
+    def complete(self, prompt, max_tokens=160, temperature=0.7, top_p=0.9):
         req = {"prompt": prompt, "max_tokens": max_tokens, "temperature": temperature, "top_p": top_p}
         try:
             self.p.stdin.write((json.dumps(req) + "\n").encode("utf-8"))
@@ -168,6 +168,79 @@ class OverlaySession:
             self.s.close()
         except Exception:
             pass
+
+
+class EmbodiedSession:
+    """Wraps a session so the character visibly takes part while the model works. The model's language is unchanged:
+    before a turn that points the pointer at a pixel (<click>, <move>, <scroll px py n>) the HARNESS makes the body look at that
+    spot and stretch its right hand toward it (the engine clamps to the arm's reach and says so). With walk=True it first
+    walks to the right so it stands under the target when it can. These prelude motions are not recorded in the episode:
+    the training data stays exactly what the model wrote and what the overlay answered."""
+    SHOULDER = (-0.18, 1.40)        # right shoulder (x, y) relative to the pelvis column, measured from the engine's reach messages
+    REACH = 0.55                    # the arm reaches 0.56 m; aim just inside it
+    POINT_TAGS = ("click", "move", "scroll")
+
+    def __init__(self, inner, walk=False, step=0.45, step_wait=2.0, max_steps=8, log=None):
+        self.inner, self.walk, self.step, self.step_wait, self.max_steps, self.log = inner, walk, step, step_wait, max_steps, log
+        self.human_only = inner.human_only
+
+    def state(self): return self.inner.state()
+    def lint(self, turn): return self.inner.lint(turn)
+    def close(self): self.inner.close()
+
+    def _say(self, msg):
+        if self.log: self.log("  [embody] " + msg)
+
+    def _target(self, turn):
+        for name, args in ACTION_RE.findall(turn):
+            if name not in self.POINT_TAGS: continue
+            v = args.split()
+            if len(v) >= 2 and all(re.fullmatch(r"-?\d+", x) for x in v[:2]): return int(v[0]), int(v[1])
+        return None
+
+    def _ask(self, turn):
+        obs, probs, _ = self.inner.run(turn)
+        return None if probs else obs
+
+    def _pelvis_z(self):
+        obs = self._ask("<status></status>")
+        m = re.search(r"pelvis \(([-\d.]+), ([-\d.]+), ([-\d.]+)\)", obs or "")
+        return float(m.group(3)) if m else None
+
+    def _walk_to(self, z_goal):
+        z = self._pelvis_z()
+        if z is None or z_goal - z < 0.3: return             # no turn-around yet: only walks to the right
+        for n in range(self.max_steps):
+            obs = self._ask("<status></status>") or ""
+            feet = dict((side, float(zz)) for side, zz in re.findall(r"(left|right) \([-\d.]+, [-\d.]+, ([-\d.]+)\) planted", obs))
+            if len(feet) < 2: return
+            trail = min(feet, key=feet.get); lead = max(feet.values())
+            nz = min(lead + self.step, z_goal)
+            if nz <= feet[trail] + 0.05: return
+            x = 0.10 if trail == "left" else -0.10
+            r = self._ask("<foot>%s %.2f 0.00 %.2f</foot><wait>%.1f</wait>" % (trail, x, nz, self.step_wait))
+            if r is None or "<r>1 err" in r: self._say("walk stopped: %s" % (r or "refused").replace("\n", " ")[:120]); return
+        self._say("walked %d steps" % self.max_steps)
+
+    def run(self, turn):
+        if not self.lint(turn):
+            try:
+                t = self._target(turn)
+                if t:
+                    m = re.search(r"z=([-\d.]+) y=([-\d.]+)", self._ask("<px2w>%d %d</px2w>" % t) or "")
+                    if m:
+                        tz, ty = float(m.group(1)), float(m.group(2))
+                        if self.walk: self._walk_to(tz)
+                        pz = self._pelvis_z() or 0.0
+                        sx, sy, sz = self.SHOULDER[0], self.SHOULDER[1], pz
+                        dy, dz = ty - sy, tz - sz
+                        n = max(1e-6, (dy * dy + dz * dz) ** 0.5)
+                        hx, hy, hz = sx, sy + self.REACH * dy / n, sz + self.REACH * dz / n
+                        self._ask("<look>0 %.2f %.2f</look><hand>right %.2f %.2f %.2f</hand><wait>1.2</wait>" % (ty, tz, hx, hy, hz))
+                        self._say("looked and pointed toward pixel %d,%d (z=%.2f y=%.2f)" % (t[0], t[1], tz, ty))
+            except Exception as e:                           # embodiment is decoration: it must never break the model's turn
+                self._say("skipped: %s" % e)
+        return self.inner.run(turn)
 
 
 class MockSession:
@@ -258,7 +331,7 @@ def probe(neon, system, bos_is_im_start=True, out=print):
 
 
 # ----------------------------------------------------------------------------- one episode
-def run_episode(neon, session, task, system, fewshot, max_turns=12, max_tokens=160, temperature=0.2,
+def run_episode(neon, session, task, system, fewshot, max_turns=12, max_tokens=160, temperature=0.7,
                 top_p=0.9, bos_is_im_start=True, ep_id="rollout", model_name="", verbose=False):
     start = session.state()
     messages = list(fewshot) + [("user", "<task>%s</task>\n%s" % (task, start))]
@@ -309,9 +382,11 @@ def main(argv=None):
     ap.add_argument("--session-args", default="--a11y --mouse --pointer dry-run", help="args after the overlay binary")
     ap.add_argument("--overlay-bin", help="path to the nerva-overlay binary (a real path, not a placeholder)")
     ap.add_argument("--mock-session", action="store_true", help="use the built-in mock instead of the real overlay")
+    ap.add_argument("--embody", action="store_true", help="the character looks at and points toward every pixel the model targets (needs the real overlay)")
+    ap.add_argument("--walk", action="store_true", help="with --embody: also walk right to stand under the target first (slow: 0.31 m/s)")
     ap.add_argument("--max-turns", type=int, default=12)
     ap.add_argument("--max-tokens", type=int, default=160)
-    ap.add_argument("--temperature", type=float, default=0.2)
+    ap.add_argument("--temperature", type=float, default=0.7, help="0.2 gives junk on some NEON builds (see --probe); keep 0.7 until the sampler is fixed")
     ap.add_argument("--top-p", type=float, default=0.9)
     ap.add_argument("--no-bos-im-start", action="store_true", help="the tokenizer's BOS is NOT <|im_start|>")
     ap.add_argument("--verbose", action="store_true", help="print every model turn and observation")
@@ -353,6 +428,8 @@ def main(argv=None):
     try:
         for n, task in enumerate(a.task, 1):
             session = MockSession() if a.mock_session else OverlaySession(a.overlay_tools, [a.overlay_bin] + shlex.split(a.session_args))
+            if a.embody and not a.mock_session:
+                session = EmbodiedSession(session, walk=a.walk, log=print if a.verbose else None)
             try:
                 ep = run_episode(neon, session, task, system, fewshot, a.max_turns, a.max_tokens, a.temperature,
                                  a.top_p, not a.no_bos_im_start, "rollout-%03d" % n,
