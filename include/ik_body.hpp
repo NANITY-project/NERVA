@@ -15,6 +15,9 @@
 //   PELVIS x y z | auto                  hip target;  FACE x z | auto   pelvis facing
 //   LOOK x y z | auto                    head look target;  TORSO x y z | auto   neck-base target
 //   GRIP <left|right> 0..1               finger curl;  STAND   recover from a fall;  BALANCE assist|none
+//   JUMP  x y z [apex_m]                 push off with both feet and land at (x, y=surface, z); the engine solves the arc.
+//                                        Take-off speed is limited by how far the legs can push: crouch first with PELVIS.
+//                                        While airborne FOOT x y z sets where a foot will land instead of queueing a step.
 #pragma once
 #include <algorithm>
 #include <cmath>
@@ -102,6 +105,9 @@ public:
         float max_step_up = 0.45f, max_step_down = 0.60f;
         float fall_margin = -0.03f, fall_time = 0.30f;
         float shift_settle_speed = 0.04f;   // m/s: how still the pelvis must be over the support foot before the other foot lifts
+        float jump_accel = 10.f;            // m/s^2 net push-off acceleration of the legs (take-off speed = sqrt(2 * accel * push stroke))
+        float ankle_push = 0.06f;           // m of extra stroke from the ankles/toes (so even a standing hop is possible)
+        float max_launch_speed = 3.4f;      // m/s, total take-off speed cap
         float hand_idle_m = 0.0015f;        // tiny hand drift when idle (0 = none, for deterministic tests)
     };
     struct Result { bool ok; std::string msg; };
@@ -179,6 +185,11 @@ public:
             if (t.size() == 4 && num(1, a) && num(2, b) && num(3, c)) { torso_user_ = true; torso_tgt_ = Vec3(a, b, c); return ok("neck-base target set"); }
             return fail("usage: TORSO x y z | auto");
         }
+        if (v == "JUMP") {
+            if ((t.size() != 4 && t.size() != 5) || !num(1, a) || !num(2, b) || !num(3, c)) return fail("usage: JUMP x y z [apex_m]  (land at x, surface height y, z)");
+            bool ha = t.size() == 5; d = 0; if (ha && !(num(4, d) && d >= 0.f)) return fail("apex_m must be a finite number >= 0 (clearance above the higher of take-off and landing height)");
+            return cmd_jump(Vec3(a, b, c), ha, d);
+        }
         if (v == "GRIP") {
             int s = side(1);
             if (s < 0 || t.size() != 3 || !num(2, a)) return fail("usage: GRIP <left|right> 0..1");
@@ -197,7 +208,10 @@ public:
         if (!(dt > 0.f)) return;
         dt = std::min(dt, 0.05f);
         time_ += dt;
-        if (!fallen_) { step_machine(dt); update_feet(dt); update_pelvis(dt); }
+        if (!fallen_) {
+            if (flight_ != Flight::None) update_flight(dt);
+            else { step_machine(dt); update_feet(dt); update_pelvis(dt); }
+        }
         pose_upper(dt, false);
         pose_legs();
         compute_bones();
@@ -219,6 +233,7 @@ public:
     Vec3 hand_target(int s) const { return hands_[s].cmd; }
     bool hand_targeted(int s) const { return hands_[s].target_mode; }
     bool hand_settled(int s) const { return arms_.is_settled(arm_id_[s]); }
+    bool airborne() const { return flight_ == Flight::Air; }          // feet off the ground (the push-off before it still has both feet planted)
     bool stepping() const { return act_.on || !queue_.empty(); }
     int steps_queued() const { return (int)queue_.size() + (act_.on ? 1 : 0); }
     float time() const { return time_; }
@@ -237,7 +252,7 @@ public:
     std::string status_json() {
         std::string j; char b[256];
         auto v3 = [&](Vec3 v) { std::snprintf(b, sizeof b, "[%.3f,%.3f,%.3f]", v.x, v.y, v.z); return std::string(b); };
-        std::snprintf(b, sizeof b, "{\"t\":%.2f,\"state\":\"%s\",\"balance\":\"%s\",\"margin_cm\":%.1f,", time_, fallen_ ? "fallen" : "standing", params.balance == Balance::Assist ? "assist" : "none", std::max(margin_, -999.f) * 100.f);
+        std::snprintf(b, sizeof b, "{\"t\":%.2f,\"state\":\"%s\",\"balance\":\"%s\",\"margin_cm\":%.1f,", time_, fallen_ ? "fallen" : flight_ == Flight::Air ? "airborne" : "standing", params.balance == Balance::Assist ? "assist" : "none", std::max(margin_, -999.f) * 100.f);
         j += b; j += "\"pelvis\":" + v3(pelvis_) + ",\"com\":" + v3(com_) + ",";
         std::snprintf(b, sizeof b, "\"yaw_deg\":%.1f,\"steps_queued\":%d,", yaw_ * 180.f / PI, steps_queued()); j += b;
         j += "\"feet\":{";
@@ -288,6 +303,9 @@ private:
     std::vector<Surface> surfaces_;
     std::deque<StepCmd> queue_; Active act_;
     bool fallen_ = false; float unstable_t_ = 0.f, time_ = 0.f;
+    enum class Flight { None, Push, Air } flight_ = Flight::None;
+    Vec3 fl_v_, fl_prev_free_; float fl_y0_ = 0.f, fl_push_t_ = 0.f, fl_push_T_ = 0.f, fl_air_t_ = 0.f;
+    bool fl_has_tgt_[2] = {false, false}; body_detail::V2 fl_tgt_[2]; bool fl_has_yaw_[2] = {false, false}; float fl_yaw_[2] = {0.f, 0.f};
     Vec3 com_; body_detail::V2 com_off_, vcom_, xcom_; float margin_ = 0.f; bool com_init_ = false; Vec3 com_prev_;
     std::vector<body_detail::V2> support_;
     std::vector<BoneOut> bones_; std::vector<std::string> names_; std::vector<float> mass_; std::vector<std::string> events_;
@@ -382,6 +400,10 @@ private:
 
     Result cmd_foot(int s, Vec3 target, bool has_yaw, float yaw) {
         if (fallen_) return fail("FOOT rejected: the body has fallen; STAND first");
+        if (flight_ != Flight::None) {
+            fl_has_tgt_[s] = true; fl_tgt_[s] = {target.x, target.z}; fl_has_yaw_[s] = has_yaw; fl_yaw_[s] = yaw;
+            char b[140]; std::snprintf(b, sizeof b, "%s foot will land near (%.2f, %.2f) if the leg can reach it", side_name(s).c_str(), target.x, target.z); return ok(b);
+        }
         if (queue_.size() >= 8) return fail("FOOT rejected: 8 steps are already queued");
         if (std::hypot(target.x - pelvis_.x, target.z - pelvis_.z) > 3.f) return fail("FOOT rejected: target is more than 3 m from the body; step toward it in stages");
         queue_.push_back({s, target, has_yaw, yaw});
@@ -389,7 +411,7 @@ private:
     }
 
     Result stand() {
-        fallen_ = false; unstable_t_ = 0.f; queue_.clear(); act_.on = false; pelvis_user_ = false;
+        fallen_ = false; unstable_t_ = 0.f; queue_.clear(); act_.on = false; pelvis_user_ = false; flight_ = Flight::None; fl_has_tgt_[0] = fl_has_tgt_[1] = false;
         for (int s = 0; s < 2; ++s) {
             Foot& f = feet_[s]; Vec3 l = body_detail::lft(yaw_);
             f.sole = Vec3(pelvis_.x, 0, pelvis_.z) + l * (sg(s) * D.hip_w); f.yaw = yaw_; f.pitch = 0; f.toe = 0;
@@ -401,10 +423,160 @@ private:
         return ok("standing");
     }
 
+    // ------------------------------------------------------------------ jumping (coordinates in, physics out)
+    // The model says WHERE to land; the engine solves the ballistic arc and refuses what the legs cannot do. There is no jump clip:
+    // the legs push through a stroke (the crouch the caller set with PELVIS + an ankle push), the body then flies on a parabola, and the
+    // feet meet whatever surface is under them. A landing the balance model cannot hold ends in a fall (BALANCE none shows this plainly).
+    float surface_below(float x, float z, float ref_y) const {                 // highest surface whose top is at or just under ref_y
+        float y = 0.f;
+        const float tol = 0.06f * params.scale;               // a foot that arrives within 6 cm of a top lands on it (edge scrape)
+        for (const auto& s : surfaces_) if (s.y <= ref_y + tol && x >= s.x0 && x <= s.x1 && z >= s.z0 && z <= s.z1) y = std::max(y, s.y);
+        return y;
+    }
+    struct JumpPlan { bool ok; std::string why; float stroke, vy, T, vmax_y; Vec3 v; float y_launch, y_land; };
+    JumpPlan plan_jump(Vec3 tgt, bool has_apex, float clear) const {
+        JumpPlan P{}; char b[320];
+        float L = D.thigh + D.shin, sc = params.scale;
+        float surf0 = 0.5f * (feet_[0].surface + feet_[1].surface);
+        float y_ext = surf0 + D.ankle_h + 0.985f * L, y0 = pelvis_.y;
+        P.y_launch = y_ext + params.ankle_push * sc;
+        P.stroke = std::max(0.02f, P.y_launch - y0);
+        P.vmax_y = std::sqrt(2.f * params.jump_accel * P.stroke);
+        float land_s = surface_below(tgt.x, tgt.z, tgt.y);
+        P.y_land = land_s + D.ankle_h + 0.985f * L;
+        const float g = 9.81f;
+        float dxh = tgt.x - pelvis_.x, dzh = tgt.z - pelvis_.z, dh = std::hypot(dxh, dzh);
+        float base = std::max(P.y_launch, P.y_land), clr = clear;
+        if (!has_apex) {                                   // default arc: about 45 degrees (the cheapest in take-off speed), as high as the legs can give
+            float avail = P.y_launch + 0.5f * P.vmax_y * P.vmax_y / g - base;     // clearance the stroke can pay for
+            clr = std::min(std::max(0.10f * sc, dh / 4.f), avail);
+            if (clr < 0.005f) {
+                std::snprintf(b, sizeof b, "JUMP rejected: the legs cannot lift the body to that landing height: a %.0f cm push stroke reaches %.2f m for the pelvis, the landing needs %.2f m (crouch deeper with PELVIS)", P.stroke * 100.f, P.y_launch + 0.5f * P.vmax_y * P.vmax_y / g, base); P.why = b; return P;
+            }
+        }
+        float apex = base + clr;
+        P.vy = std::sqrt(2.f * g * std::max(0.f, apex - P.y_launch));
+        float tu = P.vy / g, td = std::sqrt(2.f * std::max(0.f, apex - P.y_land) / g); P.T = tu + td;
+        float dx = tgt.x - pelvis_.x, dz = tgt.z - pelvis_.z;
+        P.v = Vec3(P.T > 1e-4f ? dx / P.T : 0.f, P.vy, P.T > 1e-4f ? dz / P.T : 0.f);
+        float sp = std::sqrt(P.v.x * P.v.x + P.v.y * P.v.y + P.v.z * P.v.z), vh = std::hypot(P.v.x, P.v.z);
+        P.ok = false;
+        if (P.vy > P.vmax_y + 1e-4f) {
+            std::snprintf(b, sizeof b, "JUMP rejected: that landing needs %.2f m/s upward take-off but a %.0f cm push stroke gives at most %.2f m/s (crouch deeper with PELVIS to push through a longer stroke, or lower the apex)", P.vy, P.stroke * 100.f, P.vmax_y); P.why = b; return P;
+        }
+        if (sp > params.max_launch_speed + 1e-4f) {
+            float lo = 0.f, hi = 1.f;                                         // how far along the same direction can it go?
+            for (int i = 0; i < 20; ++i) { float k = 0.5f * (lo + hi); float vx = P.v.x * k, vz = P.v.z * k; if (std::sqrt(vx * vx + P.v.y * P.v.y + vz * vz) <= params.max_launch_speed) lo = k; else hi = k; }
+            std::snprintf(b, sizeof b, "JUMP rejected: %.2f m horizontally in %.2f s needs a %.2f m/s take-off, the legs give at most %.2f m/s; about %.2f m is reachable in that direction", std::hypot(dx, dz), P.T, sp, params.max_launch_speed, lo * std::hypot(dx, dz)); P.why = b; return P;
+        }
+        (void)vh; P.ok = true; return P;
+    }
+
+    Result cmd_jump(Vec3 tgt, bool has_apex, float clear) {
+        if (fallen_) return fail("JUMP rejected: the body has fallen; STAND first");
+        if (flight_ != Flight::None) return fail("JUMP rejected: already in the air");
+        if (stepping()) return fail("JUMP rejected: finish the queued steps first (steps are still queued or moving)");
+        if (feet_[0].state != FootState::Planted || feet_[1].state != FootState::Planted) return fail("JUMP rejected: both feet must be on the ground to push off");
+        if (std::hypot(tgt.x - pelvis_.x, tgt.z - pelvis_.z) > 4.f) return fail("JUMP rejected: target is more than 4 m away");
+        JumpPlan P = plan_jump(tgt, has_apex, clear);
+        if (!P.ok) return fail(P.why);
+        flight_ = Flight::Push; fl_v_ = P.v; fl_y0_ = pelvis_.y; fl_push_t_ = 0.f; fl_push_T_ = std::max(0.05f, 2.f * P.stroke / std::max(P.vy, 0.5f));
+        fl_has_tgt_[0] = fl_has_tgt_[1] = false; queue_.clear(); act_.on = false;
+        char b[220]; std::snprintf(b, sizeof b, "jumping: push-off %.0f cm over %.2f s, take-off %.2f m/s up and %.2f m/s forward, in the air about %.2f s",
+                                   P.stroke * 100.f, fl_push_T_, P.vy, std::hypot(P.v.x, P.v.z), P.T);
+        return ok(b);
+    }
+
+    void update_flight(float dt) {
+        using namespace body_detail;
+        const float g = 9.81f, L = D.thigh + D.shin;
+        pelvis_prev_ = pelvis_;
+        float want_yaw = face_user_ ? std::atan2(face_pt_.x - pelvis_.x, face_pt_.z - pelvis_.z) : yaw_;
+        yaw_ += clampf(wrap(want_yaw - yaw_), -3.f * dt, 3.f * dt);
+        if (flight_ == Flight::Push) {
+            fl_push_t_ += dt; float tau = std::min(fl_push_t_, fl_push_T_);
+            float a = fl_v_.y / fl_push_T_;
+            pelvis_.y = fl_y0_ + 0.5f * a * tau * tau; pvel_ = Vec3(0, a * tau, 0);
+            clamp_push_reach();
+            if (fl_push_t_ >= fl_push_T_) {
+                flight_ = Flight::Air; fl_air_t_ = 0.f; pvel_ = fl_v_;
+                for (int s = 0; s < 2; ++s) feet_[s].state = FootState::Air;
+                fl_prev_free_ = Vec3(0, pelvis_.y - D.ankle_h - 0.985f * L, 0);
+                event("airborne");
+            }
+            return;
+        }
+        fl_air_t_ += dt;
+        fl_v_.y -= g * dt; pelvis_ += fl_v_ * dt; pvel_ = fl_v_;
+        float free_y = pelvis_.y - D.ankle_h - 0.985f * L;
+        collide_walls(std::max(free_y, fl_prev_free_.y));
+        for (int s = 0; s < 2; ++s) {
+            Foot& f = feet_[s];
+            V2 fx = air_foot_xz(s); f.sole.x = fx.x; f.sole.z = fx.z;
+            if (fl_has_yaw_[s]) f.yaw += clampf(wrap(fl_yaw_[s] - f.yaw), -6.f * dt, 6.f * dt); else f.yaw = yaw_;
+            float below = surface_below(f.sole.x, f.sole.z, std::max(free_y, fl_prev_free_.y)), gap = std::max(0.f, free_y - below);
+            f.sole.y = free_y + std::min(0.10f * params.scale, 0.5f * gap); f.pitch = 0.f; f.toe = 0.f;
+        }
+        bool down = fl_v_.y < 0.f;
+        float touch = -1e9f; float surfs[2];
+        for (int s = 0; s < 2; ++s) surfs[s] = surface_below(feet_[s].sole.x, feet_[s].sole.z, std::max(free_y, fl_prev_free_.y));
+        float hi = std::max(surfs[0], surfs[1]);
+        if (down && free_y <= hi) touch = hi;
+        fl_prev_free_.y = free_y;
+        if (touch > -1e8f) land(surfs, touch);
+    }
+
+    // Where a foot is in the air: under its hip, pulled toward its landing target (a foot only swings so far from the hip).
+    body_detail::V2 air_foot_xz(int s) const {
+        using namespace body_detail;
+        const float L = D.thigh + D.shin; Vec3 l = lft(yaw_);
+        V2 hip{pelvis_.x + l.x * sg(s) * D.hip_w, pelvis_.z + l.z * sg(s) * D.hip_w}, want = fl_has_tgt_[s] ? fl_tgt_[s] : hip;
+        float dx = want.x - hip.x, dz = want.z - hip.z, dl = std::hypot(dx, dz), cap = 0.45f * L;
+        if (dl > cap) { dx *= cap / dl; dz *= cap / dl; }
+        return {hip.x + dx, hip.z + dz};
+    }
+
+    // A surface whose top is well above the feet is a wall in flight: the body is pushed out of it sideways (and loses that speed).
+    void collide_walls(float ref_y) {
+        const float tol = 0.06f * params.scale, eps = 0.02f;
+        for (int it = 0; it < 4; ++it) for (int s = 0; s < 2; ++s) for (const auto& sf : surfaces_) {
+            if (sf.y <= ref_y + tol) continue;
+            body_detail::V2 p = air_foot_xz(s);
+            if (p.x < sf.x0 || p.x > sf.x1 || p.z < sf.z0 || p.z > sf.z1) continue;
+            float d[4] = {p.x - sf.x0, sf.x1 - p.x, p.z - sf.z0, sf.z1 - p.z}; int k = 0; for (int i = 1; i < 4; ++i) if (d[i] < d[k]) k = i;
+            if (k == 0) { pelvis_.x -= d[0] + eps; if (fl_v_.x > 0) fl_v_.x = 0; } else if (k == 1) { pelvis_.x += d[1] + eps; if (fl_v_.x < 0) fl_v_.x = 0; }
+            else if (k == 2) { pelvis_.z -= d[2] + eps; if (fl_v_.z > 0) fl_v_.z = 0; } else { pelvis_.z += d[3] + eps; if (fl_v_.z < 0) fl_v_.z = 0; }
+            event("hit the side of a surface in the air");
+        }
+    }
+
+    void clamp_push_reach() {                  // while the feet are still planted the legs cannot be longer than they are
+        for (int s = 0; s < 2; ++s) {
+            Vec3 A = feet_[s].sole + Vec3(0, D.ankle_h, 0), H = hip_pos(s, pelvis_, yaw_), d = H - A; float l = d.length(), hi = 0.995f * rmax_leg_ + params.ankle_push * params.scale;
+            if (l > hi) pelvis_ -= d * ((l - hi) / l);
+        }
+    }
+
+    void land(const float surfs[2], float highest) {
+        const float L = D.thigh + D.shin;
+        float vy = fl_v_.y;
+        for (int s = 0; s < 2; ++s) {
+            Foot& f = feet_[s]; f.sole.y = surfs[s]; f.surface = surfs[s]; f.state = FootState::Planted; f.pitch = 0.f; f.toe = 0.f;
+            fl_has_tgt_[s] = false; fl_has_yaw_[s] = false;
+        }
+        if (std::fabs(surfs[0] - surfs[1]) > 0.02f) event("landed with one foot higher than the other: the lower leg may not reach its surface");
+        float y_ext = highest + D.ankle_h + 0.985f * L;
+        float dip = std::min(vy * vy / (2.f * 25.f), 0.22f * params.scale);       // the knees absorb the impact over ~25 m/s^2
+        pelvis_.y = y_ext - dip; pvel_ = Vec3(fl_v_.x, 0.f, fl_v_.z);
+        flight_ = Flight::None; unstable_t_ = 0.f; reach_warned_ = false;
+        char b[160]; std::snprintf(b, sizeof b, "landed at (%.2f, %.2f), coming down at %.2f m/s, still moving %.2f m/s horizontally", pelvis_.x, pelvis_.z, -vy, std::hypot(fl_v_.x, fl_v_.z));
+        event(b);
+    }
+
     // ------------------------------------------------------------------ stepping
     bool validate_step(const StepCmd& c, Vec3& end, bool& planted, float& surf, std::string& why) {
         const Foot& f = feet_[c.side]; const Foot& sup = feet_[1 - c.side]; char b[200];
-        if (sup.state != FootState::Planted) { why = side_name(c.side) + " foot step dropped: the other foot is not on the ground (jumping is not implemented)"; return false; }
+        if (sup.state != FootState::Planted) { why = side_name(c.side) + " foot step dropped: the other foot is not on the ground (use JUMP to leave the ground with both feet)"; return false; }
         float stride = std::hypot(c.target.x - sup.sole.x, c.target.z - sup.sole.z), maxs = params.max_stride * params.scale;
         if (stride > maxs) { std::snprintf(b, sizeof b, "%s foot step rejected: step too long (%.2f m from the support foot, max %.2f m)", side_name(c.side).c_str(), stride, maxs); why = b; return false; }
         if (stride < 0.07f * params.scale) { std::snprintf(b, sizeof b, "%s foot step rejected: target is %.0f cm from the other foot (feet would collide)", side_name(c.side).c_str(), stride * 100.f); why = b; return false; }
@@ -700,9 +872,9 @@ private:
         surf = np ? surf / np : 0.f;
         float h = std::max(0.3f, com_.y - surf), w0 = std::sqrt(9.81f / h);
         xcom_ = {com_.x + vcom_.x / w0, com_.z + vcom_.z / w0};
-        margin_ = np ? hull_margin(support_, xcom_) : -1.f;
+        margin_ = np ? hull_margin(support_, xcom_) : (flight_ != Flight::None ? 0.f : -1.f);
         com_off_ = {com_.x - pelvis_.x, com_.z - pelvis_.z};
-        bool unstable = margin_ < params.fall_margin;
+        bool unstable = flight_ == Flight::None && margin_ < params.fall_margin;
         unstable_t_ = unstable ? unstable_t_ + dt : 0.f;
         if (unstable_t_ > params.fall_time && !fallen_) {
             fallen_ = true; queue_.clear(); act_.on = false;
