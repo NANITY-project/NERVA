@@ -18,6 +18,8 @@
 //   JUMP  x y z [apex_m]                 push off with both feet and land at (x, y=surface, z); the engine solves the arc.
 //                                        Take-off speed is limited by how far the legs can push: crouch first with PELVIS.
 //                                        While airborne FOOT x y z sets where a foot will land instead of queueing a step.
+//   GAIT  dynamic|legacy                 dynamic (default): the centre of mass is simulated as an inverted pendulum and steered through the
+//                                        queued footfalls with capture-point control (no stop at every step); legacy: the old quasi-static shuffle.
 #pragma once
 #include <algorithm>
 #include <cmath>
@@ -26,6 +28,7 @@
 #include <deque>
 #include <string>
 #include <vector>
+#include <memory>
 #include "ik_engine.hpp"
 
 namespace ik {
@@ -104,11 +107,21 @@ public:
         float max_stride = 0.90f;           // m, support foot -> target (scaled)
         float max_step_up = 0.45f, max_step_down = 0.60f;
         float fall_margin = -0.03f, fall_time = 0.30f;
+        float swing_reach_slack = 0.03f;      // m: how far past 0.99 x leg reach the pelvis may let a LANDING leg stretch (the old smoothing let it reach ~5 cm; 0 = hard cap, but then the pelvis dips 2 cm+ more); tracking absorbs this with heel lift
         float shift_settle_speed = 0.04f;   // m/s: how still the pelvis must be over the support foot before the other foot lifts
         float jump_accel = 10.f;            // m/s^2 net push-off acceleration of the legs (take-off speed = sqrt(2 * accel * push stroke))
         float ankle_push = 0.06f;           // m of extra stroke from the ankles/toes (so even a standing hop is possible)
         float max_launch_speed = 3.4f;      // m/s, total take-off speed cap
         float hand_idle_m = 0.0015f;        // tiny hand drift when idle (0 = none, for deterministic tests)
+        // ---- dynamic gait (reduced-order physics: linear inverted pendulum + capture point, see docs/GAIT.md)
+        bool dynamic_gait = true;
+        float step_ds_time = 0.10f;         // s, minimum double support (weight transfer) before the next foot lifts
+        float swing_base = 0.30f, swing_per_m = 0.25f;   // swing time = base + per_m * stride (s)
+        float leg_len_frac = 0.985f;        // stance leg length as a fraction of the straight leg: the pelvis vaults over it (the bob comes from this)
+        float arm_swing_gain = 0.5f;        // resting hands swing m per m of the opposite foot's fore-aft offset (0 = off)
+        float twist_gain = 0.17f;           // pelvis yaw (rad) per m of foot fore-aft offset; the chest counter-rotates (0 = off)
+        float head_turn_omega = 14.f;       // rad/s, head/gaze dynamics (critically damped; 0 = instant like a camera)
+        float recover_time = 1.5f;          // s after a fall before the body stands itself back up (0 = stay fallen until STAND)
     };
     struct Result { bool ok; std::string msg; };
     struct Surface { float x0, x1, z0, z1, y; };
@@ -118,8 +131,10 @@ public:
 
     Body() : Body(Params{}) {}                       // (two constructors: a nested struct's default initializers can't appear in a default argument)
     explicit Body(const Params& p) : params(p) { build(); }
-    Body(const Body&) = delete;                       // bones_ hold pointers into names_
-    Body& operator=(const Body&) = delete;
+    // Copyable: a copy is a full snapshot (pose, gait/tracking state, queued steps, events). bones_ point at the bone names, which live in one
+    // immutable list shared by all copies (never reallocated after build()), so a copy's pointers stay valid.
+    Body(const Body&) = default;
+    Body& operator=(const Body&) = default;
 
     void set_hand_idle(float m) { params.hand_idle_m = m; arms_.params.idle_amp_m = m; }
 
@@ -195,6 +210,10 @@ public:
             if (s < 0 || t.size() != 3 || !num(2, a)) return fail("usage: GRIP <left|right> 0..1");
             hands_[s].curl = clampf(a, 0.f, 1.f); return ok(side_name(s) + " grip " + fmt(hands_[s].curl));
         }
+        if (v == "GAIT") {
+            if (t.size() != 2 || (upper(t[1]) != "DYNAMIC" && upper(t[1]) != "LEGACY")) return fail("usage: GAIT dynamic|legacy");
+            params.dynamic_gait = upper(t[1]) == "DYNAMIC"; dyn_init_ = false; return ok("gait " + lower(t[1]));
+        }
         if (v == "SURFACE") {
             float e;
             if (t.size() == 6 && num(1, a) && num(2, b) && num(3, c) && num(4, d) && num(5, e)) { add_surface(a, b, c, d, e); return ok("surface added"); }
@@ -205,22 +224,203 @@ public:
 
     // ------------------------------------------------------------------ simulation
     void update(float dt) {
-        if (!(dt > 0.f)) return;
+        if (!(dt > 0.f) || tracking_) return;                    // while tracking, track() drives the body
         dt = std::min(dt, 0.05f);
         time_ += dt;
         if (!fallen_) {
+            fall_t_ = 0.f;
             if (flight_ != Flight::None) update_flight(dt);
             else { step_machine(dt); update_feet(dt); update_pelvis(dt); }
-        }
+        } else if (params.recover_time > 0.f && (fall_t_ += dt) > params.recover_time) { fall_t_ = 0.f; stand(); event("recovered from the fall (the pose was reset upright)"); }
         pose_upper(dt, false);
         pose_legs();
         compute_bones();
         compute_balance(dt);
     }
 
+    // ------------------------------------------------------------------ learning interface
+    // A fixed-size state vector for models, and a per-frame TRACKING mode: a generator (VAE / diffusion / retargeted video) gives the
+    // pose it wants every frame and the body enforces what physics forbids (no sliding planted feet, no sinking below the ground, legs and
+    // arms only as long as they are) and reports how much it had to change. The gait controller is not used while tracking.
+    static constexpr int STATE_DIM = 35, ACTION_DIM = 30, REPORT_DIM = 12;
+    static const char* const* state_names() {
+        static const char* n[STATE_DIM] = {"pelvis_x", "pelvis_y", "pelvis_z", "yaw", "com_x", "com_y", "com_z", "com_vx", "com_vz", "margin_m", "fallen",
+            "footL_x", "footL_y", "footL_z", "footL_yaw", "footL_state", "footL_heel", "footR_x", "footR_y", "footR_z", "footR_yaw", "footR_state", "footR_heel",
+            "wristL_x", "wristL_y", "wristL_z", "wristR_x", "wristR_y", "wristR_z", "handL_targeted", "handR_targeted", "head_x", "head_y", "head_z", "steps_queued"};
+        return n;
+    }
+    void get_state(float* o) const {                       // world metres / radians; foot_state 0 planted, 1 swing, 2 air
+        int i = 0; auto v3 = [&](Vec3 v) { o[i++] = v.x; o[i++] = v.y; o[i++] = v.z; };
+        v3(pelvis_); o[i++] = yaw_; v3(com_); o[i++] = vcom_.x; o[i++] = vcom_.z; o[i++] = margin_; o[i++] = fallen_ ? 1.f : 0.f;
+        for (int s = 0; s < 2; ++s) { v3(feet_[s].sole); o[i++] = feet_[s].yaw; o[i++] = (float)(int)feet_[s].state; o[i++] = feet_[s].heel; }
+        v3(wrist_[0]); v3(wrist_[1]); o[i++] = hands_[0].target_mode ? 1.f : 0.f; o[i++] = hands_[1].target_mode ? 1.f : 0.f; v3(head_center_); o[i++] = (float)steps_queued();
+    }
+    // action layout (ACTION_DIM floats): pelvis xyz, yaw | footL xyz yaw contact | footR xyz yaw contact | handL xyz on | handR xyz on | look xyz on | torso xyz on
+    // report layout (REPORT_DIM floats, metres), by index: 0,1 slide removed L,R | 2,3 sink removed L,R | 4 pelvis moved by leg reach | 5,6 leg unreachable L,R |
+    //                                                       7 reserved (0) | 8,9 hand unreachable L,R | 10 balance margin (negative = outside the support area) | 11 any-violation (0/1)
+    void track(const float* a, float dt, float* r) {
+        using namespace body_detail;
+        if (!(dt > 0.f)) dt = 1.f / 60.f; dt = std::min(dt, 0.05f);
+        if (!tracking_) { tracking_ = true; queue_.clear(); act_.on = false; flight_ = Flight::None; fallen_ = false; pelvis_user_ = false; fl_has_tgt_[0] = fl_has_tgt_[1] = false;
+            com_init_ = false; pvel_ = Vec3(); }      // start with no velocity history: the first frame snaps the pose (lean, twist), and that jump is not a CoM velocity
+        fallen_ = false; time_ += dt; for (int i = 0; i < REPORT_DIM; ++i) r[i] = 0.f;
+        Vec3 pel(a[0], a[1], a[2]); float yaw = a[3];
+        const float* fa[2] = {a + 4, a + 9};
+        for (int s = 0; s < 2; ++s) {
+            Foot& f = feet_[s]; Vec3 want(fa[s][0], fa[s][1], fa[s][2]); float wyaw = fa[s][3]; bool contact = fa[s][4] > 0.5f;
+            track_fv_[s] = (want - f.sole) * (1.f / dt);
+            float ground = surface_at(want.x, want.z, f.surface);
+            if (want.y < ground) { r[2 + s] = ground - want.y; want.y = ground; }
+            if (contact && f.state == FootState::Planted && !track_free_[s]) {          // a planted foot does not slide: keep where it is
+                r[0 + s] = std::hypot(want.x - f.sole.x, want.z - f.sole.z);
+                f.surface = ground; f.sole.y = ground;
+            } else { f.sole = want; f.yaw = wyaw; f.surface = ground; }
+            if (contact && std::fabs(want.y - ground) < 0.03f) { f.state = FootState::Planted; f.sole.y = ground; track_free_[s] = false; }
+            else { f.state = FootState::Swing; track_free_[s] = true; }
+            f.heel = 0.f; f.pitch = 0.f; f.toe = 0.f;
+        }
+        yaw_ = yaw; lean_ = head_dev_ = V2{0, 0};
+        {   // anatomy the generator does not have to spell out: the hips twist with the legs, the arms swing, a trailing heel rises when the leg would overstretch
+            Vec3 fw = fwd(yaw_); float zl = (feet_[0].sole.x - pel.x) * fw.x + (feet_[0].sole.z - pel.z) * fw.z, zr = (feet_[1].sole.x - pel.x) * fw.x + (feet_[1].sole.z - pel.z) * fw.z;
+            float tw = clampf(-params.twist_gain * clampf(zl - zr, -0.7f, 0.7f), -0.14f, 0.14f); damp1(twist_, twist_v_, tw, 12.f, dt); chest_twist_ = -1.1f * twist_;
+            for (int s = 0; s < 2; ++s) { const Foot& o = feet_[1 - s]; float fo = (o.sole.x - pel.x) * fw.x + (o.sole.z - pel.z) * fw.z; damp1(arm_swing_[s], arm_swing_v_[s], clampf(params.arm_swing_gain * fo, -0.16f * params.scale, 0.16f * params.scale), 9.f, dt); }
+            for (int s = 0; s < 2; ++s) {
+                Foot& f = feet_[s]; f.heel = 0.f; if (f.state != FootState::Planted && f.sole.y > f.surface + 0.15f) continue;
+                for (float hh = 0.f; hh <= 0.6f; hh += 0.1f) { f.heel = hh; if ((hip_pos(s, pel, hyaw()) - ankle_of(f)).length() <= 0.995f * rmax_leg_) break; }
+                if (f.state == FootState::Planted) f.pitch = -f.heel;
+            }
+        }
+        Vec3 np_ = pel; clamp_reach(np_, hyaw()); r[4] = (np_ - pel).length();
+        pvel_ = Vec3((np_.x - pelvis_.x) / dt, (np_.y - pelvis_.y) / dt, (np_.z - pelvis_.z) / dt); pelvis_ = np_;
+        const float* ha[2] = {a + 14, a + 18};
+        for (int s = 0; s < 2; ++s) {
+            bool on = ha[s][3] > 0.5f; hands_[s].target_mode = on; hands_[s].has_cmd = on; if (on) hands_[s].cmd = Vec3(ha[s][0], ha[s][1], ha[s][2]);
+        }
+        look_user_ = a[25] > 0.5f; if (look_user_) look_tgt_ = Vec3(a[22], a[23], a[24]);
+        torso_user_ = a[29] > 0.5f; if (torso_user_) torso_tgt_ = Vec3(a[26], a[27], a[28]);
+        float keep = params.head_turn_omega; params.head_turn_omega = 0.f;           // no head lag while tracking: the generator already made it smooth
+        pose_upper(dt, false);
+        for (int s = 0; s < 2; ++s) if (hands_[s].target_mode) { arms_.teleport_to(arm_id_[s], hands_[s].cmd); }
+        arms_.update(1e-4f);
+        for (int s = 0; s < 2; ++s) { Vec3 p[3]; arms_.chain(arm_id_[s]).world_positions(p); shoulder_[s] = p[0]; elbow_[s] = p[1]; wrist_[s] = p[2]; if (hands_[s].target_mode) r[8 + s] = (p[2] - hands_[s].cmd).length(); }
+        params.head_turn_omega = keep;
+        pose_legs();
+        for (int s = 0; s < 2; ++s) r[5 + s] = (feet_[s].ankle - ankle_of(feet_[s])).length();
+        compute_bones(); compute_balance(dt);
+        const bool unb = margin_ < params.fall_margin; fallen_ = false; unstable_t_ = 0.f;           // tracking reports a loss of balance, it never latches a fall
+        r[10] = unb ? -std::fabs(margin_) : margin_; float v = r[0] + r[1] + r[2] + r[3] + r[4] + r[5] + r[6] + r[8] + r[9]; r[11] = (v > 0.005f || unb) ? 1.f : 0.f;
+                report_unbalanced_ = unb;
+        track_land_has_[0] = track_land_has_[1] = false;                                  // a hint is for one frame only
+    }
+    // Optional look-ahead for ONE track() call: where foot s will touch down next. A generator output is a whole clip, so the caller can
+    // see this; the balance check then counts the landing footprint (as the walking engine does) instead of guessing from the foot's velocity.
+    void track_land(int s, Vec3 p, float yaw) { if (s < 0 || s > 1) return; track_land_has_[s] = true; track_land_[s] = p; track_land_yaw_[s] = yaw; }
+    // Track a whole clip (n frames of ACTION_DIM floats): looks ahead for each lifted foot's next touchdown. reports: n*REPORT_DIM, states: n*STATE_DIM
+    // (either may be null). Returns the number of frames that reported a loss of balance.
+    int track_clip(const float* a, int n, float dt, float* reports, float* states) {
+        float tmp[REPORT_DIM]; int bad = 0;
+        for (int i = 0; i < n; ++i) {
+            const float* ai = a + (size_t)i * ACTION_DIM;
+            for (int s = 0; s < 2; ++s) {
+                auto contact = [&](int k, int f) { return a[(size_t)k * ACTION_DIM + 4 + 5 * f + 4] > 0.5f; };
+                int from = i;
+                if (contact(i, s)) {            // loaded foot that lifts within ~0.4 s, while the other foot is down: the step is already being prepared (weight shift)
+                    if (!contact(i, 1 - s)) continue;
+                    int last = std::min(n - 1, i + (int)(0.4f / dt)), k = i + 1; while (k <= last && contact(k, s)) ++k;
+                    if (k > last) continue; from = k;
+                }
+                for (int j = from + 1; j < n; ++j) if (contact(j, s)) { const float* aj = a + (size_t)j * ACTION_DIM + 4 + 5 * s; track_land(s, Vec3(aj[0], aj[1], aj[2]), aj[3]); break; }
+            }
+            track(ai, dt, reports ? reports + (size_t)i * REPORT_DIM : tmp);
+            if (track_unbalanced()) ++bad;
+            if (states) get_state(states + (size_t)i * STATE_DIM);
+        }
+        return bad;
+    }
+
+    // ------------------------------------------------------------------ clip evaluation: one number and plain-English reasons
+    // What a movement controller / trainer needs from the engine: "is this candidate motion feasible, how badly does it fail, and why".
+    struct ClipVerdict {
+        bool feasible = true;                 // nothing needed correcting (> 5 mm) and balance held on every frame
+        int frames = 0, bad_frames = 0;       // bad: any correction above 5 mm, or a loss of balance
+        float score = 0.f;                    // mean per-frame cost in metres (corrections + how far the CoM left the support area): 0 = feasible, lower is better
+        int worst_frame = -1; float worst_cost = 0.f;
+        std::vector<std::string> issues;      // one plain-English line per run of frames, most severe first (empty when feasible)
+    };
+    static float frame_cost(const float* r, float fall_margin) {
+        float c = r[0] + r[1] + r[2] + r[3] + r[4] + r[5] + r[6] + r[8] + r[9];
+        if (r[10] < fall_margin) c -= r[10];
+        return c;
+    }
+    // Turn n tracking reports into readable issues (frame ranges, times, how much, what the engine did about it).
+    std::vector<std::string> explain_reports(const float* rep, int n, float dt) const {
+        if (!(dt > 0.f)) dt = 1.f / 60.f; dt = std::min(dt, 0.05f);
+        static const char* side[2] = {"left", "right"};
+        static const int idx[10] = {0, 1, 2, 3, 4, 5, 6, 8, 9, 10};                  // category -> report slot
+        auto val = [&](int f, int c) -> float { const float* r = rep + (size_t)f * REPORT_DIM; return c == 9 ? (r[10] < params.fall_margin ? -r[10] : 0.f) : r[idx[c]]; };
+        struct Span { float peak; std::string text; };
+        std::vector<Span> spans; char b[320];
+        for (int c = 0; c < 10; ++c) {
+            const float thr = c == 9 ? 0.f : 0.005f;
+            for (int f = 0; f < n; ) {
+                if (!(val(f, c) > thr)) { ++f; continue; }
+                int a = f, last = f; float peak = val(f, c);
+                for (int g = f + 1; g < n && g <= last + 4; ++g) if (val(g, c) > thr) { last = g; peak = std::max(peak, val(g, c)); }   // runs split by a gap of up to 4 frames stay one issue
+                f = last + 1;
+                char when[64]; std::snprintf(when, sizeof when, "frames %d-%d (%.2f-%.2f s)", a, last, a * dt, (last + 1) * dt);
+                const float cm = peak * 100.f; const char* sd = c < 2 ? side[c] : c < 4 ? side[c - 2] : c < 7 ? side[c - 5] : c < 9 ? side[c - 7] : "";
+                switch (c) {
+                    case 0: case 1: std::snprintf(b, sizeof b, "%s: the %s foot is marked in contact but the clip moves it up to %.1f cm from where it is planted; a planted foot cannot slide, so it was held in place", when, sd, cm); break;
+                    case 2: case 3: std::snprintf(b, sizeof b, "%s: the %s foot goes up to %.1f cm below the ground; it was lifted onto the surface", when, sd, cm); break;
+                    case 4: std::snprintf(b, sizeof b, "%s: the pelvis is up to %.1f cm farther from the planted feet than the legs can reach; it was pulled back", when, cm); break;
+                    case 5: case 6: std::snprintf(b, sizeof b, "%s: the %s leg cannot reach its foot (short by up to %.1f cm); the foot is too far from the hip for the leg length", when, sd, cm); break;
+                    case 7: case 8: std::snprintf(b, sizeof b, "%s: the %s hand target is out of the arm's reach by up to %.1f cm", when, sd, cm); break;
+                    default: std::snprintf(b, sizeof b, "%s: balance is lost; the centre of mass is up to %.1f cm outside the support area, so the body would fall", when, cm); break;
+                }
+                spans.push_back({peak, b});
+            }
+        }
+        std::stable_sort(spans.begin(), spans.end(), [](const Span& x, const Span& y) { return x.peak > y.peak; });
+        std::vector<std::string> out; const size_t cap = 8;
+        for (size_t i = 0; i < spans.size() && i < cap; ++i) out.push_back(spans[i].text);
+        if (spans.size() > cap) out.push_back("and " + std::to_string(spans.size() - cap) + " more smaller issues");
+        return out;
+    }
+    // Track a clip FROM THE CURRENT STATE and judge it. This body ADVANCES to the clip's end; to try a candidate without committing, use preview_clip.
+    // reports (n*REPORT_DIM) and states (n*STATE_DIM) are optional.
+    ClipVerdict evaluate_clip(const float* a, int n, float dt, float* reports = nullptr, float* states = nullptr) {
+        ClipVerdict v; v.frames = n < 0 ? 0 : n; if (n <= 0 || !a) return v;
+        for (size_t i = 0; i < (size_t)n * ACTION_DIM; ++i) if (!std::isfinite(a[i])) {
+            v.feasible = false; v.bad_frames = n; v.score = 1e3f; v.worst_frame = (int)(i / ACTION_DIM);
+            v.issues.push_back("frame " + std::to_string(i / ACTION_DIM) + " has a non-finite number (NaN or infinity) in action value " + std::to_string(i % ACTION_DIM) + "; the clip was not tracked");
+            return v;
+        }
+        std::vector<float> own; float* r = reports; if (!r) { own.resize((size_t)n * REPORT_DIM); r = own.data(); }
+        track_clip(a, n, dt, r, states);
+        float sum = 0.f;
+        for (int i = 0; i < n; ++i) {
+            const float* ri = r + (size_t)i * REPORT_DIM; float c = frame_cost(ri, params.fall_margin);
+            sum += c; if (ri[11] > 0.5f) ++v.bad_frames; if (c > v.worst_cost || v.worst_frame < 0) { v.worst_cost = c; v.worst_frame = i; }
+        }
+        v.score = sum / (float)n; v.feasible = v.bad_frames == 0; if (!v.feasible) v.issues = explain_reports(r, n, dt);
+        return v;
+    }
+    // Try a candidate clip from the current state on a COPY: this body is left exactly as it was.
+    ClipVerdict preview_clip(const float* a, int n, float dt, float* reports = nullptr, float* states = nullptr) const { Body t(*this); return t.evaluate_clip(a, n, dt, reports, states); }
+
+    // Leave tracking: the commanded-control state (feet planted where they are, hands relaxed, gait controller back on) resumes from the current pose.
+    void track_end() {
+        if (!tracking_) return; tracking_ = false;
+        for (int s = 0; s < 2; ++s) { Foot& f = feet_[s]; f.state = FootState::Planted; f.sole.y = f.surface = surface_at(f.sole.x, f.sole.z, f.surface); track_free_[s] = false; hands_[s].target_mode = false; hands_[s].has_cmd = false; }
+        look_user_ = false; torso_user_ = false; dyn_init_ = false; com_init_ = false; track_land_has_[0] = track_land_has_[1] = false;
+        pvel_ = Vec3(); vcom_ = {};      // resume from rest: the last tracked frame's pelvis velocity can be a huge artefact of a correction, and the gait controller starts its capture-point state from it
+    }
+    bool tracking() const { return tracking_; }
+    bool track_unbalanced() const { return report_unbalanced_; }
+
     // ------------------------------------------------------------------ queries
     const std::vector<BoneOut>& bones() const { return bones_; }
-    int bone_index(const std::string& n) const { for (size_t i = 0; i < names_.size(); ++i) if (names_[i] == n) return (int)i; return -1; }
+    int bone_index(const std::string& n) const { for (size_t i = 0; i < names_->size(); ++i) if ((*names_)[i] == n) return (int)i; return -1; }
     Vec3 pelvis() const { return pelvis_; }
     float yaw() const { return yaw_; }
     Vec3 com() const { return com_; }
@@ -234,6 +434,7 @@ public:
     bool hand_targeted(int s) const { return hands_[s].target_mode; }
     bool hand_settled(int s) const { return arms_.is_settled(arm_id_[s]); }
     bool airborne() const { return flight_ == Flight::Air; }          // feet off the ground (the push-off before it still has both feet planted)
+    bool speed_ok_for_test() const { return std::hypot(pvel_.x, pvel_.z) < 0.05f; }
     bool stepping() const { return act_.on || !queue_.empty(); }
     int steps_queued() const { return (int)queue_.size() + (act_.on ? 1 : 0); }
     float time() const { return time_; }
@@ -285,7 +486,7 @@ private:
 
     struct Foot {
         FootState state = FootState::Planted;
-        Vec3 sole; float yaw = 0.f, pitch = 0.f, toe = 0.f, surface = 0.f;
+        Vec3 sole; float yaw = 0.f, pitch = 0.f, toe = 0.f, surface = 0.f, heel = 0.f;   // heel: rad the heel is raised while the ball stays on the ground (toe-off)
         Trajectory traj; float yaw0 = 0.f, yaw1 = 0.f; Vec3 end_sole; bool end_planted = true; float end_surface = 0.f;
         Chain leg; Vec3 hip, knee, ankle;
     };
@@ -302,15 +503,23 @@ private:
     float rmin_leg_ = 0.f, rmax_leg_ = 0.f;
     std::vector<Surface> surfaces_;
     std::deque<StepCmd> queue_; Active act_;
-    bool fallen_ = false; float unstable_t_ = 0.f, time_ = 0.f;
+    bool fallen_ = false; float unstable_t_ = 0.f, time_ = 0.f, fall_t_ = 0.f;
+    bool tracking_ = false, track_free_[2] = {false, false}, report_unbalanced_ = false; Vec3 track_fv_[2];
+    bool track_land_has_[2] = {false, false}; Vec3 track_land_[2]; float track_land_yaw_[2] = {0.f, 0.f};     // where a lifted foot will land (hint for the next track() call)
     enum class Flight { None, Push, Air } flight_ = Flight::None;
     Vec3 fl_v_, fl_prev_free_; float fl_y0_ = 0.f, fl_push_t_ = 0.f, fl_push_T_ = 0.f, fl_air_t_ = 0.f;
     bool fl_has_tgt_[2] = {false, false}; body_detail::V2 fl_tgt_[2]; bool fl_has_yaw_[2] = {false, false}; float fl_yaw_[2] = {0.f, 0.f};
     Vec3 com_; body_detail::V2 com_off_, vcom_, xcom_; float margin_ = 0.f; bool com_init_ = false; Vec3 com_prev_;
     std::vector<body_detail::V2> support_;
-    std::vector<BoneOut> bones_; std::vector<std::string> names_; std::vector<float> mass_; std::vector<std::string> events_;
+    std::vector<BoneOut> bones_; std::shared_ptr<std::vector<std::string>> names_ = std::make_shared<std::vector<std::string>>(); std::vector<float> mass_; std::vector<std::string> events_;
     struct Idx { int clav[2], upper[2], fore[2], hand[2], finger0[2], thigh[2], shin[2], foot[2], toe[2], nfingers = 0; } I{};
     Quat chest_q_;
+    // dynamic gait state
+    body_detail::V2 cm_, cmv_, cop_f_, lean_, head_dev_; bool dyn_init_ = false;
+    float twist_ = 0.f, twist_v_ = 0.f, chest_twist_ = 0.f, arm_swing_[2] = {0.f, 0.f}, arm_swing_v_[2] = {0.f, 0.f};
+    float hl_yaw_ = 0.f, hl_pitch_ = 0.f, hl_chest_ = 0.f, hl_vyaw_ = 0.f, hl_vpitch_ = 0.f, hl_vchest_ = 0.f;
+    float hyaw() const { return yaw_ + twist_; }                      // hip-line heading: the body heading plus the walking twist
+    bool dyn_on() const { return params.dynamic_gait && params.balance == Balance::Assist && !pelvis_user_; }
 
     // ------------------------------------------------------------------ helpers
     static std::string upper(std::string s) { for (char& c : s) c = (char)std::toupper((unsigned char)c); return s; }
@@ -334,6 +543,139 @@ private:
     void event(const std::string& s) { if (events_.size() < 64) events_.push_back(s); }
     static std::string xz(Vec3 p) { char b[64]; std::snprintf(b, sizeof b, "(%.2f, %.2f)", p.x, p.z); return b; }
 
+    using V2 = body_detail::V2;
+    static void damp1(float& x, float& v, float target, float omega, float dt) {        // critically damped scalar (same formula as smooth_damp)
+        float q = omega * dt, e = 1.f / (1.f + q + 0.48f * q * q + 0.235f * q * q * q), ch = x - target, tmp = (v + ch * omega) * dt;
+        v = (v - tmp * omega) * e; x = target + (ch + tmp) * e;
+    }
+
+    // ------------------------------------------------------------------ dynamic gait
+    // The centre of mass is a linear inverted pendulum pivoting on the centre of pressure (CoP), which can only sit inside the support foot:
+    //     cm'' = w^2 (cm - cop),   w = sqrt(g / h),   capture point (DCM)  xi = cm + cm' / w,   xi' = w (xi - cop).
+    // The queued footfalls fix where the CoP will be (each stance foot). Integrating the DCM backwards from "come to rest between the last
+    // two feet" gives the DCM needed at every touchdown; the controller picks the CoP each frame so the DCM arrives there (dead-beat on the
+    // remaining swing time). Nothing stops between steps: the body falls onto the next foot and the next foot catches it. The pelvis is
+    // the CoM minus a measured offset; its height follows from a constant-length stance leg (so it bobs), not from a target.
+    // ankle joint position: above the sole point when the foot is flat; when the heel is raised the foot pivots about the ball (toe-off)
+    Vec3 ankle_of(const Foot& f) const {
+        if (f.heel < 1e-4f) return f.sole + Vec3(0, D.ankle_h, 0);
+        Vec3 fw = body_detail::fwd(f.yaw); float c = std::cos(f.heel), sn = std::sin(f.heel);
+        float a = -D.ball * c + D.ankle_h * sn, u = D.ankle_h * c + D.ball * sn;               // ankle relative to the ball, in (forward, up)
+        return f.sole + fw * D.ball + fw * a + Vec3(0, u, 0);
+    }
+    float dyn_w() const { float h = std::max(0.3f, com_.y - 0.5f * (feet_[0].surface + feet_[1].surface)); return std::sqrt(9.81f / h); }
+    V2 cop_ref_of(Vec3 sole, float yaw) const { Vec3 fw = body_detail::fwd(yaw); float o = 0.5f * (D.ball - D.heel); return {sole.x + fw.x * o, sole.z + fw.z * o}; }
+    struct GaitPlan { bool steps = false; int stance = 0; V2 c0, xi_s0, xi_td0, mid, mid_land; float T0 = 0.4f; };
+    GaitPlan make_plan(float w, float T_first) const {
+        struct St { V2 c, land; float T; };
+        GaitPlan P; V2 pos[2]; bool air[2] = {false, false};
+        for (int s = 0; s < 2; ++s) { pos[s] = cop_ref_of(feet_[s].sole, feet_[s].yaw); air[s] = feet_[s].state == FootState::Air; }
+        std::vector<St> L; L.reserve(10);
+        auto add = [&](const StepCmd& c, float Tov) {
+            float yw = c.has_yaw ? c.yaw : feet_[c.side].yaw; V2 land = cop_ref_of(c.target, yw);
+            float h = std::hypot(land.x - pos[c.side].x, land.z - pos[c.side].z);
+            L.push_back({pos[1 - c.side], land, Tov > 0.f ? Tov : swing_time(h, 0.f)}); pos[c.side] = land;
+            air[c.side] = c.target.y > surface_at(c.target.x, c.target.z, feet_[1 - c.side].surface) + 0.02f;      // a raised foot is held in the air: it is not a support
+            if (L.size() == 1) P.stance = 1 - c.side;
+        };
+        if (act_.on) add(act_.cmd, act_.phase == Active::Swing ? T_first : 0.f);
+        for (const StepCmd& c : queue_) if (L.size() < 9) add(c, 0.f);
+        { V2 m{0, 0}; int n = 0; for (int s = 0; s < 2; ++s) if (!air[s]) { m.x += pos[s].x; m.z += pos[s].z; ++n; }
+          P.mid_land = n ? V2{m.x / n, m.z / n} : V2{0.5f * (pos[0].x + pos[1].x), 0.5f * (pos[0].z + pos[1].z)}; }
+        if (L.empty()) {
+            V2 m{0, 0}; int n = 0;
+            for (int s = 0; s < 2; ++s) if (feet_[s].state == FootState::Planted) { m.x += pos[s].x; m.z += pos[s].z; ++n; }
+            P.mid = n ? V2{m.x / n, m.z / n} : P.mid_land; return P;
+        }
+        P.steps = true; P.mid = P.mid_land; P.c0 = L[0].c; P.T0 = L[0].T;
+        V2 xi = P.mid_land; std::vector<V2> td(L.size());
+        td[L.size() - 1] = xi;
+        for (int i = (int)L.size() - 2; i >= 0; --i) {
+            V2 c = L[i + 1].c; float E = std::exp(-w * (params.step_ds_time + L[i + 1].T));
+            td[i] = {c.x + (td[i + 1].x - c.x) * E, c.z + (td[i + 1].z - c.z) * E};
+        }
+        P.xi_td0 = td[0]; float E0 = std::exp(-w * L[0].T);
+        P.xi_s0 = {P.c0.x + (td[0].x - P.c0.x) * E0, P.c0.z + (td[0].z - P.c0.z) * E0};
+        return P;
+    }
+
+    // Where the DCM is steered before the swing foot lifts. From (nearly) standing it must stay over the support foot; the capture
+    // happens during the swing. When already moving (continuous walking) the plan value is used as is.
+    V2 shift_ref(const GaitPlan& P) const {
+        V2 r = P.xi_s0;
+        const Foot& rear = feet_[1 - P.stance];                         // the foot about to swing: the CoM cannot be taken further from it than the leg reaches
+        if (rear.state == FootState::Planted && std::hypot(cmv_.x, cmv_.z) <= 0.3f) {
+            V2 q = cop_ref_of(rear.sole, rear.yaw); float dx = r.x - q.x, dz = r.z - q.z, d = std::hypot(dx, dz), lim = 0.36f * params.scale;
+            if (d > lim) { r.x = q.x + dx * lim / d; r.z = q.z + dz * lim / d; }
+        }
+        if (std::hypot(cmv_.x, cmv_.z) > 0.3f || feet_[P.stance].state != FootState::Planted) return r;
+        return body_detail::hull_project(foot_polygon(P.stance), r, 0.02f);
+    }
+
+    void update_pelvis_dynamic(float dt, const int* planted, int np) {
+        using namespace body_detail;
+        float surf = 0.f; for (int i = 0; i < np; ++i) surf += feet_[planted[i]].surface / np;
+        float h = std::max(0.3f, com_.y - surf), w = std::sqrt(9.81f / h);
+        if (!dyn_init_) { cm_ = {com_.x, com_.z}; cmv_ = {pvel_.x, pvel_.z}; cop_f_ = cm_; dyn_init_ = true; }
+        V2 xi{cm_.x + cmv_.x / w, cm_.z + cmv_.z / w};
+        const bool ss = act_.on && act_.phase == Active::Swing && feet_[1 - act_.side].state == FootState::Planted;
+        float Trem = ss ? std::max(feet_[act_.side].traj.T - feet_[act_.side].traj.t, 0.12f) : 0.f;
+        GaitPlan P = make_plan(w, Trem); V2 c;
+        if (ss && P.steps) {                                         // single support: dead-beat the DCM onto the planned touchdown value
+            float E = std::exp(w * Trem); c = {(P.xi_td0.x - xi.x * E) / (1.f - E), (P.xi_td0.z - xi.z * E) / (1.f - E)};
+            c = hull_project(foot_polygon(1 - act_.side), c, 0.012f);
+        } else {                                                     // double support / standing: track the DCM reference inside the support polygon
+            V2 ref = P.steps ? shift_ref(P) : P.mid; c = {ref.x + 2.5f * (xi.x - ref.x), ref.z + 2.5f * (xi.z - ref.z)};   // classic DCM hold: converge on the reference
+            c = hull_project(support_poly(), c, 0.01f);
+        }
+        float a = 1.f - std::exp(-dt / 0.045f); cop_f_.x += (c.x - cop_f_.x) * a; cop_f_.z += (c.z - cop_f_.z) * a;   // force transfer is not instantaneous
+        float ch = std::cosh(w * dt), sh = std::sinh(w * dt);          // exact LIPM step with the CoP held over dt
+        V2 e{cm_.x - cop_f_.x, cm_.z - cop_f_.z}, en{e.x * ch + cmv_.x / w * sh, e.z * ch + cmv_.z / w * sh}, vn{e.x * w * sh + cmv_.x * ch, e.z * w * sh + cmv_.z * ch};
+        cm_ = {cop_f_.x + en.x, cop_f_.z + en.z}; cmv_ = vn;
+        pelvis_prev_ = pelvis_;
+        Vec3 np_(cm_.x - com_off_.x, pelvis_.y, cm_.z - com_off_.z);
+        // pelvis twist: the hip on the leading-leg side swings forward; the chest counter-rotates
+        Vec3 fw = fwd(yaw_);
+        float zl = (feet_[0].sole.x - pelvis_.x) * fw.x + (feet_[0].sole.z - pelvis_.z) * fw.z, zr = (feet_[1].sole.x - pelvis_.x) * fw.x + (feet_[1].sole.z - pelvis_.z) * fw.z;
+        float tw = -params.twist_gain * clampf(zl - zr, -0.7f, 0.7f); tw = clampf(tw, -0.14f, 0.14f);
+        damp1(twist_, twist_v_, tw, 12.f, dt); chest_twist_ = -1.1f * twist_;
+        // pelvis height: constant-length stance leg(s). Each planted leg bounds the height; a swinging leg may not be over-extended either.
+        float Lcap = params.leg_len_frac * (D.thigh + D.shin), yt = 1e9f;
+        for (int i = 0; i < np; ++i) {
+            const Foot& f = feet_[planted[i]]; Vec3 H = hip_pos(planted[i], np_, hyaw()), A = ankle_of(f); float dh = std::hypot(H.x - A.x, H.z - A.z);
+            yt = std::min(yt, A.y + std::sqrt(std::max(Lcap * Lcap - dh * dh, 0.09f * Lcap * Lcap)));
+        }
+        float y_swing = 1e9f;                                          // a swinging leg may not be over-extended: y_swing is a hard cap (with swing_reach_slack) because the smoothing below lags behind a landing foot
+        for (int s = 0; s < 2; ++s) if (feet_[s].state != FootState::Planted) {
+            const Foot& f = feet_[s]; Vec3 H = hip_pos(s, np_, hyaw()); float dh = std::hypot(H.x - f.sole.x, H.z - f.sole.z), r = 0.99f * rmax_leg_;
+            float ys = f.sole.y + D.ankle_h + std::sqrt(std::max(r * r - dh * dh, 0.f)); yt = std::min(yt, ys);
+            float rs = r + params.swing_reach_slack * params.scale; y_swing = std::min(y_swing, f.sole.y + D.ankle_h + std::sqrt(std::max(rs * rs - dh * dh, 0.f)));
+        }
+        { Vec3 cy(0, pelvis_.y, 0), ty(0, yt, 0), vy(0, pvel_.y, 0); smooth_damp(cy, ty, vy, 18.f, dt); float dy = clampf(cy.y - pelvis_.y, -1.5f * params.scale * dt, 1.5f * params.scale * dt); np_.y = std::min(pelvis_.y + dy, y_swing); }
+        clamp_reach(np_, hyaw());
+        pvel_ = Vec3((np_.x - pelvis_prev_.x) / dt, (np_.y - pelvis_prev_.y) / dt, (np_.z - pelvis_prev_.z) / dt);
+        pelvis_ = np_; cm_ = {pelvis_.x + com_off_.x, pelvis_.z + com_off_.z};
+        for (int s = 0; s < 2; ++s) {                                  // toe-off: the trailing foot rolls onto its ball while the other foot is down or landing
+            Foot& f = feet_[s]; float want = 0.f;
+            if (f.state == FootState::Planted) {
+                V2 r = cop_ref_of(f.sole, f.yaw); float rel = (r.x - pelvis_.x) * fw.x + (r.z - pelvis_.z) * fw.z;
+                want = clampf((-rel - 0.10f) / 0.22f, 0.f, 1.f) * 0.55f;
+            }
+            f.heel += (want - f.heel) * (1.f - std::exp(-dt * 18.f)); if (f.state == FootState::Planted) f.pitch = -f.heel;
+        }
+        // secondary motion (cosmetic physics): trunk leans along the CoM-CoP line, the head cancels part of the lateral sway, hands swing opposite the legs
+        V2 lt{(cm_.x - cop_f_.x) / h * 0.25f + cmv_.x * 0.05f, (cm_.z - cop_f_.z) / h * 0.25f + cmv_.z * 0.05f};
+        float lm = std::hypot(lt.x, lt.z); if (lm > 0.25f) { lt.x *= 0.25f / lm; lt.z *= 0.25f / lm; }
+        float k = 1.f - std::exp(-dt * 10.f); lean_.x += (lt.x - lean_.x) * k; lean_.z += (lt.z - lean_.z) * k;
+        V2 r0 = cop_ref_of(feet_[0].state == FootState::Swing && act_.on ? feet_[0].end_sole : feet_[0].sole, feet_[0].yaw), r1 = cop_ref_of(feet_[1].state == FootState::Swing && act_.on ? feet_[1].end_sole : feet_[1].sole, feet_[1].yaw);
+        Vec3 lf = lft(yaw_); float lat = (pelvis_.x - 0.5f * (r0.x + r1.x)) * lf.x + (pelvis_.z - 0.5f * (r0.z + r1.z)) * lf.z;
+        head_dev_ = {lf.x * -0.5f * lat, lf.z * -0.5f * lat};
+        for (int s = 0; s < 2; ++s) {
+            const Foot& o = feet_[1 - s]; float fo = (o.sole.x - pelvis_.x) * fw.x + (o.sole.z - pelvis_.z) * fw.z;
+            float tg = clampf(params.arm_swing_gain * fo, -0.16f * params.scale, 0.16f * params.scale); damp1(arm_swing_[s], arm_swing_v_[s], tg, 9.f, dt);
+        }
+    }
+
     // ------------------------------------------------------------------ construction
     void build() {
         params.finger_lod = std::max(0, std::min(2, params.finger_lod));
@@ -341,8 +683,8 @@ private:
         D = Dim(params.scale);
         two_bone_reach_limits(D.thigh, D.shin, 30.f * PI / 180.f, 175.f * PI / 180.f, rmin_leg_, rmax_leg_);
         // bone table
-        names_.reserve(64); mass_.reserve(64); std::vector<int> parents; std::vector<float> masses;
-        auto add = [&](const std::string& n, int par, float m) { names_.push_back(n); parents.push_back(par); masses.push_back(m); return (int)names_.size() - 1; };
+        names_->reserve(64); mass_.reserve(64); std::vector<int> parents; std::vector<float> masses;
+        auto add = [&](const std::string& n, int par, float m) { names_->push_back(n); parents.push_back(par); masses.push_back(m); return (int)names_->size() - 1; };
         int pel = add("pelvis", -1, .145f), sp1 = add("spine1", pel, .125f), sp2 = add("spine2", sp1, .125f), sp3 = add("spine3", sp2, .102f);
         int nk = add("neck", sp3, .012f); add("head", nk, .069f);
         const char* S[2] = {"L", "R"};
@@ -350,10 +692,10 @@ private:
             std::string u = std::string("_") + S[s];
             I.clav[s] = add("clavicle" + u, sp3, .005f); I.upper[s] = add("upper_arm" + u, I.clav[s], .028f);
             I.fore[s] = add("forearm" + u, I.upper[s], .016f); I.hand[s] = add("hand" + u, I.fore[s], .006f);
-            I.finger0[s] = (int)names_.size();
+            I.finger0[s] = (int)names_->size();
             if (params.finger_lod == 1) { for (const char* f : {"thumb", "index", "middle", "ring", "pinky"}) add(std::string(f) + u, I.hand[s], 0.f); }
             else if (params.finger_lod == 2) {
-                for (int k = 1; k <= 2; ++k) add("thumb_" + std::to_string(k) + u, k == 1 ? I.hand[s] : (int)names_.size() - 1, 0.f);
+                for (int k = 1; k <= 2; ++k) add("thumb_" + std::to_string(k) + u, k == 1 ? I.hand[s] : (int)names_->size() - 1, 0.f);
                 for (const char* f : {"index", "middle", "ring", "pinky"}) { int prev = I.hand[s]; for (int k = 1; k <= 3; ++k) prev = add(std::string(f) + "_" + std::to_string(k) + u, prev, 0.f); }
             }
         }
@@ -366,8 +708,8 @@ private:
         float M = 0; for (float m : masses) M += m;
         for (float& m : masses) m /= M;
         mass_ = masses;
-        bones_.resize(names_.size());
-        for (size_t i = 0; i < names_.size(); ++i) { bones_[i].name = names_[i].c_str(); bones_[i].parent = parents[i]; }
+        bones_.resize(names_->size());
+        for (size_t i = 0; i < names_->size(); ++i) { bones_[i].name = (*names_)[i].c_str(); bones_[i].parent = parents[i]; }
 
         // pose: standing, feet under the hips, legs slightly bent
         yaw_ = 0.f;
@@ -385,6 +727,8 @@ private:
         }
         pose_upper(0.f, true);
         pose_legs(); compute_bones(); compute_balance(1e-3f);
+        { V2 m{0.5f * (cop_ref_of(feet_[0].sole, 0.f).x + cop_ref_of(feet_[1].sole, 0.f).x), cop_ref_of(feet_[0].sole, 0.f).z};   // start with the CoM over the feet
+          pelvis_.x += m.x - com_.x; pelvis_.z += m.z - com_.z; pelvis_prev_ = pelvis_; pose_upper(0.f, true); pose_legs(); compute_bones(); com_init_ = false; compute_balance(1e-3f); }
     }
 
     // ------------------------------------------------------------------ commands
@@ -418,7 +762,7 @@ private:
             f.surface = surface_at(f.sole.x, f.sole.z, std::max(feet_[0].surface, feet_[1].surface)); f.sole.y = f.surface; f.state = FootState::Planted;
         }
         pelvis_.y = std::max(feet_[0].surface, feet_[1].surface) + D.ankle_h + 0.985f * (D.thigh + D.shin); pvel_ = Vec3();
-        com_init_ = false;
+        com_init_ = false; dyn_init_ = false;
         event("stood up (no fall or get-up animation: the pose was reset)");
         return ok("standing");
     }
@@ -480,7 +824,7 @@ private:
         if (std::hypot(tgt.x - pelvis_.x, tgt.z - pelvis_.z) > 4.f) return fail("JUMP rejected: target is more than 4 m away");
         JumpPlan P = plan_jump(tgt, has_apex, clear);
         if (!P.ok) return fail(P.why);
-        flight_ = Flight::Push; fl_v_ = P.v; fl_y0_ = pelvis_.y; fl_push_t_ = 0.f; fl_push_T_ = std::max(0.05f, 2.f * P.stroke / std::max(P.vy, 0.5f));
+        dyn_init_ = false; flight_ = Flight::Push; fl_v_ = P.v; fl_y0_ = pelvis_.y; fl_push_t_ = 0.f; fl_push_T_ = std::max(0.05f, 2.f * P.stroke / std::max(P.vy, 0.5f));
         fl_has_tgt_[0] = fl_has_tgt_[1] = false; queue_.clear(); act_.on = false;
         char b[220]; std::snprintf(b, sizeof b, "jumping: push-off %.0f cm over %.2f s, take-off %.2f m/s up and %.2f m/s forward, in the air about %.2f s",
                                    P.stroke * 100.f, fl_push_T_, P.vy, std::hypot(P.v.x, P.v.z), P.T);
@@ -552,7 +896,7 @@ private:
 
     void clamp_push_reach() {                  // while the feet are still planted the legs cannot be longer than they are
         for (int s = 0; s < 2; ++s) {
-            Vec3 A = feet_[s].sole + Vec3(0, D.ankle_h, 0), H = hip_pos(s, pelvis_, yaw_), d = H - A; float l = d.length(), hi = 0.995f * rmax_leg_ + params.ankle_push * params.scale;
+            Vec3 A = ankle_of(feet_[s]), H = hip_pos(s, pelvis_, hyaw()), d = H - A; float l = d.length(), hi = 0.995f * rmax_leg_ + params.ankle_push * params.scale;
             if (l > hi) pelvis_ -= d * ((l - hi) / l);
         }
     }
@@ -561,14 +905,14 @@ private:
         const float L = D.thigh + D.shin;
         float vy = fl_v_.y;
         for (int s = 0; s < 2; ++s) {
-            Foot& f = feet_[s]; f.sole.y = surfs[s]; f.surface = surfs[s]; f.state = FootState::Planted; f.pitch = 0.f; f.toe = 0.f;
+            Foot& f = feet_[s]; f.sole.y = surfs[s]; f.surface = surfs[s]; f.state = FootState::Planted; f.pitch = 0.f; f.toe = 0.f; f.heel = 0.f;
             fl_has_tgt_[s] = false; fl_has_yaw_[s] = false;
         }
         if (std::fabs(surfs[0] - surfs[1]) > 0.02f) event("landed with one foot higher than the other: the lower leg may not reach its surface");
         float y_ext = highest + D.ankle_h + 0.985f * L;
         float dip = std::min(vy * vy / (2.f * 25.f), 0.22f * params.scale);       // the knees absorb the impact over ~25 m/s^2
         pelvis_.y = y_ext - dip; pvel_ = Vec3(fl_v_.x, 0.f, fl_v_.z);
-        flight_ = Flight::None; unstable_t_ = 0.f; reach_warned_ = false;
+        flight_ = Flight::None; unstable_t_ = 0.f; reach_warned_ = false; dyn_init_ = false;
         char b[160]; std::snprintf(b, sizeof b, "landed at (%.2f, %.2f), coming down at %.2f m/s, still moving %.2f m/s horizontally", pelvis_.x, pelvis_.z, -vy, std::hypot(fl_v_.x, fl_v_.z));
         event(b);
     }
@@ -600,11 +944,45 @@ private:
         else start_swing();
     }
 
+    float swing_time(float h, float dy) const {
+        float stride = std::sqrt(h * h + dy * dy);
+        if (!params.dynamic_gait) return clampf(0.30f + 0.40f * stride, 0.30f, 1.1f) * params.step_time_scale;
+        return clampf(params.swing_base + params.swing_per_m * stride, 0.28f, 1.1f) * params.step_time_scale;
+    }
+
+    // A step the pendulum cannot catch in the nominal time is taken more slowly (a person slows down when the next foot is far):
+    // find the shortest swing time, up to 1.9x nominal, for which the dead-beat CoP stays inside the support foot.
+    bool swing_ok_ = true;
+    float feasible_swing_time(float T_nom) {
+        const float w = dyn_w(); V2 xi{cm_.x + cmv_.x / w, cm_.z + cmv_.z / w}; if (!dyn_init_) xi = {com_.x, com_.z};
+        for (float k = 0.8f; k <= 1.91f; k += 0.1f) {
+            float T = T_nom * k; GaitPlan P = make_plan(w, T); float E = std::exp(w * T);
+            V2 c{(P.xi_td0.x - xi.x * E) / (1.f - E), (P.xi_td0.z - xi.z * E) / (1.f - E)};
+            if (body_detail::hull_margin(foot_polygon(1 - act_.side), c) >= 0.004f) { swing_ok_ = true; return T; }
+        }
+        swing_ok_ = false; return T_nom * 1.9f;
+    }
+    // Assist: if the pendulum cannot catch the commanded landing even at the slowest swing, land nearer to the support foot (and say so).
+    void adjust_for_capture() {
+        Foot& f = feet_[act_.side]; const Foot& sup = feet_[1 - act_.side];
+        float h0 = std::hypot(act_.cmd.target.x - f.sole.x, act_.cmd.target.z - f.sole.z);
+        feasible_swing_time(swing_time(h0, 0.f)); if (swing_ok_) return;
+        Vec3 orig = act_.cmd.target; float dx = orig.x - sup.sole.x, dz = orig.z - sup.sole.z, d0 = std::hypot(dx, dz);
+        for (float k : {0.8f, 0.65f, 0.5f, 0.35f, 0.2f, 0.1f, 0.05f}) {
+            act_.cmd.target.x = sup.sole.x + dx * k; act_.cmd.target.z = sup.sole.z + dz * k;
+            float h = std::hypot(act_.cmd.target.x - f.sole.x, act_.cmd.target.z - f.sole.z); feasible_swing_time(swing_time(h, 0.f));
+            if (swing_ok_) { char b[200]; std::snprintf(b, sizeof b, "%s foot target pulled in from %.2f m to %.2f m from the support foot: the body could not catch itself at the requested distance (assist)", side_name(act_.side).c_str(), d0, d0 * k); event(b); return; }
+        }
+        act_.cmd.target = orig;                                              // nothing helps: take the step as asked, the balance model decides
+    }
+
     void start_swing() {
         Foot& f = feet_[act_.side]; Vec3 end; bool planted; float surf; std::string why;
+        if (dyn_on() && f.state == FootState::Planted && act_.cmd.target.y <= surface_at(act_.cmd.target.x, act_.cmd.target.z, feet_[1 - act_.side].surface) + 0.02f) adjust_for_capture();
         if (!validate_step(act_.cmd, end, planted, surf, why)) { event(why); act_.on = false; return; }
         float h = std::hypot(end.x - f.sole.x, end.z - f.sole.z), dy = end.y - f.sole.y, stride = std::sqrt(h * h + dy * dy);
-        float T = clampf(0.30f + 0.40f * stride, 0.30f, 1.1f) * params.step_time_scale;
+        float T = swing_time(h, dy);
+        if (dyn_on() && f.state == FootState::Planted) { float Tn = T; T = feasible_swing_time(Tn); (void)Tn; }
         float lift = clampf(0.06f + 0.12f * h, 0.05f, 0.16f) * params.scale + std::max(0.f, dy);
         Vec3 p0 = f.sole, v0, a0;
         if (f.state == FootState::Swing) f.traj.eval(f.traj.t, p0, v0, a0);
@@ -621,6 +999,19 @@ private:
         }
         if (act_.on && act_.phase == Active::Shift) {
             act_.t += dt;
+            if (dyn_on()) {                                           // ready when the pendulum can reach the plan with the CoP inside the support foot
+                const float w = dyn_w(); GaitPlan P = make_plan(w, 0.f); V2 xi{cm_.x + cmv_.x / w, cm_.z + cmv_.z / w};
+                if (!dyn_init_) { xi = {com_.x, com_.z}; }
+                float E = std::exp(w * std::max(P.T0, 0.12f)); V2 c{(P.xi_td0.x - xi.x * E) / (1.f - E), (P.xi_td0.z - xi.z * E) / (1.f - E)};
+                float m = body_detail::hull_margin(foot_polygon(1 - act_.side), c);
+                float unload = body_detail::hull_margin(foot_polygon(1 - act_.side), V2{cop_f_.x, cop_f_.z});   // the swing foot lifts once the CoP is under the support foot (it is unloaded)
+                                bool close = std::hypot(xi.x - shift_ref(P).x, xi.z - shift_ref(P).z) < 0.015f; bool still = std::hypot(cmv_.x, cmv_.z) < 0.15f, inside = body_detail::hull_margin(foot_polygon(1 - act_.side), xi) >= 0.012f;   // quasi-static: the DCM is inside the support foot
+                if (((m >= 0.006f || close || (still && inside)) && unload >= -0.004f && act_.t >= params.step_ds_time) || act_.t > 1.0f) {
+                    if (m < 0.f) event("weight shift timed out before the CoM could be caught by the support foot; stepping anyway");
+                    start_swing();
+                }
+                return;
+            }
             const Foot& sup = feet_[1 - act_.side];
             float m = single_margin(1 - act_.side);
             float pv = std::hypot(pvel_.x, pvel_.z);
@@ -645,7 +1036,7 @@ private:
             f.traj.t += dt;
             float tau = clampf(f.traj.t / f.traj.T, 0.f, 1.f);
             if (f.traj.t >= f.traj.T) {
-                f.sole = f.end_sole; f.yaw = f.yaw1; f.pitch = 0.f; f.toe = 0.f;
+                f.sole = f.end_sole; f.yaw = f.yaw1; f.pitch = 0.f; f.toe = 0.f; f.heel = 0.f;
                 if (f.end_planted) {
                     f.state = FootState::Planted; f.surface = f.end_surface;
                     event(side_name(s) + " foot planted at " + xz(f.sole));
@@ -656,7 +1047,7 @@ private:
             f.sole = f.traj.position(f.traj.t);
             f.sole.y = std::max(f.sole.y, surface_at(f.sole.x, f.sole.z, feet_[1 - s].surface));          // never through a surface
             f.yaw = f.yaw0 + (f.yaw1 - f.yaw0) * minimum_jerk_s(tau);
-            f.pitch = body_detail::swing_pitch(tau); f.toe = std::max(0.f, -f.pitch) * 0.8f;
+            f.heel *= std::exp(-dt * 14.f); f.pitch = body_detail::swing_pitch(tau); f.toe = std::max(0.f, -f.pitch) * 0.8f;
         }
     }
 
@@ -667,7 +1058,7 @@ private:
         for (int it = 0; it < 4; ++it)
             for (int s = 0; s < 2; ++s) {
                 if (feet_[s].state != FootState::Planted) continue;
-                Vec3 A = feet_[s].sole + Vec3(0, D.ankle_h, 0), H = hip_pos(s, p, yaw), d = H - A; float l = d.length();
+                Vec3 A = ankle_of(feet_[s]), H = hip_pos(s, p, yaw), d = H - A; float l = d.length();
                 float hi = 0.995f * rmax_leg_, lo = rmin_leg_;
                 if (l > hi) { p -= d * ((l - hi) / l); if (!reach_warned_) { event("pelvis limited by leg length (the planted feet do not slide)"); reach_warned_ = true; } }
                 else if (l < lo && l > 1e-6f) p += d * ((lo - l) / l);
@@ -688,6 +1079,9 @@ private:
             float lim = 60.f * PI / 180.f, diff = wrap(yaw_ - twist_ref);
             if (std::fabs(diff) > lim) { yaw_ = twist_ref + (diff > 0 ? lim : -lim); if (face_user_ && !turn_warned_) { event("FACE limited: planted feet allow 60 degrees of twist; step the feet around (FOOT with a yaw) to turn further"); turn_warned_ = true; } }
         }
+        if (np > 0 && dyn_on()) { update_pelvis_dynamic(dt, planted, np); return; }
+        dyn_init_ = false;                                            // legacy path: the walking-only extras fade out
+        { float k = std::exp(-dt * 8.f); twist_ *= k; chest_twist_ *= k; lean_.x *= k; lean_.z *= k; head_dev_.x *= k; head_dev_.z *= k; for (int s = 0; s < 2; ++s) arm_swing_[s] *= k; }
         // target
         const bool override_on = act_.on && params.balance == Balance::Assist && feet_[1 - act_.side].state == FootState::Planted;
         V2 txz{pelvis_.x, pelvis_.z}; float surf = 0.f;
@@ -708,7 +1102,7 @@ private:
         if (hl > hmax) { dlt.x *= hmax / hl; dlt.z *= hmax / hl; }
         dlt.y = clampf(dlt.y, -vmax, vmax);
         Vec3 np_ = pelvis_ + dlt;
-        clamp_reach(np_, yaw_);
+        clamp_reach(np_, hyaw());
         if (params.balance == Balance::Assist && !support_.empty()) {                // keep the extrapolated CoM inside the support polygon
             std::vector<V2> poly = np ? support_poly() : std::vector<V2>();
             if (!poly.empty()) {
@@ -719,7 +1113,7 @@ private:
                     // x = pos + off + (pos - prev)/(dt*w0): moving the pelvis by d moves x by k*d, with k = 1 + 1/(dt*w0).
                     // Dividing by k is exactly the capture-point speed limit (it also avoids a frame-to-frame oscillation).
                     V2 pr = hull_project(poly, x, params.safe_margin); float k = 1.f + 1.f / (dt * w0);
-                    np_.x += (pr.x - x.x) / k; np_.z += (pr.z - x.z) / k; clamp_reach(np_, yaw_);
+                    np_.x += (pr.x - x.x) / k; np_.z += (pr.z - x.z) / k; clamp_reach(np_, hyaw());
                 }
             }
         }
@@ -740,7 +1134,7 @@ private:
         Vec3 root = pelvis_ + up * D.pelvis_bone;
         float total = D.spine[0] + D.spine[1] + D.spine[2];
         spine_.root_position = root; spine_.root_orientation = Quat::rotation_between(Vec3(1, 0, 0), up);
-        Vec3 t = (torso_user_ ? torso_tgt_ : root + up * total) - root;
+        Vec3 t = (torso_user_ ? torso_tgt_ - root : up * total + Vec3(lean_.x + head_dev_.x, 0.f, lean_.z + head_dev_.z) );
         float l = t.length(); if (l < 1e-4f) t = up * total, l = total;
         Vec3 dir = t * (1.f / l);
         if (dir.y < std::cos(55.f * PI / 180.f)) { Vec3 hz(dir.x, 0, dir.z); hz = hz.normalized(); dir = up * std::cos(55.f * PI / 180.f) + hz * std::sin(55.f * PI / 180.f); }
@@ -752,13 +1146,20 @@ private:
         float lyaw = 0, lpitch = 0, chest_yaw = yaw_;
         if (look_user_) {
             Vec3 d = (look_tgt_ - headc).normalized();
-            float gy = std::atan2(d.x, d.z); chest_yaw = yaw_ + clampf(0.35f * wrap(gy - yaw_), -0.44f, 0.44f);
+            float hz = std::hypot(d.x, d.z), hw = clampf((hz - 0.05f) / 0.35f, 0.f, 1.f);       // gaze almost straight up/down: its heading is meaningless, keep the current one
+            float gy = std::atan2(d.x, d.z); chest_yaw = yaw_ + hw * clampf(0.35f * wrap(gy - yaw_), -0.44f, 0.44f);
             Quat q0 = frameQ(cup, fwd(chest_yaw)); Vec3 Z = q0.rotate(Vec3(0, 0, 1)), X = q0.rotate(Vec3(1, 0, 0));
             float dx = dot(d, X), dz = dot(d, Z), dyy = dot(d, cup);
-            lyaw = std::atan2(dx, dz); lpitch = std::atan2(dyy, std::hypot(dx, dz));
+            lyaw = std::atan2(dx, dz) * hw; lpitch = std::atan2(dyy, std::hypot(dx, dz));
             float ym = 75.f * PI / 180.f, pu = 50.f * PI / 180.f, pd = -55.f * PI / 180.f;
             if ((std::fabs(lyaw) > ym || lpitch > pu || lpitch < pd) && !look_warned_) { event("LOOK limited by neck range (75 deg turn, +50/-55 deg tilt); the body must turn to look further"); look_warned_ = true; }
             lyaw = clampf(lyaw, -ym, ym); lpitch = clampf(lpitch, pd, pu);
+        }
+        {   // head and gaze have inertia: a LOOK target is chased by a critically damped spring instead of snapping like a camera
+            float co = chest_yaw - yaw_;
+            if (init || dt <= 0.f || params.head_turn_omega <= 0.f) { hl_chest_ = co; hl_yaw_ = lyaw; hl_pitch_ = lpitch; hl_vchest_ = hl_vyaw_ = hl_vpitch_ = 0.f; }
+            else { damp1(hl_chest_, hl_vchest_, co, 0.7f * params.head_turn_omega, dt); damp1(hl_yaw_, hl_vyaw_, lyaw, params.head_turn_omega, dt); damp1(hl_pitch_, hl_vpitch_, lpitch, params.head_turn_omega, dt); }
+            chest_yaw = yaw_ + hl_chest_ + chest_twist_; lyaw = hl_yaw_; lpitch = hl_pitch_;
         }
         Quat qc = frameQ(cup, fwd(chest_yaw)); chest_q_ = qc;
         auto qyaw = [](float a) { return Quat::from_axis_angle(Vec3(0, 1, 0), a); };
@@ -782,7 +1183,9 @@ private:
             arms_.set_anchor(arm_id_[s], shoulder_[s]);
             arms_.set_pole(arm_id_[s], (Z * -0.6f + X * (g * 0.25f) + Vec3(0, -1, 0)));
             Vec3 restpt = shoulder_[s] + X * (g * 0.07f * params.scale) + Z * (0.05f * params.scale) + Vec3(0, -(D.upper + D.fore) * 0.86f, 0);
-            if (!hands_[s].target_mode && (!hands_[s].has_last || (restpt - hands_[s].last).length() > 0.03f * params.scale)) { arms_.reach_to(arm_id_[s], restpt); hands_[s].last = restpt; hands_[s].has_last = true; }
+            restpt += fwd(yaw_) * arm_swing_[s];
+            const float thr = (std::fabs(arm_swing_[s]) > 0.004f || std::fabs(arm_swing_v_[s]) > 0.02f) ? 0.003f : 0.03f;
+            if (!hands_[s].target_mode && (!hands_[s].has_last || (restpt - hands_[s].last).length() > thr * params.scale)) { arms_.reach_to(arm_id_[s], restpt); hands_[s].last = restpt; hands_[s].has_last = true; }
             if (init) arms_.teleport_to(arm_id_[s], restpt);
         }
         arms_.update(init ? 1e-4f : dt);
@@ -794,9 +1197,9 @@ private:
     void pose_legs() {
         using namespace body_detail;
         for (int s = 0; s < 2; ++s) {
-            Foot& f = feet_[s]; f.leg.root_position = hip_pos(s, pelvis_, yaw_);
+            Foot& f = feet_[s]; f.leg.root_position = hip_pos(s, pelvis_, hyaw());
             Vec3 pole = (fwd(f.yaw) * 0.6f + fwd(yaw_) * 0.4f).normalized();
-            solve_two_bone_reach(f.leg, f.sole + Vec3(0, D.ankle_h, 0), pole, rmin_leg_, 0.999f * rmax_leg_);
+            solve_two_bone_reach(f.leg, ankle_of(f), pole, rmin_leg_, 0.999f * rmax_leg_);
             Vec3 p[3]; f.leg.world_positions(p); f.hip = p[0]; f.knee = p[1]; f.ankle = p[2];
         }
     }
@@ -806,7 +1209,7 @@ private:
 
     void compute_bones() {
         using namespace body_detail;
-        Vec3 up(0, 1, 0), pf = fwd(yaw_);
+        Vec3 up(0, 1, 0), pf = fwd(hyaw());
         put(0, pelvis_, pelvis_ + up * D.pelvis_bone, pf);
         Vec3 zc = chest_q_.rotate(Vec3(0, 0, 1)), Xc = chest_q_.rotate(Vec3(1, 0, 0));
         for (int i = 0; i < 3; ++i) { float k = (i + 1) / 3.f; put(1 + i, sp_[i], sp_[i + 1], pf * (1.f - k) + zc * k); }
@@ -868,6 +1271,33 @@ private:
         vcom_.x = vcom_.x * 0.6f + raw.x * 0.4f; vcom_.z = vcom_.z * 0.6f + raw.z * 0.4f;
         com_prev_ = com_;
         support_ = support_poly();
+        if (params.dynamic_gait && params.balance == Balance::Assist && act_.on && flight_ == Flight::None) {
+            const Foot& f = feet_[act_.side]; bool swing = act_.phase == Active::Swing;      // dynamic walking: the DCM may leave the stance foot as long as the landing foot can catch it
+            Vec3 land = swing ? f.end_sole : act_.cmd.target; float ly = swing ? f.yaw1 : (act_.cmd.has_yaw ? act_.cmd.yaw : f.yaw);
+            if (!swing || f.end_planted) {
+                std::vector<V2> pts = support_; Vec3 fw = fwd(ly), lf = lft(ly);
+                for (float lat : {D.heel_hw, -D.heel_hw}) { Vec3 q = land - fw * D.heel + lf * lat; pts.push_back({q.x, q.z}); }
+                for (float lat : {D.ball_hw, -D.ball_hw}) { Vec3 q = land + fw * D.ball + lf * lat; pts.push_back({q.x, q.z}); }
+                support_ = hull(pts);
+            }
+        }
+        if (tracking_) {        // a tracked walk is dynamic: the DCM may leave the stance foot as long as the other foot is (about to be) down; count its footprint where it is
+            std::vector<V2> pts = support_;
+            for (int s = 0; s < 2; ++s) {
+                if (track_land_has_[s]) {      // the clip says where this foot lands next: count that footprint, exactly like the walking engine does (also while it is still being loaded)
+                    Vec3 fw = fwd(track_land_yaw_[s]), lf = lft(track_land_yaw_[s]), L = track_land_[s];
+                    for (float lat : {D.heel_hw, -D.heel_hw}) { Vec3 q = L - fw * D.heel + lf * lat; pts.push_back({q.x, q.z}); }
+                    for (float lat : {D.ball_hw, -D.ball_hw}) { Vec3 q = L + fw * D.ball + lf * lat; pts.push_back({q.x, q.z}); }
+                    continue;
+                }
+                if (feet_[s].state == FootState::Planted) continue;
+                // no look-ahead (single frames): where the swing foot is, and where it will be in ~0.25 s at its current velocity
+                for (const Vec3& q : foot_contact_points(s)) pts.push_back({q.x, q.z});
+                Vec3 d = track_fv_[s] * 0.25f; d.y = 0.f; if (d.length() > 0.6f) d = d.normalized() * 0.6f;
+                for (const Vec3& q : foot_contact_points(s)) pts.push_back({q.x + d.x, q.z + d.z});
+            }
+            if (pts.size() > support_.size()) support_ = hull(pts);
+        }
         int np = 0; float surf = 0; for (int s = 0; s < 2; ++s) if (feet_[s].state == FootState::Planted) { ++np; surf += feet_[s].surface; }
         surf = np ? surf / np : 0.f;
         float h = std::max(0.3f, com_.y - surf), w0 = std::sqrt(9.81f / h);
