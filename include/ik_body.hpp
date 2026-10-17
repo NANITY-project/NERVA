@@ -317,7 +317,9 @@ public:
     void track_land(int s, Vec3 p, float yaw) { if (s < 0 || s > 1) return; track_land_has_[s] = true; track_land_[s] = p; track_land_yaw_[s] = yaw; }
     // Track a whole clip (n frames of ACTION_DIM floats): looks ahead for each lifted foot's next touchdown. reports: n*REPORT_DIM, states: n*STATE_DIM
     // (either may be null). Returns the number of frames that reported a loss of balance.
-    int track_clip(const float* a, int n, float dt, float* reports, float* states) {
+    int track_clip(const float* a, int n, float dt, float* reports, float* states) { return track_clip_each(a, n, dt, reports, states, [](int) {}); }
+    // The same, calling each(i) after frame i has been tracked (e.g. to read the bones of that frame).
+    template <class Fn> int track_clip_each(const float* a, int n, float dt, float* reports, float* states, Fn&& each) {
         float tmp[REPORT_DIM]; int bad = 0;
         for (int i = 0; i < n; ++i) {
             const float* ai = a + (size_t)i * ACTION_DIM;
@@ -334,6 +336,7 @@ public:
             track(ai, dt, reports ? reports + (size_t)i * REPORT_DIM : tmp);
             if (track_unbalanced()) ++bad;
             if (states) get_state(states + (size_t)i * STATE_DIM);
+            each(i);
         }
         return bad;
     }
