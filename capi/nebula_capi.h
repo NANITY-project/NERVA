@@ -73,7 +73,7 @@ NEBULA_API int  nebula_body_command(NebulaBody*, const char* line, char* msg, in
 NEBULA_API void nebula_body_update(NebulaBody*, float dt);
 /* keys: safe_margin, step_time_scale, max_stride, max_step_up, max_step_down, fall_margin, fall_time,
  *       shift_settle_speed, hand_idle_m, balance (1 assist / 0 none),
- *       dynamic_gait (1/0), recover_time, arm_swing_gain, twist_gain, head_turn_omega, leg_len_frac, step_ds_time */
+ *       dynamic_gait (1/0), recover_time, arm_swing_gain, twist_gain, head_turn_omega, leg_len_frac, step_ds_time, swing_reach_slack */
 NEBULA_API int  nebula_body_set_param(NebulaBody*, const char* key, float value);
 NEBULA_API int  nebula_body_add_surface(NebulaBody*, float x0, float x1, float z0, float z1, float y);
 NEBULA_API void nebula_body_clear_surfaces(NebulaBody*);
