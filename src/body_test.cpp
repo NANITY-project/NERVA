@@ -1,4 +1,5 @@
 // Body tests: physical invariants, not just "does it run". Exits non-zero on failure.
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -179,7 +180,7 @@ static void test_stepping() {
     CHECK(v.pelvis().y > 0.927f + 0.15f && !v.fallen(), "the pelvis rises with the platform and the body stays up (y=%.3f)", v.pelvis().y);
     v.command("FOOT right -0.1 0.6 1.0"); run(v, 1.f); (void)v.take_events();       // 40 cm up from a 20 cm platform at z in [0.5,3] -> no surface there: foot target at 0.6 is air (leg lift 0.4 <= 0.6)
     Body w = mk(); w.add_surface(-3, 3, 0.3f, 3, 0.7f); run(w, 1.f); w.command("FOOT right -0.1 0.7 0.5"); run(w, 0.5f); auto ew = w.take_events();
-    CHECK(has(ew, "step up of"), "a 70 cm step up is refused with its height: %s", joined(ew).c_str());
+    CHECK(has(ew, "step up of") || has(ew, "lifting the foot"), "a 70 cm step up is refused with its height (a top above max_step_up is not a floor, so it is reported as a too-high lift): %s", joined(ew).c_str());
     Body d = mk(); d.add_surface(-3, 3, -5, -0.5f, -1.0f); run(d, 1.f); d.command("FOOT right -0.1 -1.0 0.0"); run(d, 0.5f); (void)d.take_events();
     Body air = mk(); run(air, 1.f); air.command("FOOT right -0.1 0.2 0.3"); run(air, 3.f);
     CHECK(air.foot_state(1) == Body::FootState::Air && !air.fallen(), "a foot can be held in the air while the other supports"); air.take_events();
@@ -210,6 +211,153 @@ static void test_walking_is_coordinates() {
     // queued steps run in order without further commands
     Body q = mk(); run(q, 1.f); q.command("FOOT right -0.1 0 0.4"); q.command("FOOT left 0.1 0 0.8"); q.command("FOOT right -0.1 0 1.2"); CHECK(q.steps_queued() == 3, "three steps queued (%d)", q.steps_queued());
     run_until(q, 12.f, idle); run(q, 1.5f); CHECK(!q.fallen() && std::fabs(q.foot_sole(1).z - 1.2f) < 0.005f && std::fabs(q.foot_sole(0).z - 0.8f) < 0.005f, "queued steps all land in order (%.3f, %.3f)", q.foot_sole(0).z, q.foot_sole(1).z);
+}
+
+
+static void test_dynamic_gait() {
+    std::printf("[dynamic gait: inverted pendulum + capture point]\n");
+    auto walk = [&](bool dyn, float stride, float hw, int n, std::vector<float>& spd, std::vector<float>& py, std::vector<float>& px, float& twist, float& minm, bool& fell) {
+        Body::Params p; p.hand_idle_m = 0.f; p.dynamic_gait = dyn; Body b(p); run(b, 1.f); int fed = 0; Vec3 pp = b.pelvis(); std::vector<float> tt, st; bool was[2] = {false, false}; twist = 0; minm = 9; fell = false;
+        std::vector<std::pair<float, float>> raw;
+        for (float t = 0; t < 25.f && (b.stepping() || fed < n || t < 0.5f); t += DT) {
+            while (fed < n && b.steps_queued() < 4) { char c[80]; std::snprintf(c, sizeof c, "FOOT %s %.3f 0 %.3f", fed % 2 == 0 ? "right" : "left", fed % 2 == 0 ? -hw : hw, (fed + 1) * stride); b.command(c); ++fed; }
+            b.update(DT); Vec3 q = b.pelvis(); float v = std::hypot(q.x - pp.x, q.z - pp.z) / DT; pp = q; minm = std::min(minm, b.margin()); if (b.fallen()) fell = true;
+            tt.push_back(t); raw.push_back({v, q.y}); px.push_back(q.x);
+            for (int s = 0; s < 2; ++s) { bool sw = b.foot_state(s) == Body::FootState::Swing; if (was[s] && !sw) st.push_back(t); was[s] = sw; }
+            Vec3 hl = bone(b, "thigh_L").head - bone(b, "thigh_R").head; twist = std::max(twist, std::fabs(std::atan2(hl.z, hl.x)) * 180.f / PI);
+        }
+        size_t a = 0, z = tt.size(); if (st.size() > 4) { while (tt[a] < st[2]) ++a; z = a; while (z < tt.size() && tt[z] < st[st.size() - 2]) ++z; }
+        for (size_t i = a; i < z; ++i) { spd.push_back(raw[i].first); py.push_back(raw[i].second); }
+        px = std::vector<float>(px.begin() + a, px.begin() + z);
+    };
+    auto span = [](const std::vector<float>& v) { float lo = 9, hi = -9; for (float x : v) { lo = std::min(lo, x); hi = std::max(hi, x); } return hi - lo; };
+    std::vector<float> sd, yd, xd, sl, yl, xl; float twd, twl, md, ml; bool fd, fl;
+    walk(true, 0.45f, 0.06f, 10, sd, yd, xd, twd, md, fd); walk(false, 0.45f, 0.06f, 10, sl, yl, xl, twl, ml, fl);
+    float vmin = 9, vm = 0; for (float v : sd) { vmin = std::min(vmin, v); vm += v / sd.size(); } float lmin = 9; for (float v : sl) lmin = std::min(lmin, v);
+    std::printf("  dynamic: speed min/mean %.2f/%.2f m/s, bob %.1f cm, sway %.1f cm, hip-line twist %.1f deg, min margin %.1f cm | legacy: min speed %.2f m/s, sway %.1f cm\n", vmin, vm, span(yd) * 100, span(xd) * 100, twd, md * 100, lmin, span(xl) * 100);
+    CHECK(!fd && md > -0.02f, "the dynamic walk never falls (min margin %.3f)", md);
+    CHECK(vmin > 0.25f * vm && vmin > 0.2f, "the pelvis never stops between steps (min %.2f, mean %.2f m/s)", vmin, vm);
+    CHECK(lmin < 0.1f, "(the old gait does stop every step: %.2f m/s -- this is what the new one fixes)", lmin);
+    CHECK(span(yd) > 0.02f && span(yd) < 0.09f, "pelvis bob comes from the stance-leg geometry: %.1f cm p-p", span(yd) * 100);
+    CHECK(span(xd) > 0.03f && span(xd) < 0.11f, "lateral sway is human-sized, not a waddle: %.1f cm p-p", span(xd) * 100);
+    CHECK(twd > 1.0f, "the pelvis twists as the legs swing (%.1f deg)", twd);
+    // arms swing opposite the legs with no hand commands; the body still ends at rest
+    Body b = mk(); b.params.hand_idle_m = 0.f; run(b, 1.f); float z0 = bone(b, "hand_R").head.z; float zmax = -9, zmin = 9;
+    for (int i = 0; i < 6; ++i) { char c[80]; std::snprintf(c, sizeof c, "FOOT %s %.3f 0 %.3f", i % 2 == 0 ? "right" : "left", i % 2 == 0 ? -0.06f : 0.06f, (i + 1) * 0.5f); b.command(c); }
+    for (float t = 0; t < 8.f; t += DT) { b.update(DT); float z = bone(b, "hand_R").head.z - b.pelvis().z; zmax = std::max(zmax, z); zmin = std::min(zmin, z); }
+    std::printf("  right hand fore-aft range relative to the pelvis: %.1f cm\n", (zmax - zmin) * 100); (void)z0;
+    CHECK(zmax - zmin > 0.10f, "resting hands swing on their own while walking (%.1f cm)", (zmax - zmin) * 100);
+    run(b, 3.f); CHECK(b.speed_ok_for_test(), "comes to rest after the last step"); CHECK(!b.fallen(), "no fall");
+    // head: LOOK is a spring, not a camera snap
+    Body h = mk(); run(h, 1.f); auto hf = [&]() { Vec3 f = bone(h, "head").q.rotate(Vec3(0, 0, 1)); f.y = 0; return f; }; Vec3 before = hf(); h.command("LOOK -2 1.6 0.2"); h.update(DT); Vec3 after = hf();
+    CHECK(ang(before, after) < 10.f, "the head does not snap to a new look target in one frame (%.1f deg)", ang(before, after)); run(h, 1.5f);
+    Vec3 fin = hf(); CHECK(ang(fin, Vec3(-2, 0, 0.2f)) < 40.f && ang(before, fin) > 40.f, "but it gets there (turned %.0f deg)", ang(before, fin));
+}
+
+static void test_learning_interface() {
+    std::printf("[learning interface: state vector, tracking, recovery]\n");
+    Body b = mk(); run(b, 1.f); float st[Body::STATE_DIM]; b.get_state(st); bool fin = true; for (float v : st) fin = fin && std::isfinite(v);
+    CHECK(fin && Body::state_names()[0] && std::string(Body::state_names()[Body::STATE_DIM - 1]) == "steps_queued", "state vector is %d finite floats with names", Body::STATE_DIM);
+    // 1. record a real dynamic walk as an action clip (what a generator would output), then track it on a fresh body
+    Body w = mk(); run(w, 1.f); for (int i = 0; i < 6; ++i) { char c[80]; std::snprintf(c, sizeof c, "FOOT %s %.3f 0 %.3f", i % 2 == 0 ? "right" : "left", i % 2 == 0 ? -0.07f : 0.07f, (i + 1) * 0.45f); w.command(c); }
+    std::vector<std::array<float, Body::ACTION_DIM>> clip; std::vector<Vec3> pel;
+    for (float t = 0; t < 6.f; t += DT) {
+        w.update(DT); std::array<float, Body::ACTION_DIM> a{}; Vec3 p = w.pelvis(); a[0] = p.x; a[1] = p.y; a[2] = p.z; a[3] = w.yaw();
+        for (int s = 0; s < 2; ++s) { Vec3 f = w.foot_sole(s); float* o = &a[4 + 5 * s]; o[0] = f.x; o[1] = f.y; o[2] = f.z; o[3] = w.foot_yaw(s); o[4] = w.foot_state(s) == Body::FootState::Planted ? 1.f : 0.f; }
+        clip.push_back(a); pel.push_back(p);
+    }
+    Body t = mk(); float rep[Body::REPORT_DIM], worst_slide = 0, worst_reach = 0, worst_leg = 0, minm = 9;
+    std::vector<float> flat, reps(clip.size() * Body::REPORT_DIM); for (auto& a : clip) flat.insert(flat.end(), a.begin(), a.end());
+    int bad = t.track_clip(flat.data(), (int)clip.size(), DT, reps.data(), nullptr);
+    for (size_t i = 0; i < clip.size(); ++i) { const float* r = &reps[i * Body::REPORT_DIM]; worst_slide = std::max(worst_slide, std::max(r[0], r[1])); worst_reach = std::max(worst_reach, r[4]); worst_leg = std::max(worst_leg, std::max(r[5], r[6])); minm = std::min(minm, r[10]); }
+    float perr = (t.pelvis() - pel.back()).length();
+    std::printf("  tracked a recorded walk: slide %.1f mm, reach correction %.1f mm, leg unreachable %.1f mm, min margin %.1f cm, unbalanced frames %d, final pelvis error %.1f mm\n", worst_slide * 1e3, worst_reach * 1e3, worst_leg * 1e3, minm * 100, bad, perr * 1e3);
+    CHECK(worst_slide < 0.02f && worst_reach < 0.02f && worst_leg < 0.02f, "a physically valid clip passes through almost untouched");
+    CHECK(bad == 0 && perr < 0.005f, "and it never reports a loss of balance (%d frames)", bad);
+    // 2. an impossible clip is corrected and reported
+    Body v = mk(); run(v, 1.f); std::array<float, Body::ACTION_DIM> a{}; a[0] = 0; a[1] = 0.927f; a[2] = 0; a[4] = 0.1f; a[6] = 0; a[8] = 1; a[9] = -0.1f; a[11] = 0; a[13] = 1;
+    v.track(a.data(), DT, rep); a[4] = 0.5f;                                      // the contact foot "slides" 40 cm in one frame
+    v.track(a.data(), DT, rep); CHECK(rep[0] > 0.3f && std::fabs(v.foot_sole(0).x - 0.1f) < 1e-4f, "a planted foot that slides is held in place and the slide is reported (%.2f m)", rep[0]);
+    a[4] = 0.1f; a[5] = -0.2f; v.track(a.data(), DT, rep); CHECK(rep[2] > 0.15f && v.foot_sole(0).y >= -1e-6f, "a foot below the ground is lifted out and reported (%.2f m)", rep[2]);
+    a[5] = 0; a[1] = 1.6f; v.track(a.data(), DT, rep); CHECK(rep[4] > 0.3f || rep[5] > 0.3f, "a pelvis higher than the legs can reach is corrected (%.2f m)", std::max(rep[4], rep[5]));
+    a[1] = 0.927f; a[14] = 4.f; a[15] = 1.f; a[16] = 1.f; a[17] = 1.f; v.track(a.data(), DT, rep); CHECK(rep[8] > 1.5f, "a hand target 4 m away is reported as unreachable (%.2f m)", rep[8]);
+    // 3. control returns to the gait controller
+    v.track_end(); run(v, 0.5f); auto r = v.command("FOOT right -0.1 0 0.4"); run(v, 3.f); CHECK(r.ok && !v.tracking() && v.foot_state(1) == Body::FootState::Planted && !v.fallen(), "track_end hands control back: a normal step works afterwards");
+    // 4. falls are recovered instead of freezing at an angle
+    Body f = mk(); f.params.balance = Body::Balance::None; f.command("TORSO 0 1.0 0.9"); f.command("PELVIS 0 0.9 0.5"); run(f, 3.f); bool was = f.fallen(); auto ev0 = f.take_events();
+    f.params.balance = Body::Balance::Assist; f.command("PELVIS auto"); f.command("TORSO auto"); run(f, 3.f);
+    std::printf("  fell=%d, then: fallen=%d, pelvis y=%.2f\n", (int)was, (int)f.fallen(), f.pelvis().y);
+    CHECK(!f.fallen() && f.pelvis().y > 0.85f, "after a fall the body stands itself back up (recover_time)");
+    // 5. looking straight up/down: no jump in head orientation frame to frame
+    Body h = mk(); run(h, 1.f); float maxjump = 0; Vec3 prev = bone(h, "head").q.rotate(Vec3(0, 0, 1));
+    for (int i = 0; i < 240; ++i) { float x = 0.4f * std::sin(i * 0.05f), z = 0.4f * std::cos(i * 0.05f); char c[80]; std::snprintf(c, sizeof c, "LOOK %.3f 4.0 %.3f", x, z); h.command(c); h.update(DT); Vec3 cur = bone(h, "head").q.rotate(Vec3(0, 0, 1)); maxjump = std::max(maxjump, ang(prev, cur)); prev = cur; }
+    std::printf("  sweeping the gaze across the zenith: max head turn per frame %.1f deg\n", maxjump);
+    CHECK(maxjump < 12.f, "no teleport when the gaze passes overhead (%.1f deg per frame)", maxjump);
+}
+
+// A recorded dynamic walk as a flat action clip (what a generator would output).
+static std::vector<float> walk_clip(int& n) {
+    Body w = mk(); run(w, 1.f); for (int i = 0; i < 6; ++i) { char c[80]; std::snprintf(c, sizeof c, "FOOT %s %.3f 0 %.3f", i % 2 == 0 ? "right" : "left", i % 2 == 0 ? -0.07f : 0.07f, (i + 1) * 0.45f); w.command(c); }
+    std::vector<float> flat; n = 0;
+    for (float t = 0; t < 6.f; t += DT, ++n) {
+        w.update(DT); std::array<float, Body::ACTION_DIM> a{}; Vec3 p = w.pelvis(); a[0] = p.x; a[1] = p.y; a[2] = p.z; a[3] = w.yaw();
+        for (int s = 0; s < 2; ++s) { Vec3 f = w.foot_sole(s); float* o = &a[4 + 5 * s]; o[0] = f.x; o[1] = f.y; o[2] = f.z; o[3] = w.foot_yaw(s); o[4] = w.foot_state(s) == Body::FootState::Planted ? 1.f : 0.f; }
+        flat.insert(flat.end(), a.begin(), a.end());
+    }
+    return flat;
+}
+static float state_diff(const Body& a, const Body& b) { float x[Body::STATE_DIM], y[Body::STATE_DIM]; a.get_state(x); b.get_state(y); float m = 0; for (int i = 0; i < Body::STATE_DIM; ++i) m = std::max(m, std::fabs(x[i] - y[i])); return m; }
+
+static void test_snapshot_and_verdict() {
+    std::printf("[snapshot / restore, clip verdict]\n");
+    // 1. a copy is a full snapshot: it continues exactly like the original (here mid-step, with steps still queued)
+    Body a = mk(); run(a, 1.f); for (int i = 0; i < 4; ++i) { char c[80]; std::snprintf(c, sizeof c, "FOOT %s %.3f 0 %.3f", i % 2 == 0 ? "right" : "left", i % 2 == 0 ? -0.07f : 0.07f, (i + 1) * 0.4f); a.command(c); }
+    run(a, 1.2f); Body c = a; int q0 = a.steps_queued(); run(a, 3.f); run(c, 3.f);
+    CHECK(q0 > 0 && state_diff(a, c) == 0.f && a.bones().size() == c.bones().size(), "a copy mid-walk continues identically to the original (queued steps %d)", q0);
+    Body d = a; d.command("PELVIS 0.1 0.9 0.3"); run(d, 1.f);
+    CHECK(state_diff(a, d) > 0.01f, "changing the copy does not change the original");
+    // 2. the copy owns valid bone names even after the original is gone
+    Body* o = new Body(mk()); Body k = *o; delete o; run(k, 0.5f); int hi = k.bone_index("head");
+    CHECK(hi >= 0 && std::string(k.bones()[hi].name) == "head" && std::string(k.bones()[0].name).size() > 0, "a copy's bone names stay valid after the original is destroyed");
+    Body asg = mk(); asg = a; CHECK(state_diff(asg, a) == 0.f && std::string(asg.bones()[hi].name) == "head", "assignment restores a snapshot into an existing body");
+    // 3. snapshot while TRACKING: both copies track the rest of the clip with identical reports and states
+    int n = 0; std::vector<float> clip = walk_clip(n); const size_t A = Body::ACTION_DIM; int h = n / 2;
+    Body t1 = mk(); t1.track_clip(clip.data(), h, DT, nullptr, nullptr); Body t2 = t1;
+    std::vector<float> r1((n - h) * Body::REPORT_DIM), r2(r1.size()), s1((n - h) * Body::STATE_DIM), s2(s1.size());
+    t1.track_clip(clip.data() + h * A, n - h, DT, r1.data(), s1.data()); t2.track_clip(clip.data() + h * A, n - h, DT, r2.data(), s2.data());
+    CHECK(r1 == r2 && s1 == s2, "a tracking snapshot continues with identical reports and states");
+    // 4. preview_clip judges a candidate from the current state and leaves the body untouched
+    Body p = mk(); float before[Body::STATE_DIM], after[Body::STATE_DIM]; p.get_state(before);
+    Body::ClipVerdict ok = p.preview_clip(clip.data(), n, DT); p.get_state(after);
+    CHECK(ok.feasible && ok.bad_frames == 0 && ok.score < 0.002f && ok.issues.empty() && !p.tracking() && std::memcmp(before, after, sizeof before) == 0,
+          "a feasible clip: verdict feasible, score %.5f, no issues, and preview left the body untouched", ok.score);
+    Body::ClipVerdict ev = p.evaluate_clip(clip.data(), n, DT);
+    CHECK(ev.feasible && p.tracking() && state_diff(p, t1) < 1e-4f, "evaluate_clip commits: the body is at the clip's end");
+    // 5. an impossible clip: every failure is reported in plain English, worst first
+    const int N = 80; std::vector<float> bad(N * A, 0.f);
+    for (int f = 0; f < N; ++f) {
+        float* x = &bad[f * A]; x[1] = 0.927f; x[4] = 0.1f; x[8] = 1.f; x[9] = -0.1f; x[13] = 1.f;                      // both feet planted at +-0.1 (left x=0.1)
+        if (f >= 10 && f < 30) x[4] = 0.5f;                                                                                // left foot slides 40 cm while in contact
+        if (f >= 20 && f < 26) x[10] = -0.2f;                                                                              // right foot below the ground
+        if (f >= 40) { x[14] = 4.f; x[15] = 1.f; x[16] = 1.f; x[17] = 1.f; }                                              // left hand 4 m away
+    }
+    Body bb = mk(); run(bb, 1.f); Body::ClipVerdict v = bb.preview_clip(bad.data(), N, DT);
+    auto issue = [&](const char* frag) { for (auto& i : v.issues) if (i.find(frag) != std::string::npos) return true; return false; };
+    for (auto& i : v.issues) std::printf("    - %s\n", i.c_str());
+    std::printf("  impossible clip: score %.3f m/frame, %d of %d frames bad, worst frame %d, %d issues\n", v.score, v.bad_frames, v.frames, v.worst_frame, (int)v.issues.size());
+    CHECK(!v.feasible && v.bad_frames > 0 && v.score > 0.1f && v.worst_frame >= 40 && v.issues.size() >= 3 && v.issues.size() <= 9, "an impossible clip is infeasible with a score and a bounded list of issues");
+    CHECK(issue("held in place") && issue("below the ground") && issue("hand target") , "the issues name the slide, the sunken foot and the unreachable hand");
+    CHECK(!v.issues.empty() && v.issues[0].find("hand target") != std::string::npos && v.issues[0].find("frames 40-79") != std::string::npos, "the most severe issue comes first, with its frame range: %s", v.issues.empty() ? "-" : v.issues[0].c_str());
+    // 6. bad input is refused, not tracked
+    std::vector<float> nan(clip.begin(), clip.begin() + 3 * A); nan[A + 7] = std::nanf(""); Body nb = mk(); Body::ClipVerdict nv = nb.preview_clip(nan.data(), 3, DT);
+    CHECK(!nv.feasible && nv.issues.size() == 1 && nv.issues[0].find("non-finite") != std::string::npos && nv.worst_frame == 1, "a clip with NaN is refused and says where: %s", nv.issues.empty() ? "-" : nv.issues[0].c_str());
+    // 7. a loss of balance is explained
+    const int M = 30; std::vector<float> fall(M * A, 0.f);
+    for (int f = 0; f < M; ++f) { float* x = &fall[f * A]; x[1] = 0.927f; x[2] = 0.30f; x[4] = 0.1f; x[8] = 1.f; x[9] = -0.1f; x[13] = 1.f; }
+    Body fb = mk(); run(fb, 1.f); Body::ClipVerdict fv = fb.preview_clip(fall.data(), M, DT);
+    bool bal = false; for (auto& i : fv.issues) bal = bal || i.find("balance is lost") != std::string::npos;
+    for (auto& i : fv.issues) std::printf("    - %s\n", i.c_str());
+    CHECK(!fv.feasible && bal, "a pelvis thrown 30 cm ahead of the feet reports a loss of balance");
 }
 
 static void test_head_and_torso() {
@@ -285,7 +433,7 @@ static void test_protocol_and_fuzz() {
 }
 
 int main() {
-    test_skeleton(); test_standing(); test_hands(); test_pelvis_and_contact(); test_balance_modes(); test_stepping(); test_walking_is_coordinates(); test_head_and_torso(); test_protocol_and_fuzz();
+    test_skeleton(); test_standing(); test_hands(); test_pelvis_and_contact(); test_balance_modes(); test_stepping(); test_walking_is_coordinates(); test_dynamic_gait(); test_learning_interface(); test_snapshot_and_verdict(); test_head_and_torso(); test_protocol_and_fuzz();
     std::printf("\n%d checks passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }
