@@ -175,6 +175,20 @@ int nebula_body_evaluate_clip(NebulaBody* h, const float* a, int n, float dt, in
     copy_out(j, json, json_cap);
     return v.bad_frames;
 }
+/* Track a clip and also return every frame's bones (n * bone_count * 10 floats, same layout as nebula_body_bones) - for viewers. Same tracking as track_clip. */
+int nebula_body_replay_clip(NebulaBody* h, const float* a, int n, float dt, float* reports, float* states, float* bones) {
+    if (!h || !a || n <= 0) return -1;
+    const size_t nb = h->b.bones().size();
+    return h->b.track_clip_each(a, n, dt, reports, states, [&](int i) {
+        if (!bones) return;
+        const auto& bs = h->b.bones(); float* base = bones + (size_t)i * nb * 10;
+        for (size_t k = 0; k < nb; ++k) {
+            float* o = base + 10 * k;
+            o[0] = bs[k].head.x; o[1] = bs[k].head.y; o[2] = bs[k].head.z; o[3] = bs[k].tail.x; o[4] = bs[k].tail.y; o[5] = bs[k].tail.z;
+            o[6] = bs[k].q.w; o[7] = bs[k].q.x; o[8] = bs[k].q.y; o[9] = bs[k].q.z;
+        }
+    });
+}
 void nebula_body_track_end(NebulaBody* h) { if (h) h->b.track_end(); }
 void nebula_body_reset(NebulaBody* h) { if (h) { ik::Body::Params p = h->b.params; h->b.~Body(); new (&h->b) ik::Body(p); } }
 
