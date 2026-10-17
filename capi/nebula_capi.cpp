@@ -1,4 +1,5 @@
 #include "nebula_capi.h"
+#include <cstdio>
 #include <cstring>
 #include <new>
 #include <string>
@@ -20,7 +21,7 @@ static void put3(float* o, const Vec3& v) { o[0] = v.x; o[1] = v.y; o[2] = v.z; 
 
 extern "C" {
 
-int nebula_abi_version(void) { return 2; }
+int nebula_abi_version(void) { return 3; }
 
 NebulaEngine* nebula_create(void) { return new (std::nothrow) NebulaEngine(); }
 void nebula_destroy(NebulaEngine* h) { delete h; }
@@ -114,11 +115,14 @@ int nebula_body_set_param(NebulaBody* h, const char* k, float v) {
     if (!h || !k || !std::isfinite(v)) return 0;
     ik::Body::Params& p = h->b.params;
     if (!std::strcmp(k, "balance")) { p.balance = v >= 0.5f ? ik::Body::Balance::Assist : ik::Body::Balance::None; return 1; }
+    if (!std::strcmp(k, "dynamic_gait")) { p.dynamic_gait = v >= 0.5f; return 1; }
     if (!std::strcmp(k, "hand_idle_m")) { h->b.set_hand_idle(std::max(0.f, v)); return 1; }
     struct { const char* n; float* f; float lo, hi; } t[] = {
         {"safe_margin", &p.safe_margin, 0.f, 0.1f}, {"step_time_scale", &p.step_time_scale, 0.2f, 5.f}, {"max_stride", &p.max_stride, 0.1f, 1.5f},
         {"max_step_up", &p.max_step_up, 0.f, 1.f}, {"max_step_down", &p.max_step_down, 0.f, 2.f}, {"fall_margin", &p.fall_margin, -1.f, 0.f},
-        {"fall_time", &p.fall_time, 0.f, 5.f}, {"shift_settle_speed", &p.shift_settle_speed, 0.f, 1e9f}};
+        {"fall_time", &p.fall_time, 0.f, 5.f}, {"shift_settle_speed", &p.shift_settle_speed, 0.f, 1e9f},
+        {"recover_time", &p.recover_time, 0.f, 60.f}, {"arm_swing_gain", &p.arm_swing_gain, 0.f, 2.f}, {"twist_gain", &p.twist_gain, 0.f, 1.f}, {"head_turn_omega", &p.head_turn_omega, 0.f, 100.f},
+        {"leg_len_frac", &p.leg_len_frac, 0.8f, 0.999f}, {"step_ds_time", &p.step_ds_time, 0.02f, 0.5f}};
     for (auto& e : t) if (!std::strcmp(e.n, k)) { *e.f = std::min(std::max(v, e.lo), e.hi); return 1; }
     return 0;
 }
@@ -141,5 +145,37 @@ int nebula_body_bones(NebulaBody* h, float* out) {
     return (int)bs.size();
 }
 int nebula_body_status_json(NebulaBody* h, char* buf, int cap) { return h ? copy_out(h->b.status_json(), buf, cap) : copy_out("{}", buf, cap); }
+
+int nebula_body_state_dim(void) { return ik::Body::STATE_DIM; }
+int nebula_body_action_dim(void) { return ik::Body::ACTION_DIM; }
+int nebula_body_report_dim(void) { return ik::Body::REPORT_DIM; }
+const char* nebula_body_state_name(int i) { return (i >= 0 && i < ik::Body::STATE_DIM) ? ik::Body::state_names()[i] : nullptr; }
+int nebula_body_get_state(NebulaBody* h, float* out) { if (!h || !out) return 0; h->b.get_state(out); return ik::Body::STATE_DIM; }
+int nebula_body_track(NebulaBody* h, const float* a, float dt, float* rep) {
+    if (!h || !a) return 0; float tmp[ik::Body::REPORT_DIM]; h->b.track(a, dt, rep ? rep : tmp); return h->b.track_unbalanced() ? 1 : 0;
+}
+int nebula_body_track_clip(NebulaBody* h, const float* a, int n, float dt, float* reports, float* states) {
+    if (!h || !a || n <= 0) return 0;      // look-ahead (where each lifted foot lands) lives in Body::track_clip
+    return h->b.track_clip(a, n, dt, reports, states);
+}
+// --- snapshots and clip verdicts -------------------------------------------------------------------------------------------------
+NebulaBody* nebula_body_clone(NebulaBody* h) { return h ? new (std::nothrow) NebulaBody(*h) : nullptr; }       // full snapshot (pose, gait/tracking state, queued steps, params, surfaces)
+int nebula_body_restore(NebulaBody* dst, const NebulaBody* src) { if (!dst || !src) return 0; dst->b = src->b; return 1; }
+
+static void json_str(std::string& o, const std::string& s) {
+    o += '"'; for (char c : s) { if (c == '"' || c == '\\') { o += '\\'; o += c; } else if ((unsigned char)c < 0x20) o += ' '; else o += c; } o += '"';
+}
+int nebula_body_evaluate_clip(NebulaBody* h, const float* a, int n, float dt, int commit, float* reports, float* states, char* json, int json_cap) {
+    if (!h || !a || n <= 0) { copy_out("{\"feasible\":false,\"issues\":[\"no clip given\"]}", json, json_cap); return -1; }
+    ik::Body::ClipVerdict v;
+    if (commit) v = h->b.evaluate_clip(a, n, dt, reports, states); else v = h->b.preview_clip(a, n, dt, reports, states);
+    std::string j; char b[160];
+    std::snprintf(b, sizeof b, "{\"feasible\":%s,\"frames\":%d,\"bad_frames\":%d,\"score\":%.6g,\"worst_frame\":%d,\"worst_cost\":%.6g,\"issues\":[", v.feasible ? "true" : "false", v.frames, v.bad_frames, v.score, v.worst_frame, v.worst_cost);
+    j += b; for (size_t i = 0; i < v.issues.size(); ++i) { if (i) j += ','; json_str(j, v.issues[i]); } j += "]}";
+    copy_out(j, json, json_cap);
+    return v.bad_frames;
+}
+void nebula_body_track_end(NebulaBody* h) { if (h) h->b.track_end(); }
+void nebula_body_reset(NebulaBody* h) { if (h) { ik::Body::Params p = h->b.params; h->b.~Body(); new (&h->b) ik::Body(p); } }
 
 } // extern "C"
