@@ -122,7 +122,7 @@ int nebula_body_set_param(NebulaBody* h, const char* k, float v) {
         {"max_step_up", &p.max_step_up, 0.f, 1.f}, {"max_step_down", &p.max_step_down, 0.f, 2.f}, {"fall_margin", &p.fall_margin, -1.f, 0.f},
         {"fall_time", &p.fall_time, 0.f, 5.f}, {"shift_settle_speed", &p.shift_settle_speed, 0.f, 1e9f},
         {"recover_time", &p.recover_time, 0.f, 60.f}, {"arm_swing_gain", &p.arm_swing_gain, 0.f, 2.f}, {"twist_gain", &p.twist_gain, 0.f, 1.f}, {"head_turn_omega", &p.head_turn_omega, 0.f, 100.f},
-        {"leg_len_frac", &p.leg_len_frac, 0.8f, 0.999f}, {"step_ds_time", &p.step_ds_time, 0.02f, 0.5f}};
+        {"leg_len_frac", &p.leg_len_frac, 0.8f, 0.999f}, {"step_ds_time", &p.step_ds_time, 0.02f, 0.5f}, {"swing_reach_slack", &p.swing_reach_slack, 0.f, 0.15f}};
     for (auto& e : t) if (!std::strcmp(e.n, k)) { *e.f = std::min(std::max(v, e.lo), e.hi); return 1; }
     return 0;
 }
