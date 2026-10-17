@@ -97,7 +97,7 @@ class Lib:
         sig = {"nebula_abi_version": (I, []), "nebula_body_create": (P, [F, I, I]), "nebula_body_destroy": (None, [P]),
                "nebula_body_command": (I, [P, S, C.c_char_p, I]), "nebula_body_update": (None, [P, F]), "nebula_body_set_param": (I, [P, S, F]),
                "nebula_body_bone_count": (I, [P]), "nebula_body_bone_name": (S, [P, I]), "nebula_body_bones": (I, [P, fp]),
-               "nebula_body_get_state": (I, [P, fp]), "nebula_body_state_dim": (I, []), "nebula_body_action_dim": (I, []), "nebula_body_report_dim": (I, []),
+               "nebula_body_get_state": (I, [P, fp]), "nebula_body_track": (I, [P, fp, F, fp]), "nebula_body_replay_clip": (I, [P, fp, I, F, fp, fp, fp]), "nebula_body_state_dim": (I, []), "nebula_body_action_dim": (I, []), "nebula_body_report_dim": (I, []),
                "nebula_body_evaluate_clip": (I, [P, fp, I, F, I, fp, fp, C.c_char_p, I])}
         for k, (res, args) in sig.items():
             try:
