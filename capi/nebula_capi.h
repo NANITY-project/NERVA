@@ -101,6 +101,8 @@ NEBULA_API int  nebula_body_track(NebulaBody*, const float* action, float dt, fl
 /* n frames at once: actions[n*30]; reports[n*12] (optional); states[n*35] (optional). Returns the number of frames that needed any correction. */
 NEBULA_API int  nebula_body_track_clip(NebulaBody*, const float* actions, int n, float dt, float* reports, float* states);
 NEBULA_API void nebula_body_track_end(NebulaBody*);
+/* Like track_clip, and bones[n * bone_count * 10] (optional) receives every frame's bones (layout of nebula_body_bones). For viewers. Returns bad frames, -1 on bad arguments. */
+NEBULA_API int  nebula_body_replay_clip(NebulaBody*, const float* actions, int n, float dt, float* reports, float* states, float* bones);
 /* Snapshots: clone = a full copy of the body (pose, gait/tracking state, queued steps, params, surfaces); destroy it with nebula_body_destroy.
    restore overwrites dst with src's state. Use them to try candidate motions from the same starting state. Returns NULL / 0 on bad arguments. */
 NEBULA_API NebulaBody* nebula_body_clone(NebulaBody*);
