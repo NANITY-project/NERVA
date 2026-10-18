@@ -18,6 +18,7 @@ import argparse, base64, json, os, re, sys, webbrowser
 import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gen_dataset as g
+import realism as R
 
 CORRUPT = {"noise5": "noise 5 mm", "noise10": "noise 10 mm", "noise20": "noise 20 mm", "blur": "blur (7-frame average)", "blend": "blend with another clip",
            "flip": "5% contact flags flipped", "far": "feet 30% farther out", "slow": "slowed x1.4 (control: should pass)"}
@@ -41,6 +42,7 @@ def pack(rp, actions):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("npz", nargs="?", default="data/clips.npz"); ap.add_argument("--clips", type=int, nargs="+"); ap.add_argument("--corrupt", choices=sorted(CORRUPT))
+    ap.add_argument("--allow", nargs="*", default=[], help="realism: deviations the request asked for (groups/presets: zombie tired limp drunk robot)")
     ap.add_argument("--out", default="view.html"); ap.add_argument("--open", action="store_true"); ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--lib"); ap.add_argument("--repo"); ap.add_argument("--no-build", action="store_true")
     args = ap.parse_args()
@@ -53,21 +55,25 @@ def main():
     lib = g.Lib(args.lib, args.repo, build=not args.no_build); chk = g.new_standing(lib); rng = np.random.default_rng(args.seed)
     names = None; clips = []
     for i in ids:
-        a = acts[off[i]:off[i + 1]]; st = z["style"][i]; style = ", ".join(f"{n} {v:.2f}" for n, v in zip(z["style_names"], st) if n in ("stride", "step_time", "turn_deg", "torso_lean", "look_down_deg"))
-        shown, ghost, label = a, None, f"clip {i}  ({style})"
+        a = acts[off[i]:off[i + 1]]; st = z["style"][i]; allow = [x for p in args.allow for x in R.GROUPS.get(p, [p])]
+        style = ", ".join(f"{n} {v:.2f}" for n, v in zip(z["style_names"], st) if n in ("stride", "step_time", "turn_deg", "torso_lean", "look_down_deg"))
+        shown, ghost, label = a, None, (f"{z['labels'][i]}: {z['description'][i]}" if "description" in z.files else f"clip {i}  ({style})")
         if args.corrupt:
             other = acts[off[(i + 1) % N]:off[(i + 1) % N + 1]]; cs, _ = g.corruptions(rng, a, other, dt); shown = cs[CORRUPT[args.corrupt]].astype(np.float32)
             ghost = replay(lib, a, dt); label = f"clip {i} + {CORRUPT[args.corrupt]}: engine's answer (colour) over the clean clip (grey)"
         v = chk.evaluate(shown, dt); rp = replay(lib, shown, dt)
+        ang = z["angles"][off[i]:off[i + 1]] if ("angles" in z.files and not args.corrupt) else R.angles_from_engine(lib, shown, dt)
+        rr = R.grade_clip(shown, dt, ang, allow)
         if names is None:
             b = g.new_standing(lib); names = b.names; b.close()
         c = pack(rp, shown); c["label"] = label
         c["verdict"] = dict(feasible=v["feasible"], score=v["score"], bad_frames=v["bad_frames"], issues=v["issues"])
+        c["realism"] = dict(score=rr["score"], strict=rr["human_likeness"], findings=rr["findings"], allow=args.allow)
         c["spans"] = [dict(a=int(m.group(1)), b=int(m.group(2)), t=t) for t in v["issues"] for m in [re.search(r"frames (\d+)-(\d+)", t)] if m]
         if ghost is not None:
             c["ghost"] = pack(ghost, a)["bones"]
         clips.append(c)
-        print(f"  clip {i}: {'feasible' if v['feasible'] else 'NOT feasible'}, score {v['score']:.4f}, {len(shown)} frames")
+        print(f"  {label.split('(')[0].strip()}: physics {'ok' if v['feasible'] else 'NOT feasible'}, realism {('%.0f' % rr['score']) if rr['score'] is not None else 'n/a'}/100, {len(shown)} frames")
     html = TEMPLATE.replace("__DATA__", json.dumps(dict(names=names, dt=dt, clips=clips), separators=(",", ":")))
     open(args.out, "w", encoding="utf-8").write(html)
     print(f"\nwrote {args.out} ({os.path.getsize(args.out) / 1e6:.1f} MB): open it in a browser")
@@ -87,7 +93,7 @@ select,button{background:#2a2e38;color:#d8dbe2;border:1px solid #3a3f4c;border-r
 <div id="top"><select id="clip"></select><button id="play">pause</button><select id="speed"><option value="0.25">0.25x</option><option value="0.5">0.5x</option><option value="1" selected>1x</option><option value="2">2x</option></select>
 <button data-v="0">3/4</button><button data-v="1">side</button><button data-v="2">front</button><button data-v="3">back</button><button data-v="4">top</button>
 <label><input type="checkbox" id="follow" checked> follow</label><label><input type="checkbox" id="ghost" checked> clean ghost</label><span class="dim">red ring: engine corrected this · red cross: asked vs delivered · drag: orbit · wheel: zoom · space · ←→ · [ ]</span></div>
-<div id="bot"><div id="info"></div><div id="act"></div><details id="all"><summary class="dim"></summary><div id="alli"></div></details><input type="range" id="seek" min="0" value="0"><canvas id="strip"></canvas></div>
+<div id="bot"><div id="info"></div><div id="act"></div><div id="rel"></div><details id="rf"><summary class="dim"></summary><div id="rfi"></div></details><details id="all"><summary class="dim"></summary><div id="alli"></div></details><input type="range" id="seek" min="0" value="0"><canvas id="strip"></canvas></div>
 <script>
 const D=__DATA__, NB=D.names.length, cv=document.getElementById('cv'), ctx=cv.getContext('2d');
 function dec(b64){const s=atob(b64),u=new Uint8Array(s.length);for(let i=0;i<s.length;i++)u[i]=s.charCodeAt(i);return new Int16Array(u.buffer)}
@@ -95,7 +101,11 @@ D.clips.forEach(c=>{c.B=dec(c.bones);if(c.ghost)c.G=dec(c.ghost)});
 let ci=0,f=0,playing=true,speed=1,follow=true,showGhost=true,cam={yaw:0.75,pitch:0.22,dist:3.6},last=performance.now();
 const sel=document.getElementById('clip');D.clips.forEach((c,i)=>{const o=document.createElement('option');o.value=i;o.textContent=(i+1)+'. '+c.label;sel.appendChild(o)});
 const VIEWS=[[0.75,0.22,3.6],[Math.PI/2,0.05,3.6],[0,0.05,3.6],[Math.PI,0.05,3.6],[0.0,1.5,4.2]];
-function setClip(i){ci=Math.max(0,Math.min(D.clips.length-1,i));sel.value=ci;f=0;lastKey='';const c=D.clips[ci];seek.max=c.frames-1;drawStrip();document.getElementById('ghost').parentElement.style.display=c.G?'':'none'}
+function setClip(i){ci=Math.max(0,Math.min(D.clips.length-1,i));sel.value=ci;f=0;lastKey='';
+ {const r=D.clips[ci].realism,rel=document.getElementById('rel'),rf=document.getElementById('rf');
+  if(r&&r.score!=null){const col=r.score>=85?'good':r.score>=65?'':'bad';rel.innerHTML=`<span class="dim">realism (human-likeness)</span> <b class="${col}">${r.score.toFixed(0)}/100</b>`+(r.allow&&r.allow.length?` <span class="dim">· allowed: ${r.allow.join(', ')} · strict ${r.strict.toFixed(0)}</span>`:'')+` <span class="dim">· real captured walks score 88-100</span>`;
+   rf.style.display=r.findings.length?'':'none';rf.querySelector('summary').textContent=`why not 100: ${r.findings.length} finding${r.findings.length==1?'':'s'}`;document.getElementById('rfi').innerHTML=r.findings.map(t=>`<div class="iss dim">· ${t}</div>`).join('')}
+  else{rel.innerHTML='<span class="dim">realism: not measurable on this clip (too short or barely moving)</span>';rf.style.display='none'}}const c=D.clips[ci];seek.max=c.frames-1;drawStrip();document.getElementById('ghost').parentElement.style.display=c.G?'':'none'}
 const seek=document.getElementById('seek'),strip=document.getElementById('strip');
 function drawStrip(){const c=D.clips[ci],W=strip.width=strip.clientWidth,s=strip.getContext('2d');strip.height=10;s.fillStyle='#2b3a2f';s.fillRect(0,0,W,10);s.fillStyle='#e05555';for(let i=0;i<c.frames;i++)if(c.bad[i])s.fillRect(Math.floor(i/c.frames*W),0,Math.ceil(W/c.frames)+1,10)}
 // ---- camera
