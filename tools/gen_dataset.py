@@ -270,7 +270,7 @@ def measure(a, dt, v):
         return None
     i0, i1 = moving[0], moving[-1] + 1; seg = a[i0:i1]
     c = seg[:, [8, 13]]; lifts = int(((c[1:] < 0.5) & (c[:-1] > 0.5)).sum())            # contact -> swing events = steps
-    dur = (i1 - i0) * dt; y = seg[:, 1]; y = y - np.convolve(y, np.ones(int(1 / dt) | 1) / (int(1 / dt) | 1), "same") if len(y) > 2 * int(1 / dt) else y - y.mean()
+    dur = (i1 - i0) * dt; y = seg[:, 1]; y = y - np.convolve(y, np.ones(int(round(1 / dt)) | 1) / (int(round(1 / dt)) | 1), "same") if len(y) > 2 * int(round(1 / dt)) else y - y.mean()
     n_ = len(y); inner = slice(n_ // 4, n_ - n_ // 4)             # middle half of the walk: start-up and stopping steps are not steady gait
     clear = float(max(seg[:, 5].max(), seg[:, 10].max()))
     jerk = float(np.abs(np.diff(pel, n=3, axis=0)).mean() / dt ** 3) if len(pel) > 4 else 0.0
