@@ -6,6 +6,9 @@ view_clip.py - watch clips from gen_dataset.py. Writes ONE html file (no server,
   python tools/view_clip.py data/clips.npz --clips 3 17 40   # pick clips
   python tools/view_clip.py --clips 3 --corrupt noise10      # the engine's answer to a BAD clip, over the clean one (grey ghost)
   python tools/view_clip.py --open                           # open it in the default browser when done
+  python tools/view_clip.py --best 8 --open                  # the 8 most human-like clips (realism score), best first
+  python tools/view_clip.py --best 50 --save-best data/best.npz   # keep the top 50 as a new dataset file
+  python tools/view_clip.py --worst 8                        # the 8 least human-like, to see what goes wrong
 
 Every clip is replayed through the engine (the same tracking the verdict uses), so what you see is the engine's body, not just the numbers:
   - skeleton (left blue, right orange), planted feet as green discs, centre of mass (pink) with its line to the ground, pelvis trail
@@ -42,6 +45,8 @@ def pack(rp, actions):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("npz", nargs="?", default="data/clips.npz"); ap.add_argument("--clips", type=int, nargs="+"); ap.add_argument("--corrupt", choices=sorted(CORRUPT))
+    ap.add_argument("--best", type=int, metavar="N", help="show the N clips with the highest realism score (best first)"); ap.add_argument("--worst", type=int, metavar="N", help="show the N lowest-scoring clips")
+    ap.add_argument("--min-realism", type=float, help="only clips scoring at least this (0-100)"); ap.add_argument("--save-best", metavar="FILE.npz", help="also save the selected clips as a new dataset file")
     ap.add_argument("--allow", nargs="*", default=[], help="realism: deviations the request asked for (groups/presets: zombie tired limp drunk robot)")
     ap.add_argument("--out", default="view.html"); ap.add_argument("--open", action="store_true"); ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--lib"); ap.add_argument("--repo"); ap.add_argument("--no-build", action="store_true")
@@ -49,10 +54,37 @@ def main():
     if not os.path.exists(args.npz):
         sys.exit(f"{args.npz} not found: run  python tools/gen_dataset.py --n 100 --out data  first (or pass the path to your clips.npz)")
     z = np.load(args.npz); acts, off, dt = z["actions"], z["offsets"], float(z["dt"]); N = len(off) - 1
-    ids = args.clips or list(range(min(6 if not args.corrupt else 3, N)))
+    lib = g.Lib(args.lib, args.repo, build=not args.no_build); chk = g.new_standing(lib); rng = np.random.default_rng(args.seed)
+    allow0 = [x for p in args.allow for x in R.GROUPS.get(p, [p])]; pick = args.best or args.worst or args.min_realism is not None
+    if pick:
+        if "realism" in z.files and len(z["realism"]) == N and not allow0:
+            sc = np.array(z["realism"], float)                                             # stored by gen_dataset.py
+        else:
+            print(f"scoring {N} clips for realism ...", flush=True); sc = np.full(N, np.nan)
+            for i in range(N):
+                c = acts[off[i]:off[i + 1]]; ang = z["angles"][off[i]:off[i + 1]] if "angles" in z.files else R.angles_from_engine(lib, c, dt)
+                r = R.grade_clip(c, dt, ang, allow0); sc[i] = r["score"] if r["score"] is not None else np.nan
+        order = [int(i) for i in np.argsort(-np.nan_to_num(sc, nan=-1))]                    # best first
+        if args.min_realism is not None:
+            order = [i for i in order if sc[i] >= args.min_realism]
+        ids = order[:args.best] if args.best else (order[::-1][:args.worst] if args.worst else order[:30])
+        if not ids:
+            sys.exit("no clips match")
+        print(f"selected {len(ids)} of {N} clips; realism " + ", ".join(f"#{i}:{sc[i]:.0f}" for i in ids[:12]) + (" ..." if len(ids) > 12 else ""))
+        if args.save_best:
+            keep = np.array(ids); out = {}
+            for k in z.files:
+                v = z[k]
+                if k == "actions": out[k] = np.concatenate([acts[off[i]:off[i + 1]] for i in ids])
+                elif k == "angles": out[k] = np.concatenate([z["angles"][off[i]:off[i + 1]] for i in ids])
+                elif k == "offsets": out[k] = np.cumsum([0] + [off[i + 1] - off[i] for i in ids])
+                elif getattr(v, "ndim", 0) >= 1 and len(v) == N: out[k] = v[keep]
+                else: out[k] = v
+            out["realism"] = sc[keep].astype(np.float32); np.savez_compressed(args.save_best, **out); print(f"saved {len(ids)} clips to {args.save_best}")
+    else:
+        ids = args.clips or list(range(min(6 if not args.corrupt else 3, N)))
     if any(i < 0 or i >= N for i in ids):
         sys.exit(f"clip numbers must be 0..{N - 1}")
-    lib = g.Lib(args.lib, args.repo, build=not args.no_build); chk = g.new_standing(lib); rng = np.random.default_rng(args.seed)
     names = None; clips = []
     for i in ids:
         a = acts[off[i]:off[i + 1]]; st = z["style"][i]; allow = [x for p in args.allow for x in R.GROUPS.get(p, [p])]
