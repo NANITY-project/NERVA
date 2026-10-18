@@ -90,7 +90,7 @@ def _ma(x, w):
 def features(a, dt, angles=None):
     """Measure the walk. Returns {metric: value or None}, plus '_info' with what was found."""
     a = np.asarray(a, np.float64); F = len(a); out = {k: None for k in RULES}; info = dict(frames=F)
-    pel = a[:, [0, 1, 2]]; sp = np.r_[0, np.linalg.norm(np.diff(pel[:, [0, 2]], axis=0), axis=1)] / dt; sps = _ma(sp, int(0.4 / dt))
+    pel = a[:, [0, 1, 2]]; sp = np.r_[0, np.linalg.norm(np.diff(pel[:, [0, 2]], axis=0), axis=1)] / dt; sps = _ma(sp, int(round(0.4 / dt)))
     runs = [r for r in _runs(sps > 0.3) if r[1] - r[0] > 0.8 / dt]
     if not runs:
         info["note"] = "no walking segment (the body barely moves)"; out["_info"] = info; return out
@@ -98,7 +98,7 @@ def features(a, dt, angles=None):
     seg = slice(i0, i1); info.update(segment=(int(i0), int(i1)), seconds=n * dt)
     cL, cR = a[:, 8] > 0.5, a[:, 13] > 0.5; sole = (a[:, [4, 5, 6]], a[:, [9, 10, 11]]); con = (cL, cR)
     # direction of travel: from the path averaged over about a stride, NOT from the raw pelvis, which sways sideways by several cm and would tilt the axis by 10-20 degrees
-    ps = _ma(pel[:, [0, 2]], int(1.0 / dt)); h = max(1, int(0.4 / dt)); ahead = np.roll(ps, -h, 0) - np.roll(ps, h, 0); ahead[:h] = ahead[h]; ahead[-h:] = ahead[-h - 1]
+    ps = _ma(pel[:, [0, 2]], int(round(1.0 / dt))); h = max(1, int(round(0.4 / dt))); ahead = np.roll(ps, -h, 0) - np.roll(ps, h, 0); ahead[:h] = ahead[h]; ahead[-h:] = ahead[-h - 1]
     d = ahead / (np.linalg.norm(ahead, axis=1, keepdims=True) + 1e-9); perp = np.stack([d[:, 1], -d[:, 0]], 1)
     # gait events inside the segment: heel strikes (contact onsets) per foot
     hs = {s: [i for i in np.where(np.diff(con[s].astype(int)) == 1)[0] + 1 if i0 <= i < i1] for s in (0, 1)}
@@ -134,7 +134,7 @@ def features(a, dt, angles=None):
             out["stance_pct"] = float(100 * np.mean(st))
         out["double_support"] = float((cL[seg] & cR[seg]).mean())
         # bounce: pelvis height and sideways sway, detrended with a moving average one stride long
-        w = int(2 * step_t / dt); trim = max(1, w // 2)
+        w = int(round(2 * step_t / dt)); trim = max(1, w // 2)
         xz = _ma(pel[seg][:, [0, 2]], 3); dev = xz - _ma(xz, w); lat = (dev * perp[seg]).sum(1)                 # sideways deviation from the stride-averaged path
         yb0 = _ma(pel[seg, 1], 3); ver = yb0 - _ma(yb0, w)
         ok_ = slice(trim, -trim) if len(lat) > 2 * trim + 3 else slice(None)
