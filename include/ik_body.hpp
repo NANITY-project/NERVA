@@ -283,7 +283,7 @@ public:
         {   // anatomy the generator does not have to spell out: the hips twist with the legs, the arms swing, a trailing heel rises when the leg would overstretch
             Vec3 fw = fwd(yaw_); float zl = (feet_[0].sole.x - pel.x) * fw.x + (feet_[0].sole.z - pel.z) * fw.z, zr = (feet_[1].sole.x - pel.x) * fw.x + (feet_[1].sole.z - pel.z) * fw.z;
             float tw = clampf(-params.twist_gain * clampf(zl - zr, -0.7f, 0.7f), -0.14f, 0.14f); damp1(twist_, twist_v_, tw, 12.f, dt); chest_twist_ = -1.1f * twist_;
-            for (int s = 0; s < 2; ++s) { const Foot& o = feet_[1 - s]; float fo = (o.sole.x - pel.x) * fw.x + (o.sole.z - pel.z) * fw.z; damp1(arm_swing_[s], arm_swing_v_[s], clampf(params.arm_swing_gain * fo, -0.16f * params.scale, 0.16f * params.scale), 9.f, dt); }
+            for (int s = 0; s < 2; ++s) damp1(arm_swing_[s], arm_swing_v_[s], arm_swing_target(s, fw, pel), ARM_SWING_W, dt);
             for (int s = 0; s < 2; ++s) {
                 Foot& f = feet_[s]; f.heel = 0.f; if (f.state != FootState::Planted && f.sole.y > f.surface + 0.15f) continue;
                 for (float hh = 0.f; hh <= 0.6f; hh += 0.1f) { f.heel = hh; if ((hip_pos(s, pel, hyaw()) - ankle_of(f)).length() <= 0.995f * rmax_leg_) break; }
@@ -519,6 +519,15 @@ private:
     Quat chest_q_;
     // dynamic gait state
     body_detail::V2 cm_, cmv_, cop_f_, lean_, head_dev_; bool dyn_init_ = false;
+    // Arm swing target for arm s (m forward): driven by the DIFFERENCE of the two feet's fore-aft offsets (a smooth, symmetric swing: the arm goes forward
+    // with the opposite foot and back with its own), not by the opposite foot alone (a sawtooth that left the arm half a beat late).
+    bool swing_on_[2] = {false, false}; Vec3 swing_pos_[2], swing_vel_[2], rest_prev_[2]; static constexpr float ARM_FOLLOW_W = 40.f;   // swinging hand: follower state and speed (rad/s)
+    static constexpr float ARM_HANG = 0.95f;        // resting hand distance from the shoulder, as a fraction of the arm's length (was 0.86: a 60 deg elbow bend)
+    static constexpr float ARM_SWING_W = 16.f;     // rad/s: how fast the swing target is followed (9 left the hand ~0.25 s behind the leg)
+    float arm_swing_target(int s, const Vec3& fw, const Vec3& pel) const {
+        auto fo = [&](const Foot& f) { return (f.sole.x - pel.x) * fw.x + (f.sole.z - pel.z) * fw.z; };
+        return clampf(params.arm_swing_gain * 0.5f * (fo(feet_[1 - s]) - fo(feet_[s])), -0.16f * params.scale, 0.16f * params.scale);
+    }
     float twist_ = 0.f, twist_v_ = 0.f, chest_twist_ = 0.f, arm_swing_[2] = {0.f, 0.f}, arm_swing_v_[2] = {0.f, 0.f};
     float hl_yaw_ = 0.f, hl_pitch_ = 0.f, hl_chest_ = 0.f, hl_vyaw_ = 0.f, hl_vpitch_ = 0.f, hl_vchest_ = 0.f;
     float hyaw() const { return yaw_ + twist_; }                      // hip-line heading: the body heading plus the walking twist
@@ -674,8 +683,7 @@ private:
         Vec3 lf = lft(yaw_); float lat = (pelvis_.x - 0.5f * (r0.x + r1.x)) * lf.x + (pelvis_.z - 0.5f * (r0.z + r1.z)) * lf.z;
         head_dev_ = {lf.x * -0.5f * lat, lf.z * -0.5f * lat};
         for (int s = 0; s < 2; ++s) {
-            const Foot& o = feet_[1 - s]; float fo = (o.sole.x - pelvis_.x) * fw.x + (o.sole.z - pelvis_.z) * fw.z;
-            float tg = clampf(params.arm_swing_gain * fo, -0.16f * params.scale, 0.16f * params.scale); damp1(arm_swing_[s], arm_swing_v_[s], tg, 9.f, dt);
+            damp1(arm_swing_[s], arm_swing_v_[s], arm_swing_target(s, fw, pelvis_), ARM_SWING_W, dt);
         }
     }
 
@@ -1185,10 +1193,23 @@ private:
             clav_attach_[s] = attach; shoulder_[s] = attach + cd * D.clav;
             arms_.set_anchor(arm_id_[s], shoulder_[s]);
             arms_.set_pole(arm_id_[s], (Z * -0.6f + X * (g * 0.25f) + Vec3(0, -1, 0)));
-            Vec3 restpt = shoulder_[s] + X * (g * 0.07f * params.scale) + Z * (0.05f * params.scale) + Vec3(0, -(D.upper + D.fore) * 0.86f, 0);
-            restpt += fwd(yaw_) * arm_swing_[s];
-            const float thr = (std::fabs(arm_swing_[s]) > 0.004f || std::fabs(arm_swing_v_[s]) > 0.02f) ? 0.003f : 0.03f;
-            if (!hands_[s].target_mode && (!hands_[s].has_last || (restpt - hands_[s].last).length() > thr * params.scale)) { arms_.reach_to(arm_id_[s], restpt); hands_[s].last = restpt; hands_[s].has_last = true; }
+            // a hanging arm is a pendulum: the hand sits at ARM_HANG of the arm's length (a nearly straight arm, ~30 deg of elbow bend) and swings along an arc
+            const float R = (D.upper + D.fore) * ARM_HANG, th = std::asin(clampf(arm_swing_[s] / R, -0.9f, 0.9f));
+            Vec3 restpt = shoulder_[s] + X * (g * 0.07f * params.scale) + Z * (0.05f * params.scale) + Vec3(0, -R * std::cos(th), 0) + fwd(yaw_) * (R * std::sin(th));
+            // is the hand's rest point travelling (the body walks, turns, swings)? Then the hand follows it directly. reach_to (a Fitts' law reach, >= 0.2 s, re-planned only after 3 cm)
+            // is for a hand that stays put: used for a walker it trailed the body by speed x 0.2 s, i.e. 15-30 cm behind, varying with every step.
+            const float rspd = init ? 0.f : (restpt - rest_prev_[s]).length() / std::max(dt, 1e-4f) / params.scale; rest_prev_[s] = restpt;
+            const bool swinging = swing_on_[s] ? (rspd > 0.03f || std::fabs(arm_swing_[s]) > 0.004f) : (rspd > 0.08f || std::fabs(arm_swing_[s]) > 0.004f || std::fabs(arm_swing_v_[s]) > 0.02f);
+            const float thr = swinging ? 0.003f : 0.03f;
+            if (!hands_[s].target_mode) {
+                if (swinging) {            // a continuous swing is placed directly (through a short critically damped follower): reach_to's minimum-jerk reach (Fitts' law, >= 0.2 s) left the hand a fifth of a stride behind the leg
+                    if (!swing_on_[s]) { swing_pos_[s] = wrist_[s]; swing_vel_[s] = Vec3(); swing_on_[s] = true; }
+                    smooth_damp(swing_pos_[s], restpt, swing_vel_[s], ARM_FOLLOW_W, dt); arms_.teleport_to(arm_id_[s], swing_pos_[s]); hands_[s].last = swing_pos_[s]; hands_[s].has_last = true;
+                } else {
+                    swing_on_[s] = false;
+                    if (!hands_[s].has_last || (restpt - hands_[s].last).length() > thr * params.scale) { arms_.reach_to(arm_id_[s], restpt); hands_[s].last = restpt; hands_[s].has_last = true; }
+                }
+            }
             if (init) arms_.teleport_to(arm_id_[s], restpt);
         }
         arms_.update(init ? 1e-4f : dt);
