@@ -178,7 +178,7 @@ STRIDE_RANGE = (0.25, 0.55)   # metres; the engine's reliable range (see the cov
 def sample_style(rng):
     u = rng.uniform
     turn = 0.0 if rng.random() < 0.4 else float(rng.normal(0, 28))
-    return dict(step_time=u(0.7, 1.6), stride=u(*STRIDE_RANGE), step_width=u(0.07, 0.14), turn_deg=float(np.clip(turn, -100, 100)),
+    return dict(step_time=u(0.7, 1.6), stride=u(*STRIDE_RANGE), step_width=u(0.035, 0.07), turn_deg=float(np.clip(turn, -100, 100)),
                 arm_swing=u(0.0, 0.9), twist=u(0.05, 0.30), bob=u(0.955, 0.995),
                 torso_drop=max(0.0, rng.normal(0.02, 0.04)), torso_lean=max(0.0, rng.normal(0.03, 0.05)), torso_side=float(rng.normal(0, 0.012)),
                 look_down_deg=max(0.0, float(rng.normal(8, 14))), look_yaw_deg=float(rng.normal(0, 6)))
@@ -306,6 +306,7 @@ def main():
     ap.add_argument("--n", type=int, default=200, help="clips to generate")
     ap.add_argument("--out", default="data"); ap.add_argument("--seed", type=int, default=0); ap.add_argument("--fps", type=int, default=30, choices=(30, 60))
     ap.add_argument("--stride-range", type=float, nargs=2, metavar=("MIN", "MAX"), help="step length range in metres (default 0.25 0.55)")
+    ap.add_argument("--min-realism", type=float, default=0.0, help="drop clips whose realism score (tools/realism.py, 0-100) is below this")
     ap.add_argument("--lib", help="use this libnebula instead of building one"); ap.add_argument("--repo", help="engine checkout (default: found automatically)")
     ap.add_argument("--no-build", action="store_true", help="never compile; use an existing build/libnebula.so")
     ap.add_argument("--stress", action="store_true", help="also test whether bad generator-like clips are caught")
@@ -314,7 +315,8 @@ def main():
     global STRIDE_RANGE
     if args.stride_range: STRIDE_RANGE = tuple(args.stride_range)
     lib = Lib(args.lib, args.repo, build=not args.no_build); rng = np.random.default_rng(args.seed); os.makedirs(args.out, exist_ok=True)
-    checker = new_standing(lib); t0 = time.time()
+    import realism, view_clip
+    checker = new_standing(lib); t0 = time.time(); realism_scores = []
     clips, styles, meas, feas, score, dropped = [], [], [], [], [], {}
     tries = 0; attempts = []
     while len(clips) < args.n and tries < args.n * 6:
@@ -327,6 +329,10 @@ def main():
             dropped["barely moved"] = dropped.get("barely moved", 0) + 1; continue
         if not v["feasible"] and not args.keep_infeasible:
             dropped["engine verdict: infeasible"] = dropped.get("engine verdict: infeasible", 0) + 1; continue
+        rr = realism.grade_clip(a, info["dt"], realism.angles_from_engine(lib, a, info["dt"]))
+        if rr["score"] is None or rr["score"] < args.min_realism:
+            dropped["realism below --min-realism"] = dropped.get("realism below --min-realism", 0) + 1; continue
+        realism_scores.append(rr)
         clips.append(a); styles.append([st[k] for k in STYLE_NAMES]); meas.append([m[k] for k in MEASURED_NAMES]); feas.append(bool(v["feasible"])); score.append(v["score"])
         if len(clips) % 25 == 0:
             print(f"  {len(clips)}/{args.n} clips ({time.time() - t0:.0f}s)", flush=True)
@@ -335,7 +341,7 @@ def main():
     dt = 1 / args.fps; off = np.cumsum([0] + [len(c) for c in clips])
     np.savez_compressed(os.path.join(args.out, "clips.npz"), actions=np.concatenate(clips).astype(np.float32), offsets=off, style=np.array(styles, np.float32),
                         style_names=np.array(STYLE_NAMES), measured=np.array(meas, np.float32), measured_names=np.array(MEASURED_NAMES),
-                        feasible=np.array(feas), score=np.array(score, np.float32), dt=np.float32(dt), action_names=np.array(ACTION_NAMES))
+                        feasible=np.array(feas), score=np.array(score, np.float32), realism=np.array([r["score"] for r in realism_scores], np.float32), dt=np.float32(dt), action_names=np.array(ACTION_NAMES))
     with open(os.path.join(args.out, "example.csv"), "w") as f:
         f.write(",".join(ACTION_NAMES) + "\n")
         for r in clips[0]:
@@ -352,8 +358,17 @@ def main():
     for sn in ("step_time", "stride", "bob", "torso_lean"):
         j = STYLE_NAMES.index(sn); cs = ", ".join(f"{mn} {np.corrcoef(S[:, j], M[:, k])[0, 1]:+.2f}" for k, mn in enumerate(MEASURED_NAMES[:5]) if M[:, k].std() > 1e-9)
         print(f"  {sn:12s} -> {cs}")
+    rs = np.array([r["score"] for r in realism_scores]); rep["realism_mean"] = float(rs.mean())
+    print(f"\nRealism (tools/realism.py; real captured walks score 87-100, mean 95): mean {rs.mean():.0f}, 5% {np.percentile(rs, 5):.0f}, median {np.median(rs):.0f}, 95% {np.percentile(rs, 95):.0f}")
+    worst = {}
+    for r in realism_scores:
+        for it in r["items"]:
+            if it["score"] is not None:
+                worst.setdefault(it["name"], []).append(it["score"])
+    weak = sorted(((np.mean(v), k) for k, v in worst.items()))[:5]
+    print("  weakest measures (mean 0-1 score): " + ", ".join(f"{k} {m:.2f}" for m, k in weak))
     print("\nWhere the engine succeeds (every attempt, incl. the dropped ones). ok = walked it AND replays as feasible; the rest is where it cannot do what was asked:")
-    for key, edges in (("stride", np.linspace(STRIDE_RANGE[0], STRIDE_RANGE[1] + 1e-6, 5)), ("step_time", [0.7, 0.9, 1.1, 1.3, 1.61]), ("step_width", [0.07, 0.09, 0.11, 0.1401])):
+    for key, edges in (("stride", np.linspace(STRIDE_RANGE[0], STRIDE_RANGE[1] + 1e-6, 5)), ("step_time", [0.7, 0.9, 1.1, 1.3, 1.61]), ("step_width", [0.035, 0.05, 0.0701])):
         line = []
         for lo, hi in zip(edges[:-1], edges[1:]):
             sel = [o for st_, o in attempts if lo <= st_[key] < hi]
