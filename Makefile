@@ -81,4 +81,14 @@ actions-test:
 
 test-all: test body-test studio-test blender-test overlay-test
 
-.PHONY: all test bench sanitize clean lib studio studio-test blender-test test-all body-test overlay overlay-test actions-test
+.PHONY: all test bench sanitize clean lib studio studio-test blender-test test-all body-test overlay overlay-test actions-test motion-test motion-test-quick motion-headers
+
+# --- Motion grader: real CMU examples per action, grader validation, C++ headers (see tools/motion_test.py) ---
+motion-test:
+	python3 tools/motion_test.py
+
+motion-test-quick:
+	python3 tools/motion_test.py --quick
+
+motion-headers:
+	python3 tools/export_headers.py --out include/motion
