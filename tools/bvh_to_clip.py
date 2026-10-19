@@ -90,9 +90,27 @@ def clean_runs(c, k):
     return c
 
 
-def convert(path, fps=30):
+def lowpass(x, fs, fc=6.0, order=4):
+    """Zero-phase low-pass along axis 0 (FFT, Butterworth-shaped gain, linear trend removed and reflect-padded so the ends do not ring)."""
+    F = len(x)
+    if F < 8 or fc >= fs / 2:
+        return x
+    x = np.asarray(x, np.float64); ramp = np.linspace(0, 1, F).reshape((-1,) + (1,) * (x.ndim - 1)) * (x[-1] - x[0]) + x[0]; r = x - ramp
+    pad = min(F - 1, int(fs)); rp = np.pad(r, [(pad, pad)] + [(0, 0)] * (x.ndim - 1), mode="reflect")
+    f = np.fft.rfftfreq(len(rp), 1.0 / fs); h = (1.0 / np.sqrt(1.0 + (f / fc) ** (2 * order))).reshape((-1,) + (1,) * (x.ndim - 1))
+    return np.fft.irfft(np.fft.rfft(rp, axis=0) * h, len(rp), axis=0)[pad:pad + F] + ramp
+
+
+def convert(path, fps=30, hand_cutoff_hz=6.0):
+    """BVH file -> (actions [F,30], angles [F,5], dt). hand_cutoff_hz: the CMU hand joints jitter by about 2 cm (marker noise: 0.4-1 m/s of >6 Hz velocity even
+    while standing still), so hands, neck and gaze are low-passed at this cutoff at the file's native rate (120 Hz) before the clip is decimated to `fps`.
+    Human voluntary motion lives well below 6 Hz; without this the 'real' reference would teach a grader that jitter is normal. None/0 turns it off."""
     joints, data, ft = load_bvh(path)
-    hy = data[:, 1]; ok = hy > 0.5 * np.median(hy)                       # corrupt rows (all zeros) appear at the start/end of a few CMU files
+    # corrupt rows (all zeros) appear at the start/end of a few CMU files. Only those are trimmed: the old "hips below half the median height" rule
+    # also deleted the lying / crouching / sitting frames of non-walking clips, which are exactly the frames those actions are about.
+    ok = np.abs(data).sum(axis=1) > 1e-9
+    if not ok.any():
+        raise ValueError("every row of the file is zero")
     idx = np.where(ok)[0]; data = data[idx[0]:idx[-1] + 1]
     sk = forward_kinematics(joints, data); P = lambda n: sk[n][0]
     # engine-sized: leg length from the skeleton's own offsets
@@ -113,10 +131,14 @@ def convert(path, fps=30):
     sp = lambda q: np.r_[0.0, np.linalg.norm(q[2:, [0, 2]] - q[:-2, [0, 2]], axis=1) / (2 * dt0), 0.0]
     def contact(ank, toe):
         """A planted foot is a STILL foot (a still heel or a still ball), whatever its measured height: heights drift by centimetres in mocap."""
-        c = ((np.minimum(sp(ank), sp(toe)) < 0.5) & ((ank[:, 1] - ank[:, 1].min()) < 0.3)).astype(float)
+        # the reference is a low PERCENTILE, not the minimum: a few CMU files have a corrupt frame (ankle 0.8 m below the floor) that would otherwise
+        # push every frame of the clip out of reach and leave a seated or standing person with no planted foot at all
+        c = ((np.minimum(sp(ank), sp(toe)) < 0.5) & ((ank[:, 1] - np.percentile(ank[:, 1], 2)) < 0.3)).astype(float)
         return clean_runs(c, int(round(0.1 / dt0)))
     lc, rc = contact(lank, ltoe), contact(rank, rtoe)
-    floor = np.median(np.r_[lank[lc > 0.5, 1], rank[rc > 0.5, 1]]) - ANKLE_H           # the floor, from the ankles of planted feet
+    planted = np.r_[lank[lc > 0.5, 1], rank[rc > 0.5, 1]]
+    # the floor, from the ankles of planted feet (a clip with no planted foot at all, e.g. one long flight, falls back to its lowest ankles)
+    floor = (np.median(planted) if len(planted) else np.percentile(np.r_[lank[:, 1], rank[:, 1]], 5)) - ANKLE_H
     def foot(ank, toe, c):
         d = toe - ank; fy = np.unwrap(np.arctan2(d[:, 0], d[:, 2]))
         t = np.arange(len(ank)); idx = np.where(np.diff(np.r_[0, c, 0]) != 0)[0]; seg = list(zip(idx[::2], idx[1::2]))
@@ -139,6 +161,8 @@ def convert(path, fps=30):
     neck[:, 0] -= rest_xz[0] * np.cos(yaw_c) + rest_xz[1] * np.sin(yaw_c); neck[:, 2] -= -rest_xz[0] * np.sin(yaw_c) + rest_xz[1] * np.cos(yaw_c)   # an upright trunk = zero lean
     hf = np.einsum("fij,j->fi", sk["Head"][1], [0, 0, 1]); hf = np.stack([hf[:, 0] * cy + hf[:, 2] * sy, hf[:, 1], -hf[:, 0] * sy + hf[:, 2] * cy], 1)
     look = head + 2.0 * hf
+    if hand_cutoff_hz:
+        lw, rw, neck, look = (lowpass(q, 1.0 / dt0, hand_cutoff_hz) for q in (lw, rw, neck, look))
     A = np.zeros((len(hip_c), 30), np.float32)
     A[:, 0:3] = hip_c; A[:, 3] = yaw_c
     A[:, 4:7] = ls; A[:, 7] = ly - 0.0; A[:, 8] = lc; A[:, 9:12] = rs; A[:, 12] = ry; A[:, 13] = rc
