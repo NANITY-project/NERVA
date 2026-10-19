@@ -19,3 +19,6 @@ node_modules/
 rollouts.jsonl
 neon_bridge.log
 *.log
+
+# downloaded motion capture + generated datasets (tools/get_real_motions.py, gen_dataset.py)
+data/
