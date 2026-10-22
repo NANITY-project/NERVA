@@ -15,6 +15,7 @@
 | `tools/motion_memory.py` | muscle memory: keeps valid motions that are not in the label set, with strength that grows with use and fades without it; recall by name or similarity; promotes a name to a gradable action at 4 examples |
 | `tools/motion_vary.py` | makes graded variants of a stored clip (mirror, time warp, amplitude, gaze, drift, tremor; heavy-tailed strength + occasional "uncommon" twist) so it is never replayed the same way |
 | `tools/build_vae_dataset.py` | one command: seeds the memory with the CMU clips, adds engine clips, fills up to N hours with graded variants, splits by source/performer, writes jsonl + windows + stats + report |
+| `tools/vae_eval.py` | judges a model's samples against REAL unseen windows: grader pass rate, nearest-training-window distance (replay check), diversity, engine verdict for samples that start at rest |
 | `tools/realism.py` | unchanged: the older walking-only gait grader |
 
 ```
