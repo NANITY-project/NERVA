@@ -1,6 +1,7 @@
 # NERVA
 
 **NERVA is the embodiment layer of [NANITY](https://github.com/NANITY-project): a language model gets a body, a pointer and eyes.**
+his repository and its code are provided 'as is' without any warranty.
 It is a from-scratch C++17 stack (no glm, no Eigen) where a model writes short text actions and a humanoid carries them out on your desktop,
 using its hand as the mouse and reading the screen through accessibility.
 
