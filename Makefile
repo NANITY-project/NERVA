@@ -81,7 +81,7 @@ actions-test:
 
 test-all: test body-test studio-test blender-test overlay-test
 
-.PHONY: all test bench sanitize clean lib studio studio-test blender-test test-all body-test overlay overlay-test actions-test motion-test motion-test-quick motion-headers
+.PHONY: all test bench sanitize clean lib studio studio-test blender-test test-all body-test overlay overlay-test actions-test motion-test motion-test-quick motion-headers vae-data vae-data-quick vae-data vae-data-quick
 
 # --- Motion grader: real CMU examples per action, grader validation, C++ headers (see tools/motion_test.py) ---
 motion-test:
@@ -92,3 +92,12 @@ motion-test-quick:
 
 motion-headers:
 	python3 tools/export_headers.py --out include/motion
+
+# --- VAE training set: everything in one command (tools/build_vae_dataset.py). make vae-data HOURS=20 OUT=data/vae
+HOURS ?= 10
+OUT ?= data/vae
+vae-data:
+	python3 tools/build_vae_dataset.py --hours $(HOURS) --out $(OUT)
+
+vae-data-quick:
+	python3 tools/build_vae_dataset.py --hours 0.3 --out /tmp/vae_quick --memory /tmp/vae_quick_mem
