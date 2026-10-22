@@ -318,7 +318,9 @@ def evaluate(model, ds, norm_t, a, null_label=False, bs=256):
 
 
 def amp_ctx(device, mode):
-    return torch.autocast(device_type=device.type, dtype=torch.bfloat16) if mode == "bf16" else contextlib.nullcontext()
+    if mode in ("bf16", "fp16"):
+        return torch.autocast(device_type=device.type, dtype=torch.bfloat16 if mode == "bf16" else torch.float16)
+    return contextlib.nullcontext()
 
 
 # ============================================================================================================================ io helpers
@@ -394,7 +396,7 @@ def main():
     ap.add_argument("--loss", choices=["huber", "mse"], default="huber"); ap.add_argument("--beta", type=float, default=0.25, help="commitment weight")
     ap.add_argument("--w-vel", type=float, default=0.2); ap.add_argument("--w-flag", type=float, default=0.5)
     # runtime
-    ap.add_argument("--amp", choices=["auto", "bf16", "none"], default="auto"); ap.add_argument("--compile", action="store_true", help="torch.compile the encoder and decoder")
+    ap.add_argument("--amp", choices=["auto", "bf16", "fp16", "none"], default="auto", help="auto: bf16 on Ampere+/ROCm, fp16 (+loss scaling) on older NVIDIA such as the T4, none on CPU"); ap.add_argument("--compile", action="store_true", help="torch.compile the encoder and decoder")
     ap.add_argument("--no-canon", action="store_true"); ap.add_argument("--data-on-device-gb", type=float, default=3.0, help="keep the windows on the GPU if they take less than this")
     ap.add_argument("--seed", type=int, default=0); ap.add_argument("--log-every", type=int, default=100); ap.add_argument("--resume", default=""); ap.add_argument("--ckpt", default="")
     ap.add_argument("--eval-only", action="store_true"); ap.add_argument("--params-only", action="store_true")
@@ -403,7 +405,10 @@ def main():
 
     dev = torch.device("cuda" if (a.device == "auto" and torch.cuda.is_available()) else ("cpu" if a.device == "auto" else a.device))
     if a.amp == "auto":
-        a.amp = "bf16" if dev.type == "cuda" else "none"
+        if dev.type == "cuda":                              # bf16 is native on Ampere (sm_80)+ and on AMD ROCm; a T4 (sm_75) emulates it very slowly -> fp16 there
+            a.amp = "bf16" if (torch.version.hip or torch.cuda.get_device_capability()[0] >= 8) else "fp16"
+        else:
+            a.amp = "none"
     torch.manual_seed(a.seed); np.random.seed(a.seed)
     if dev.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True; torch.backends.cudnn.allow_tf32 = True; torch.backends.cudnn.benchmark = True
@@ -453,6 +458,7 @@ def main():
             step, epoch0, best = ck["step"], ck["epoch"] + 1, ck["best_val"]; model.vq._ready = True; print(f"resumed from {a.resume}: epoch {epoch0}, step {step}, best val {best:.4f}")
         spe = max(1, train.n // a.batch); total_steps = a.epochs * spe
         lr_at = lambda s: a.lr * (s / max(1, a.warmup) if s < a.warmup else a.min_lr_frac + (1 - a.min_lr_frac) * 0.5 * (1 + math.cos(math.pi * (s - a.warmup) / max(1, total_steps - a.warmup))))
+        scaler = torch.amp.GradScaler("cuda", enabled=(a.amp == "fp16" and dev.type == "cuda"))     # a no-op unless fp16
         mlog = open(os.path.join(a.out, "metrics.jsonl"), "a"); bad = 0; t0 = time.time(); stop = False
         model.train()
         for epoch in range(epoch0, a.epochs):
@@ -462,8 +468,8 @@ def main():
                 for g in opt.param_groups:
                     g["lr"] = lr_at(step)
                 loss, m, _ = compute_loss(model, x, v, act, norm_t, a, train=True)
-                opt.zero_grad(set_to_none=True); loss.backward()
-                gn = torch.nn.utils.clip_grad_norm_(model.parameters(), a.clip); opt.step(); step += 1
+                opt.zero_grad(set_to_none=True); scaler.scale(loss).backward(); scaler.unscale_(opt)
+                gn = torch.nn.utils.clip_grad_norm_(model.parameters(), a.clip); scaler.step(opt); scaler.update(); step += 1
                 for k in ("total", "rec", "vel", "bce", "commit", "ppl"):
                     run[k] = run[k] + m[k]                      # stays a device tensor: no GPU sync per step
                 nrun += 1
