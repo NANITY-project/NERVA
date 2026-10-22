@@ -146,6 +146,27 @@ def rep_dist(r, others):
     return float(np.sqrt(((np.asarray(others) - r) ** 2).mean(1)).min())
 
 
+def duplicate_pairs(clips, thr=0.01):
+    """(i, j) pairs, i < j, of clips whose rep distance is < thr metres: the same motion stored twice (the CMU set has 39 such pairs under different performer ids,
+    e.g. subjects 77 and 139, 91 and 105, 93 and 103; nothing lies between 2 mm and 5 cm, so the threshold is not delicate)."""
+    R = np.stack([clip_rep(c) for c in clips]).astype(np.float64); sq = (R ** 2).sum(1); d2 = np.maximum(sq[:, None] + sq[None] - 2 * R @ R.T, 0) / R.shape[1]
+    i, j = np.where(np.triu(d2 < thr ** 2, 1)); return list(zip(i.tolist(), j.tolist()))
+
+
+def merge_groups(labels, pairs):
+    """labels: one group label per clip; pairs: clip index pairs that are the same motion. Returns the labels with every group that shares a duplicate merged (union-find)."""
+    par = {l: l for l in set(labels)}
+    def find(x):
+        while par[x] != x:
+            par[x] = par[par[x]]; x = par[x]
+        return x
+    for i, j in pairs:
+        a, b = find(labels[i]), find(labels[j])
+        if a != b:
+            par[b] = a
+    return [find(l) for l in labels]
+
+
 def check_variant(b, dt, action, prof, src_fit, src_rep, sib_reps=()):
     """Accept/reject a variant. Returns (ok, why, features, fit, distance). Distance = rep_dist to the source and the already accepted siblings (not a copy of any)."""
     v = mf.extract(b, dt)
