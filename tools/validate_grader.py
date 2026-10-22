@@ -50,8 +50,13 @@ def corrupt(rng, a, other, kind):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--real", default=G.REAL_DEFAULT); ap.add_argument("--actions", nargs="+"); ap.add_argument("--engine"); ap.add_argument("--engine-action", default="walk")
-    ap.add_argument("--n-corrupt", type=int, default=60, help="clean clips to corrupt"); ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--n-corrupt", type=int, default=60, help="clean clips to corrupt"); ap.add_argument("--no-dup-groups", action="store_true", help="old behaviour: leave out one performer id only"); ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args(); z, F = G.load_real(a.real); act = z["action"]; perf = z["performer"]; lab = z["labels"]; A, off, dt = z["actions"], z["offsets"], float(z["dt"])
+    import motion_vary as MV                                                 # the CMU set stores some motions twice under different performer ids: such performers are ONE group when a performer is left out
+    _cl = [A[off[i]:off[i + 1]] for i in range(len(act))]; _dp = MV.duplicate_pairs(_cl)
+    if not a.no_dup_groups:
+        perf = np.array(MV.merge_groups([str(x) for x in perf], _dp), dtype=object)
+    print(f"{len(_dp)} duplicate clip pairs across performer ids; " + ("performers that share a motion are left out together" if not a.no_dup_groups else "IGNORED (--no-dup-groups): the old, optimistic split"))
     names = sorted(set(act)); sel = [n for n in names if (not a.actions or n in a.actions)]; N = len(F)
     # ---- 1. held-out real clips
     held = {}                                                                # action -> list of (score, recognised, rank)
