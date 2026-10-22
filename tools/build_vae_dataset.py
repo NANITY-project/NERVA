@@ -13,7 +13,7 @@ What it does, in order (each step prints what it did and how long it took)
   1. real CMU motions   downloads them the first time (data/real_motions.npz); they are the grader's yardstick, and, unless --no-cmu, also source motions
   2. memory             opens data/memory (tools/motion_memory.py) and, if empty, seeds it with every CMU example (kind known, origin cmu)
   3. engine clips       builds the engine, generates --engine-clips walking clips, drops the ones the engine's own verdict rejects, stores the ones that pass the grader gates
-  4. split              by SOURCE (CMU: by performer; engine/user: by clip) into train and validation: a variant never lands in a different split than its source
+  4. split              (exact duplicate CMU clips are dropped first) by SOURCE (CMU: by performer; engine/user: by clip) into train and validation: a variant never lands in a different split than its source
   5. variants           the training set is filled up to --hours with variants of the training sources (tools/motion_vary.py: mirror, time warp, amplitude, gaze, drift, tremor,
                         heavy-tailed strength, occasional "uncommon" twist). Every variant must pass the grader (gates + fit to its action) and differ from its source and its
                         siblings; variants of ENGINE clips must also pass the engine's feasibility verdict. Names are balanced by count**--balance (0.5: square root).
@@ -99,6 +99,10 @@ def main():
             log("engine clip generation failed: " + (r.stderr or r.stdout)[-300:])
     mem.save()
     keep = [i for i, e in enumerate(mem.entries) if not (a.no_cmu and e.get("origin") == "cmu")]
+    cmu_keep = [i for i in keep if mem.entries[i].get("origin") == "cmu"]                    # the CMU set stores some motions twice under different performer ids (77/139, 91/105, 93/103): keep one copy,
+    dup = {cmu_keep[j] for _, j in V.duplicate_pairs([mem.clips[i] for i in cmu_keep])}       # otherwise a "held-out performer" can have an identical twin in training
+    if dup:
+        keep = [i for i in keep if i not in dup]; log(f"dropped {len(dup)} CMU clips that are exact duplicates of another performer's clip (the copy stays out of both splits)")
     if not keep:
         sys.exit("nothing to build from: the memory is empty (drop --no-cmu / --no-engine, or add motions)")
     name = {i: mem.entries[i]["name"] for i in keep}; origin = {i: mem.entries[i].get("origin", "user") for i in keep}; nfr = {i: len(mem.clips[i]) for i in keep}
