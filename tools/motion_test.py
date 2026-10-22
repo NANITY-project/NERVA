@@ -66,6 +66,29 @@ def main():
     cl = [A[off[i]:off[i + 1]] for i in sel]; np.savez(mixed, actions=np.concatenate(cl), offsets=np.cumsum([0] + [len(c) for c in cl]), dt=z["dt"], action=np.array([act[i] for i in sel]))
     r = run([sys.executable, os.path.join(HERE, "motion_grader.py"), mixed, "--real", real]); n_blocks = sum(1 for l in r.stdout.splitlines() if l.startswith("== "))
     step("dataset grading: a labelled file is judged action by action (CLI)", n_blocks == 3 and r.returncode == 0, f"{n_blocks} actions reported")
+    # 3b --------------------------------------------------------------- rolling labeller + muscle memory
+    r = run([sys.executable, os.path.join(HERE, "motion_roll.py"), "--selftest", "--real", real]); acc = [l for l in r.stdout.splitlines() if l.startswith("frame accuracy")]
+    step("rolling labeller: glued real clips are cut and labelled (frame accuracy >= 60%)", r.returncode == 0, acc[0] if acc else (r.stdout + r.stderr)[-200:])
+    import motion_memory as MM
+    mdir = os.path.join(tmp, "mem"); mem = MM.Memory(mdir); wv = [i for i in range(len(act)) if act[i] == "walk"][:5]; st = [mem.add(A[off[i]:off[i + 1]], dt, "wave", prof, F)[0] for i in wv]
+    st2 = mem.add(A[off[wv[0]]:off[wv[0] + 1]], dt, "wave", prof, F)[0]; mem.save(); back = MM.Memory(mdir)
+    hit = back.recall(like=mf.extract(A[off[wv[1]]:off[wv[1] + 1]], dt), k=1, real_F=F)
+    step("muscle memory: store, duplicate reinforces, reload, recall by similarity", len(wv) >= 3 and st.count("stored") >= len(wv) - 1 and st2 == "reinforced" and len(back.entries) == st.count("stored") and bool(hit) and back.entries[hit[0][0]]["name"] == "wave", f"{st.count('stored')} stored, duplicate -> {st2}")
+    ph = A[off[wv[0]]:off[wv[0] + 1]].copy(); nz = [i for i in range(30) if i % 4 != 3 and i not in (8, 13)]; ph[:, nz] += np.random.default_rng(0).normal(0, 0.04, (len(ph), len(nz))).astype(np.float32)
+    step("muscle memory: a grossly jittery clip (4 cm noise) is not admitted", back.add(ph, dt, "junk", prof, F)[0] == "rejected")
+    import motion_vary as MV
+    c0 = A[off[wv[0]]:off[wv[0] + 1]]; f0 = G.grade_features(mf.extract(c0, dt), "walk", prof, use_match=False)["fit"]; r0 = MV.clip_rep(c0); rv = np.random.default_rng(0); kept, sib = [], []
+    for _ in range(30):
+        b, _i = MV.make_variant(c0, dt, rv); ok, *_r = MV.check_variant(b, dt, "walk", prof, f0, r0, sib)
+        if ok:
+            kept.append(b); sib.append(MV.clip_rep(b))
+    step("variation: variants of one clip pass the grader and are not copies of it or of each other", len(kept) >= 4 and all(MV.rep_dist(MV.clip_rep(k), [r0]) >= MV.MIN_DIST for k in kept), f"{len(kept)} of 30 kept")
+    s1, i1 = back.serve(0, prof); s2, i2 = back.serve(0, prof)
+    step("muscle memory: serve() never gives the same variant twice (and records its seeds)", s1 is not None and s2 is not None and MV.rep_dist(MV.clip_rep(s1), [MV.clip_rep(s2)]) > 0 and len(back.entries[0]["seeds"]) == 2, f"seeds {[x[0] for x in back.entries[0]['seeds']]}")
+    bd = os.path.join(tmp, "vae"); cmd = [sys.executable, os.path.join(HERE, "build_vae_dataset.py"), "--real", real, "--hours", "0.12", "--engine-clips", "40", "--no-jsonl", "--out", bd, "--memory", os.path.join(tmp, "vmem")] + ([] if a.engine else ["--no-engine"])
+    r = run(cmd); okf = r.returncode == 0 and all(os.path.exists(os.path.join(bd, f)) for f in ("train_windows.npz", "val_windows.npz", "stats.json", "report.txt", "preview.npz"))
+    tw = np.load(os.path.join(bd, "train_windows.npz"), allow_pickle=True) if okf else None; vw = np.load(os.path.join(bd, "val_windows.npz"), allow_pickle=True) if okf else None
+    step("build_vae_dataset.py: one command builds windows, stats and a report; no source in both splits", okf and len(tw["windows"]) > 0 and np.isfinite(tw["windows"]).all() and not (set(tw["origin_id"].tolist()) & set(vw["origin_id"].tolist())), (r.stdout + r.stderr)[-200:] if not okf else f"{len(tw['windows'])} train windows")
     # 4 ---------------------------------------------------------------- headers
     hdr = os.path.join(tmp, "motion"); r = run([sys.executable, os.path.join(HERE, "export_headers.py"), "--out", hdr, "--real", real, "--clips", "3" if a.quick else "6"])
     ok = r.returncode == 0; print("      " + (r.stdout.splitlines()[0] if r.stdout else r.stderr[-300:]))
