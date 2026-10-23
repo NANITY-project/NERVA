@@ -22,3 +22,5 @@ neon_bridge.log
 
 # downloaded motion capture + generated datasets (tools/get_real_motions.py, gen_dataset.py)
 data/
+
+UI/.cache/
