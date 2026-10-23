@@ -1,0 +1,438 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NERVA · NEON — motion console</title>
+<style>
+:root{
+  --bg:#07070a; --panel:#0d0d12; --panel2:#12121a; --line:#23232f; --line2:#33333f;
+  --fg:#e8e8ee; --dim:#7d7d8c; --crim:#e0213b; --crim2:#ff4560; --crimdim:#5a0f1b; --ok:#5fd68a; --warn:#ffb454;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font:13px/1.45 var(--sans);overflow:hidden}
+button,select,input{font:inherit;color:inherit}
+#app{display:grid;grid-template-columns:330px 1fr;grid-template-rows:46px 1fr 210px;height:100%}
+header{grid-column:1/3;display:flex;align-items:center;gap:14px;padding:0 16px;border-bottom:1px solid var(--line);background:var(--panel)}
+.brand{font-weight:700;letter-spacing:.18em;font-size:13px}.brand b{color:var(--crim)}
+.pills{display:flex;gap:8px;margin-left:auto;flex-wrap:wrap}
+.pill{font:11px var(--mono);padding:3px 9px;border:1px solid var(--line2);border-radius:999px;color:var(--dim);white-space:nowrap}
+.pill.on{color:var(--fg);border-color:var(--crim)}.pill.on::before{content:"● ";color:var(--crim2)}
+.pill.warn{border-color:var(--warn);color:var(--warn)}
+aside{grid-row:2/4;border-right:1px solid var(--line);background:var(--panel);overflow:auto;padding:14px;display:flex;flex-direction:column;gap:14px}
+h3{margin:0 0 8px;font:600 10.5px var(--mono);letter-spacing:.16em;color:var(--dim);text-transform:uppercase}
+#drop{border:1px dashed var(--line2);border-radius:10px;padding:18px 12px;text-align:center;cursor:pointer;transition:.15s;background:var(--panel2)}
+#drop:hover,body.dragging #drop{border-color:var(--crim);background:#1a0a0e}
+#drop big{display:block;font-size:14px;margin-bottom:4px}
+#drop small{color:var(--dim)}
+#over{position:fixed;inset:0;z-index:50;display:none;align-items:center;justify-content:center;background:#07070acc;border:3px dashed var(--crim);font:600 20px var(--mono);letter-spacing:.14em;color:var(--crim2);pointer-events:none}
+body.dragging #over{display:flex}
+.card{border:1px solid var(--line);border-radius:8px;padding:9px 10px;background:var(--panel2);margin-top:8px;font:12px var(--mono)}
+.card.empty{color:var(--dim);border-style:dashed;background:none}
+.card .t{color:var(--crim2);font-weight:600}.card .d{color:var(--dim);margin-top:2px}
+.warnbox{border:1px solid var(--warn);color:var(--warn);border-radius:8px;padding:8px 10px;font-size:12px}
+.errbox{border:1px solid var(--crim);color:#ff9aa8;border-radius:8px;padding:8px 10px;font-size:12px;white-space:pre-wrap}
+label.row{display:grid;grid-template-columns:92px 1fr 46px;align-items:center;gap:8px;margin:7px 0;color:var(--dim)}
+label.row output{font:12px var(--mono);color:var(--fg);text-align:right}
+select,input[type=number]{background:var(--panel2);border:1px solid var(--line2);border-radius:6px;padding:5px 8px;width:100%}
+input[type=range]{accent-color:var(--crim);width:100%}
+.btns{display:flex;gap:8px}
+button{background:var(--panel2);border:1px solid var(--line2);border-radius:7px;padding:8px 12px;cursor:pointer}
+button:hover{border-color:var(--crim)}
+button.go{flex:1;background:var(--crim);border-color:var(--crim);font-weight:600;color:#fff}
+button.go:hover{background:var(--crim2)}
+button:disabled{opacity:.4;cursor:not-allowed}
+main{position:relative;min-height:0;background:radial-gradient(ellipse at 50% 30%,#14080b 0%,var(--bg) 70%)}
+#cv{position:absolute;inset:0;width:100%;height:100%;cursor:grab}
+#cv:active{cursor:grabbing}
+.hud{position:absolute;left:14px;top:12px;font:12px var(--mono);color:var(--dim);line-height:1.6;pointer-events:none;text-shadow:0 0 6px #000}
+.hud b{color:var(--fg)}.hud .crim{color:var(--crim2)}
+.views{position:absolute;right:12px;top:10px;display:flex;gap:6px}
+.views button{padding:3px 9px;font:11px var(--mono)}
+.views label{font:11px var(--mono);color:var(--dim);display:flex;align-items:center;gap:5px}
+#empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;color:var(--dim);pointer-events:none;font:13px var(--mono);line-height:1.8}
+#bar{position:absolute;left:14px;right:14px;bottom:10px;display:flex;align-items:center;gap:10px;font:11px var(--mono);color:var(--dim)}
+#bar input{flex:1}
+footer{border-top:1px solid var(--line);background:var(--panel);padding:10px 14px;display:grid;grid-template-columns:1fr 280px;gap:16px;min-height:0}
+#grid{overflow:auto;display:flex;flex-direction:column;gap:3px;min-height:0}
+.wrow{display:flex;align-items:center;gap:2px}
+.wrow .wl{width:30px;font:10px var(--mono);color:var(--dim);flex:none}
+.cell{flex:1;min-width:0;height:20px;border-radius:3px;background:var(--line);font:9px var(--mono);display:flex;align-items:center;justify-content:center;color:#fff9;overflow:hidden}
+.cell.live{outline:1px solid var(--crim2)}
+.wrow .ms{width:118px;flex:none;font:10px var(--mono);color:var(--dim);text-align:right}
+#side{display:flex;flex-direction:column;gap:8px;min-height:0}
+#ent{width:100%;height:56px;background:var(--panel2);border:1px solid var(--line);border-radius:6px}
+#logbox{flex:1;overflow:auto;font:10.5px var(--mono);color:var(--dim);white-space:pre-wrap;min-height:0}
+.legend{font:10px var(--mono);color:var(--dim)}
+</style>
+</head>
+<body>
+<div id="over">DROP best.pt · prior_best.pt · .gguf</div>
+<div id="app">
+  <header>
+    <div class="brand">NERVA <b>×</b> NEON</div>
+    <div class="pills">
+      <span class="pill" id="pBackend">NEON: —</span>
+      <span class="pill" id="pEngine">engine: —</span>
+      <span class="pill" id="pVae">VAE: none</span>
+      <span class="pill" id="pPrior">prior: none</span>
+    </div>
+  </header>
+
+  <aside>
+    <section>
+      <h3>Models</h3>
+      <div id="drop"><big>Drop .pt files here</big><small>best.pt (VAE) + prior_best.pt — or click to browse.<br>A ready .gguf cVQ-VAE works too.</small></div>
+      <input type="file" id="file" multiple accept=".pt,.pth,.gguf" hidden>
+      <div id="cards"></div>
+      <div id="msgs"></div>
+    </section>
+
+    <section>
+      <h3>Generate</h3>
+      <label class="row">action<select id="action"><option value="null">unconditional</option></select><span></span></label>
+      <label class="row">temperature<input type="range" id="temp" min="0.3" max="1.6" step="0.05" value="1"><output id="tempO">1.00</output></label>
+      <label class="row">top-k<input type="range" id="topk" min="0" max="200" step="1" value="50"><output id="topkO">50</output></label>
+      <label class="row">top-p<input type="range" id="topp" min="0.5" max="1" step="0.01" value="0.95"><output id="toppO">0.95</output></label>
+      <label class="row">seed<input type="number" id="seed" value="0" min="0"><button id="dice" title="random seed" style="padding:4px 8px">⚄</button></label>
+      <label class="row">windows<input type="number" id="wins" value="8" min="1" max="500"><span></span></label>
+      <label class="row" style="grid-template-columns:92px 1fr"><span>endless</span><input type="checkbox" id="endless" style="justify-self:start"></label>
+      <div class="btns"><button class="go" id="go" disabled>Generate</button><button id="stop" disabled>Stop</button></div>
+    </section>
+
+    <section class="legend">
+      <h3>How to read it</h3>
+      Bottom grid: each row is one 64-frame window; each cell is one VAE code the prior just sampled (brighter = more confident).
+      The body is replayed through the NERVA IK engine; green discs are planted feet, pink dot is the centre of mass.
+    </section>
+  </aside>
+
+  <main>
+    <canvas id="cv"></canvas>
+    <div id="empty">Drop a trained VAE and prior on the page.<br>Then press Generate.</div>
+    <div class="hud" id="hud"></div>
+    <div class="views">
+      <button data-v="0">3/4</button><button data-v="1">side</button><button data-v="2">front</button><button data-v="3">back</button><button data-v="4">top</button>
+      <label><input type="checkbox" id="follow" checked>follow</label>
+      <select id="speed" style="width:70px;padding:2px 4px"><option value="0.25">0.25×</option><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option></select>
+    </div>
+    <div id="bar"><button id="play" style="padding:3px 10px">pause</button><input type="range" id="seek" min="0" max="0" value="0"><span id="tt">0.00 s</span></div>
+  </main>
+
+  <footer>
+    <div id="grid"></div>
+    <div id="side">
+      <div class="legend">prior entropy per code (nats) — high = unsure</div>
+      <canvas id="ent" width="560" height="112"></canvas>
+      <div id="logbox"></div>
+    </div>
+  </footer>
+</div>
+
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const cv = $('cv'), ctx = cv.getContext('2d');
+const NCH = 30;
+
+// ------------------------------------------------------------------ state
+let ST = null;                       // last /api/status
+let es = null;                       // EventSource
+let G = null;                        // generation run: {dt, names, engine, chunks:[], total, first}
+let playhead = 0, playing = true, speed = 1, follow = true, last = performance.now();
+let cam = {yaw: .75, pitch: .22, dist: 3.6};
+const VIEWS = [[.75,.22,3.6],[Math.PI/2,.05,3.6],[0,.05,3.6],[Math.PI,.05,3.6],[0,1.5,4.2]];
+const ents = [];
+
+function log(s){ const b = $('logbox'); b.textContent += s + '\n'; b.scrollTop = b.scrollHeight; }
+
+// ------------------------------------------------------------------ status / models
+async function refresh(){
+  const r = await fetch('/api/status'); ST = await r.json(); render();
+}
+function render(){
+  const s = ST;
+  $('pBackend').textContent = 'NEON: ' + (s.vae ? s.vae.backend : '—'); $('pBackend').className = 'pill' + (s.vae ? ' on' : '');
+  $('pEngine').textContent = 'engine: ' + (s.engine ? 'libnebula' : (s.engine_error ? 'preview skeleton' : 'loading…')); $('pEngine').className = 'pill' + (s.engine ? ' on' : (s.engine_error ? ' warn' : ''));
+  $('pVae').textContent = 'VAE: ' + (s.vae ? s.vae.file : 'none'); $('pVae').className = 'pill' + (s.vae ? ' on' : '');
+  $('pPrior').textContent = 'prior: ' + (s.prior ? s.prior.file : 'none'); $('pPrior').className = 'pill' + (s.prior ? ' on' : '');
+  const c = $('cards'); c.innerHTML = '';
+  c.append(card('VAE', s.vae && `${s.vae.file}`, s.vae && `window ${s.vae.window} frames → ${s.vae.window >> s.vae.downs} codes · ${s.vae.codes} codebook · ${(1/s.vae.dt).toFixed(0)} fps`, 'drop best.pt'));
+  c.append(card('PRIOR', s.prior && `${s.prior.file}`, s.prior && `${(s.prior.params/1e6).toFixed(1)} M params · ${s.prior.layers} layers · d=${s.prior.d} · ${s.prior.windows}-window context`, 'drop prior_best.pt'));
+  const m = $('msgs'); m.innerHTML = '';
+  (s.warnings || []).forEach(w => { const d = document.createElement('div'); d.className = 'warnbox'; d.style.marginTop = '8px'; d.textContent = w; m.append(d); });
+  if (s.engine_error && !s.engine){ const d = document.createElement('div'); d.className = 'warnbox'; d.style.marginTop = '8px'; d.textContent = 'libnebula not loaded — showing a preview skeleton drawn from the action channels. (' + s.engine_error.slice(0, 160) + ')'; m.append(d); }
+  const sel = $('action'), cur = sel.value;
+  sel.innerHTML = '<option value="null">unconditional</option>' + (s.actions || []).map(a => `<option>${a}</option>`).join('');
+  if ([...sel.options].some(o => o.value === cur)) sel.value = cur;
+  $('go').disabled = !s.ready || !!es;
+  if (s.prior && !$('wins').dataset.touched) $('wins').value = Math.max(4, s.prior.windows * 2);
+}
+function card(tag, title, detail, hint){
+  const d = document.createElement('div');
+  if (!title){ d.className = 'card empty'; d.textContent = tag + ': ' + hint; return d; }
+  d.className = 'card'; d.innerHTML = `<div class="t">${tag}</div><div>${title}</div><div class="d">${detail}</div>`; return d;
+}
+
+// ------------------------------------------------------------------ upload (drag & drop anywhere)
+let dragDepth = 0;
+addEventListener('dragenter', e => { e.preventDefault(); dragDepth++; document.body.classList.add('dragging'); });
+addEventListener('dragleave', e => { e.preventDefault(); if (--dragDepth <= 0){ dragDepth = 0; document.body.classList.remove('dragging'); } });
+addEventListener('dragover', e => e.preventDefault());
+addEventListener('drop', e => { e.preventDefault(); dragDepth = 0; document.body.classList.remove('dragging'); upload([...e.dataTransfer.files]); });
+$('drop').onclick = () => $('file').click();
+$('file').onchange = e => { upload([...e.target.files]); e.target.value = ''; };
+
+async function upload(files){
+  stopGen();
+  // VAE first, so a prior dropped together with it is checked against the right VAE; order does not change the result otherwise
+  files.sort((a, b) => /prior/i.test(a.name) - /prior/i.test(b.name));
+  for (const f of files){
+    log(`uploading ${f.name} (${(f.size/1e6).toFixed(1)} MB)…`);
+    try{
+      const r = await fetch('/api/upload?name=' + encodeURIComponent(f.name), {method: 'POST', body: f});
+      const j = await r.json(); ST = j.status;
+      if (j.ok) log(`✓ ${j.info.kind}: ${j.info.file}${j.info.note ? ' (' + j.info.note + ')' : ''}`);
+      else { log('✗ ' + j.error); const d = document.createElement('div'); d.className = 'errbox'; d.style.marginTop = '8px'; d.textContent = f.name + ': ' + j.error; $('msgs').append(d); }
+    }catch(err){ log('✗ upload failed: ' + err); }
+    if (ST) render();
+  }
+  refresh();
+}
+
+// ------------------------------------------------------------------ controls
+const bindOut = (id, o, f = v => v) => $(id).oninput = () => $(o).textContent = f($(id).value);
+bindOut('temp', 'tempO', v => (+v).toFixed(2)); bindOut('topk', 'topkO', v => +v ? v : 'off'); bindOut('topp', 'toppO', v => (+v).toFixed(2));
+$('wins').oninput = () => $('wins').dataset.touched = 1;
+$('dice').onclick = () => $('seed').value = Math.floor(Math.random() * 1e6);
+$('endless').onchange = () => $('wins').disabled = $('endless').checked;
+$('go').onclick = startGen; $('stop').onclick = stopGen;
+function togglePlay(){ playing = !playing; $('play').textContent = playing ? 'pause' : 'play'; }
+$('play').onclick = togglePlay;
+$('speed').onchange = e => speed = +e.target.value;
+$('follow').onchange = e => follow = e.target.checked;
+document.querySelectorAll('[data-v]').forEach(b => b.onclick = () => { const v = VIEWS[+b.dataset.v]; cam.yaw = v[0]; cam.pitch = v[1]; cam.dist = v[2]; });
+$('seek').oninput = () => { playhead = +$('seek').value; playing = false; $('play').textContent = 'play'; };
+addEventListener('keydown', e => { if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return; if (e.code === 'Space'){ $('play').onclick(); e.preventDefault(); } });
+
+// ------------------------------------------------------------------ generation stream
+function startGen(){
+  stopGen(true);
+  $('grid').innerHTML = ''; ents.length = 0; drawEnt();
+  const q = new URLSearchParams({action: $('action').value, temperature: $('temp').value, top_k: $('topk').value, top_p: $('topp').value,
+    seed: $('seed').value, windows: $('endless').checked ? 0 : $('wins').value});
+  G = {dt: 1/30, names: null, engine: false, chunks: [], total: 0, first: 0, t0: performance.now(), rows: {}, action: $('action').value, fps: 30};
+  playhead = 0; playing = true; $('play').textContent = 'pause'; $('play').onclick = togglePlay; $('empty').style.display = 'none';
+  es = new EventSource('/api/generate?' + q);
+  $('go').disabled = true; $('stop').disabled = false;
+  es.onmessage = m => onEvent(JSON.parse(m.data));
+  es.onerror = () => { if (es && es.readyState === EventSource.CLOSED) endGen(); };
+  log(`generate: action=${$('action').value} T=${$('temp').value} k=${$('topk').value} p=${$('topp').value} seed=${$('seed').value}`);
+}
+function stopGen(silent){
+  fetch('/api/stop', {method: 'POST'}).catch(() => {});
+  endGen();
+}
+function endGen(){
+  if (es){ es.close(); es = null; }
+  $('stop').disabled = true; if (ST) $('go').disabled = !ST.ready;
+}
+function onEvent(e){
+  if (e.type === 'start'){
+    G.dt = e.dt; G.names = e.bone_names; G.engine = e.engine; G.n = e.n; G.window = e.window;
+    log(`stream: ${e.backend}; body: ${e.engine ? 'libnebula' : 'preview skeleton'}; ${e.n} codes per ${e.window}-frame window, stride ${e.stride}`);
+  } else if (e.type === 'code'){
+    const row = ensureRow(e.w); const cell = row.cells[e.i];
+    cell.textContent = e.c; cell.style.background = codeColor(e.c, e.p); cell.title = `code ${e.c} · p=${e.p} · entropy ${e.ent}`; cell.classList.add('live');
+    if (e.i > 0) row.cells[e.i - 1].classList.remove('live');
+    ents.push(e.ent); if (ents.length > 280) ents.shift(); if (e.i % 4 === 3) drawEnt();
+  } else if (e.type === 'window'){
+    const row = ensureRow(e.w); row.cells.forEach(c => c.classList.remove('live'));
+    row.ms.textContent = `prior ${e.prior_ms} · NEON ${e.decode_ms}${G.engine ? ' · eng ' + e.engine_ms : ''} ms`;
+    const winSec = e.frames * G.dt, workSec = (e.prior_ms + e.decode_ms + e.engine_ms) / 1000;
+    G.rt = winSec / Math.max(workSec, 1e-6);
+  } else if (e.type === 'frames'){
+    addChunk(e);
+  } else if (e.type === 'done'){
+    log(`done: ${e.frames} frames (${(e.frames * G.dt).toFixed(1)} s of motion) in ${e.seconds} s`); endGen();
+  } else if (e.type === 'error'){
+    log('✗ ' + e.message); const d = document.createElement('div'); d.className = 'errbox'; d.style.marginTop = '8px'; d.textContent = e.message; $('msgs').append(d); endGen();
+  }
+}
+function ensureRow(w){
+  if (G.rows[w]) return G.rows[w];
+  const r = document.createElement('div'); r.className = 'wrow';
+  const l = document.createElement('div'); l.className = 'wl'; l.textContent = 'w' + w; r.append(l);
+  const cells = []; for (let i = 0; i < G.n; i++){ const c = document.createElement('div'); c.className = 'cell'; r.append(c); cells.push(c); }
+  const ms = document.createElement('div'); ms.className = 'ms'; r.append(ms);
+  $('grid').append(r); $('grid').scrollTop = 1e9;
+  const keys = Object.keys(G.rows); if (keys.length > 60){ const k = keys[0]; G.rows[k].el.remove(); delete G.rows[k]; }
+  return G.rows[w] = {el: r, cells, ms};
+}
+function codeColor(c, p){
+  const hue = 345 + ((c * 47) % 70) - 35, light = 22 + ((c * 13) % 5) * 5;
+  return `hsla(${hue},75%,${light + 14 * p}%,${0.35 + 0.65 * p})`;
+}
+function drawEnt(){
+  const c = $('ent'), x = c.getContext('2d'), W = c.width, H = c.height; x.clearRect(0, 0, W, H);
+  if (!ents.length) return; const mx = Math.max(4, ...ents);
+  x.strokeStyle = '#e0213b'; x.lineWidth = 2; x.beginPath();
+  ents.forEach((v, i) => { const px = i / 279 * W, py = H - 6 - v / mx * (H - 12); i ? x.lineTo(px, py) : x.moveTo(px, py); }); x.stroke();
+  x.fillStyle = '#7d7d8c'; x.font = '10px monospace'; x.fillText(mx.toFixed(1), 4, 12);
+}
+
+// ------------------------------------------------------------------ frame store
+function b64i16(s){ const b = atob(s), u = new Uint8Array(b.length); for (let i = 0; i < b.length; i++) u[i] = b.charCodeAt(i); return new Int16Array(u.buffer); }
+function addChunk(e){
+  const c = {start: e.start, n: e.n, act: Float32Array.from(e.act), B: e.bones ? b64i16(e.bones) : null, com: e.com, bad: e.bad, margin: e.margin};
+  G.chunks.push(c); G.total = e.start + e.n;
+  // endless runs: forget what is far behind the playhead
+  while (G.chunks.length > 3 && G.chunks[0].start + G.chunks[0].n < playhead - 240) G.chunks.shift();
+  G.first = G.chunks[0].start;
+  const sk = $('seek'); sk.min = G.first; sk.max = G.total - 1;
+}
+function frameAt(g){
+  if (!G) return null;
+  for (let k = G.chunks.length - 1; k >= 0; k--){ const c = G.chunks[k]; if (g >= c.start && g < c.start + c.n) return {c, i: g - c.start}; }
+  return null;
+}
+
+// ------------------------------------------------------------------ camera / projection (same maths as tools/view_clip.py)
+let eye, R, U, Fw, FOC;
+function setCam(W, H, t){
+  const cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
+  eye = [t[0] + cam.dist * cp * Math.sin(cam.yaw), t[1] + cam.dist * sp, t[2] + cam.dist * cp * Math.cos(cam.yaw)];
+  let fw = [t[0] - eye[0], t[1] - eye[1], t[2] - eye[2]]; const n = Math.hypot(...fw); fw = fw.map(v => v / n);
+  let r = [-fw[2], 0, fw[0]]; const rn = Math.hypot(...r) || 1; r = r.map(v => v / rn);
+  Fw = fw; R = r; U = [r[1]*fw[2]-r[2]*fw[1], r[2]*fw[0]-r[0]*fw[2], r[0]*fw[1]-r[1]*fw[0]]; FOC = H * 1.15;
+}
+function P(x, y, z, W, H){
+  const dx = x - eye[0], dy = y - eye[1], dz = z - eye[2];
+  const cx = dx*R[0] + dy*R[1] + dz*R[2], cy = dx*U[0] + dy*U[1] + dz*U[2], cz = dx*Fw[0] + dy*Fw[1] + dz*Fw[2];
+  if (cz < .1) return null; const s = FOC / cz; return [W/2 + cx*s, H*.42 - cy*s, cz, s];
+}
+cv.onmousedown = e => drag = [e.clientX, e.clientY]; let drag = null;
+addEventListener('mouseup', () => drag = null);
+addEventListener('mousemove', e => { if (!drag) return; cam.yaw -= (e.clientX - drag[0]) * .008; cam.pitch = Math.max(-.2, Math.min(1.5, cam.pitch + (e.clientY - drag[1]) * .006)); drag = [e.clientX, e.clientY]; });
+cv.onwheel = e => { cam.dist = Math.max(1.2, Math.min(12, cam.dist * (e.deltaY > 0 ? 1.1 : .9))); e.preventDefault(); };
+
+// ------------------------------------------------------------------ skeletons
+const LEFT = '#ff4560', RIGHT = '#ececf2', MID = '#8d8d9c';
+function bone(c, i, k){ const o = (i * G.names.length + k) * 6, B = c.B; return [B[o]/1000, B[o+1]/1000, B[o+2]/1000, B[o+3]/1000, B[o+4]/1000, B[o+5]/1000]; }
+const sideOf = n => n.endsWith('_L') ? 1 : n.endsWith('_R') ? 2 : 0;
+function segsEngine(c, i){
+  const out = []; let head = null, pelvis = null;
+  G.names.forEach((nm, k) => {
+    const b = bone(c, i, k), s = sideOf(nm), fing = /thumb|index|middle|ring|pinky/.test(nm);
+    if (k === 0) pelvis = b.slice(0, 3);
+    if (nm === 'head') head = [(b[0]+b[3])/2, (b[1]+b[4])/2, (b[2]+b[5])/2];
+    out.push({a: b.slice(0, 3), b: b.slice(3, 6), col: s === 1 ? LEFT : s === 2 ? RIGHT : MID, w: fing ? 3 : (/spine|neck|pelvis/.test(nm) ? 13 : 10)});
+  });
+  const fL = G.names.indexOf('foot_L'), fR = G.names.indexOf('foot_R');
+  return {segs: out, head, pelvis, footL: fL >= 0 ? bone(c, i, fL).slice(3, 6) : null, footR: fR >= 0 ? bone(c, i, fR).slice(3, 6) : null};
+}
+// preview skeleton from the 30 action channels:
+// pelvis xyz yaw | footL xyz yaw contact | footR xyz yaw contact | handL xyz on | handR xyz on | look xyz on | torso xyz on
+function ik2(a, t, l1, l2, pole){            // two-bone IK, knee/elbow bends toward `pole`
+  const d = [t[0]-a[0], t[1]-a[1], t[2]-a[2]]; let L = Math.hypot(...d) || 1e-6; const max = (l1 + l2) * .999; if (L > max){ d[0] *= max/L; d[1] *= max/L; d[2] *= max/L; L = max; }
+  const u = d.map(v => v / L), x = (l1*l1 - l2*l2 + L*L) / (2*L), h = Math.sqrt(Math.max(0, l1*l1 - x*x));
+  let pv = pole.map((v, i) => v - u[i] * (pole[0]*u[0] + pole[1]*u[1] + pole[2]*u[2])); const pn = Math.hypot(...pv) || 1; pv = pv.map(v => v / pn);
+  return [a[0] + u[0]*x + pv[0]*h, a[1] + u[1]*x + pv[1]*h, a[2] + u[2]*x + pv[2]*h];
+}
+function segsPreview(c, i){
+  const a = c.act.subarray(i * NCH, i * NCH + NCH), pel = [a[0], a[1], a[2]], yaw = a[3];
+  const fw = [Math.sin(yaw), 0, Math.cos(yaw)], lat = [Math.cos(yaw), 0, -Math.sin(yaw)];
+  const fL = [a[4], a[5], a[6]], fR = [a[9], a[10], a[11]];
+  const hipL = [pel[0] + lat[0]*.09, pel[1], pel[2] + lat[2]*.09], hipR = [pel[0] - lat[0]*.09, pel[1], pel[2] - lat[2]*.09];
+  const chest = a[29] > .5 ? [a[26], a[27], a[28]] : [pel[0], pel[1] + .5, pel[2]];
+  const shL = [chest[0] + lat[0]*.19, chest[1] - .04, chest[2] + lat[2]*.19], shR = [chest[0] - lat[0]*.19, chest[1] - .04, chest[2] - lat[2]*.19];
+  const neck = [chest[0], chest[1] + .1, chest[2]];
+  const lookDir = a[25] > .5 ? (() => { const d = [a[22] - neck[0], a[23] - neck[1], a[24] - neck[2]], n = Math.hypot(...d) || 1; return d.map(v => v / n); })() : fw;
+  const head = [neck[0] + lookDir[0]*.08, neck[1] + .12 + lookDir[1]*.05, neck[2] + lookDir[2]*.08];
+  const hL = a[17] > .5 ? [a[14], a[15], a[16]] : [shL[0] + lat[0]*.05, shL[1] - .55, shL[2] + lat[2]*.05];
+  const hR = a[21] > .5 ? [a[18], a[19], a[20]] : [shR[0] - lat[0]*.05, shR[1] - .55, shR[2] - lat[2]*.05];
+  const kL = ik2(hipL, fL, .45, .45, fw), kR = ik2(hipR, fR, .45, .45, fw), eL = ik2(shL, hL, .3, .27, [-fw[0], -.6, -fw[2]]), eR = ik2(shR, hR, .3, .27, [-fw[0], -.6, -fw[2]]);
+  const S = (p, q, col, w) => ({a: p, b: q, col, w});
+  return {segs: [S(hipL, hipR, MID, 12), S(pel, chest, MID, 13), S(chest, neck, MID, 10), S(shL, shR, MID, 10),
+    S(hipL, kL, LEFT, 10), S(kL, fL, LEFT, 10), S(hipR, kR, RIGHT, 10), S(kR, fR, RIGHT, 10),
+    S(shL, eL, LEFT, 9), S(eL, hL, LEFT, 9), S(shR, eR, RIGHT, 9), S(eR, hR, RIGHT, 9)], head, pelvis: pel, footL: fL, footR: fR};
+}
+
+// ------------------------------------------------------------------ draw
+function draw(){
+  const W = cv.width = cv.clientWidth, H = cv.height = cv.clientHeight;
+  ctx.fillStyle = '#07070a'; ctx.fillRect(0, 0, W, H);
+  const fr = G ? frameAt(Math.floor(playhead)) : null;
+  let tgt = [0, .9, 1.5], skel = null;
+  if (fr){ skel = (fr.c.B && G.names) ? segsEngine(fr.c, fr.i) : segsPreview(fr.c, fr.i); if (follow) tgt = [skel.pelvis[0], .9, skel.pelvis[2]]; }
+  setCam(W, H, tgt);
+  // floor grid
+  const gx = Math.round(tgt[0] * 2) / 2, gz = Math.round(tgt[2] * 2) / 2; ctx.lineWidth = 1;
+  for (let i = -12; i <= 12; i++) for (const ax of [0, 1]){
+    const a = ax ? [gx-6, 0, gz + i*.5] : [gx + i*.5, 0, gz-6], b = ax ? [gx+6, 0, gz + i*.5] : [gx + i*.5, 0, gz+6];
+    const p = P(...a, W, H), q = P(...b, W, H); if (!p || !q) continue;
+    const major = Math.abs((ax ? gz + i*.5 : gx + i*.5) % 1) < 1e-6;
+    const fade = Math.max(0, 1 - Math.abs(i) / 12);
+    ctx.strokeStyle = major ? `rgba(224,33,59,${.30*fade + .05})` : `rgba(120,40,52,${.22*fade})`; ctx.beginPath(); ctx.moveTo(p[0], p[1]); ctx.lineTo(q[0], q[1]); ctx.stroke();
+  }
+  if (!fr) return;
+  // pelvis trail
+  ctx.strokeStyle = '#7a1a29'; ctx.lineWidth = 2; ctx.beginPath(); let began = false;
+  for (let g = Math.max(G.first, Math.floor(playhead) - 240); g <= Math.floor(playhead); g += 2){
+    const f = frameAt(g); if (!f) continue; const pp = f.c.B && G.names ? bone(f.c, f.i, 0) : [f.c.act[f.i*NCH], 0, f.c.act[f.i*NCH+2]];
+    const p = P(pp[0], .005, pp[2], W, H); if (!p) continue; began ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]); began = true;
+  } ctx.stroke();
+  // planted feet
+  [['footL', 8], ['footR', 13]].forEach(([k, ch]) => {
+    if (fr.c.act[fr.i*NCH + ch] < .5 || !skel[k]) return; const cx = skel[k][0], cz = skel[k][2];
+    ctx.fillStyle = 'rgba(95,214,138,.38)'; ctx.beginPath(); let s0 = true;
+    for (let a = 0; a <= 12; a++){ const p = P(cx + .09*Math.cos(a/12*6.283), .003, cz + .13*Math.sin(a/12*6.283), W, H); if (!p) continue; s0 ? ctx.moveTo(p[0], p[1]) : ctx.lineTo(p[0], p[1]); s0 = false; } ctx.fill();
+  });
+  // bones, far to near
+  const segs = [];
+  skel.segs.forEach(s => { const p = P(...s.a, W, H), q = P(...s.b, W, H); if (p && q) segs.push({p, q, col: s.col, w: s.w * Math.min(p[3], q[3]) / 300, d: (p[2] + q[2]) / 2}); });
+  segs.sort((a, b) => b.d - a.d); ctx.lineCap = 'round';
+  for (const s of segs){ ctx.strokeStyle = s.col; ctx.lineWidth = Math.max(1.5, s.w); ctx.beginPath(); ctx.moveTo(s.p[0], s.p[1]); ctx.lineTo(s.q[0], s.q[1]); ctx.stroke(); }
+  if (skel.head){ const p = P(...skel.head, W, H); if (p){ ctx.fillStyle = 'rgba(236,236,242,.9)'; ctx.beginPath(); ctx.arc(p[0], p[1], .095 * p[3], 0, 7); ctx.fill(); } }
+  // centre of mass (engine only)
+  if (fr.c.com){
+    const cm = [fr.c.com[fr.i*3], fr.c.com[fr.i*3+1], fr.c.com[fr.i*3+2]], pc = P(...cm, W, H), pg = P(cm[0], .004, cm[2], W, H);
+    if (pc && pg){ ctx.strokeStyle = '#ff5fa8'; ctx.lineWidth = 1.5; ctx.setLineDash([4, 4]); ctx.beginPath(); ctx.moveTo(pc[0], pc[1]); ctx.lineTo(pg[0], pg[1]); ctx.stroke(); ctx.setLineDash([]);
+      ctx.fillStyle = '#ff5fa8'; ctx.beginPath(); ctx.arc(pc[0], pc[1], 5, 0, 7); ctx.fill(); ctx.beginPath(); ctx.arc(pg[0], pg[1], 3, 0, 7); ctx.fill(); }
+  }
+  if (fr.c.bad && fr.c.bad[fr.i]){ ctx.strokeStyle = 'rgba(224,33,59,.8)'; ctx.lineWidth = 5; ctx.strokeRect(2, 2, W - 4, H - 4); }
+}
+
+function hud(){
+  if (!G){ $('hud').innerHTML = ''; return; }
+  const buf = Math.max(0, (G.total - 1 - playhead) * G.dt);
+  const fr = frameAt(Math.floor(playhead));
+  const mg = fr && fr.c.margin ? ` · balance <b>${(fr.c.margin[fr.i] * 100).toFixed(1)} cm</b>` : '';
+  const rt = G.rt ? `<span class="${G.rt >= 1 ? '' : 'crim'}">${G.rt.toFixed(2)}× real-time</span>` : '—';
+  $('hud').innerHTML = `<b>${G.action === 'null' ? 'unconditional' : G.action}</b> · ${G.engine ? 'engine body' : 'preview skeleton'}<br>` +
+    `t <b>${(playhead * G.dt).toFixed(2)} s</b> · frame ${Math.floor(playhead)} · buffered <b>${buf.toFixed(1)} s</b>${mg}<br>generation speed: ${rt}` +
+    (playing && es && buf < .05 && G.total ? ' · <span class="crim">waiting for the model…</span>' : '');
+  $('tt').textContent = (playhead * G.dt).toFixed(2) + ' s';
+  if (document.activeElement !== $('seek')) $('seek').value = playhead;
+}
+
+function tick(now){
+  const dt = Math.min(.1, (now - last) / 1000); last = now;
+  if (G && playing && G.total){
+    // start once ~0.4 s is buffered, then advance; stall at the edge of what the model has produced
+    const edge = G.total - 1;
+    if (playhead < edge) playhead = Math.min(edge, playhead + dt * speed / G.dt);
+    if (!es && playhead >= edge && G.total > 1) { playing = false; $('play').textContent = 'replay'; playhead = edge; $('play').onclick = replay; }
+  }
+  draw(); hud(); requestAnimationFrame(tick);
+}
+function replay(){
+  playhead = G ? G.first : 0; playing = true; $('play').textContent = 'pause';
+  $('play').onclick = togglePlay;
+}
+refresh(); setInterval(() => { if (ST && !ST.engine && !ST.engine_error) refresh(); }, 2500);
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>
