@@ -24,6 +24,7 @@ using its hand as the mouse and reading the screen through accessibility.
 | `docs/ACTIONS.md` | **nerva-actions v1**, the language the model writes (`<click>838 351</click>`, `<find>save</find>`, ...) | [docs/ACTIONS.md](docs/ACTIONS.md) |
 | `nerva_bridge.py` | Drives the overlay with a model hosted by NEON, one turn at a time; records episodes | below |
 | `studio/` | Local studio: language-model characters act in a 3D scene through the engine | [studio/README.md](studio/README.md) |
+| `UI/` | Drag-and-drop console: drop a trained cVQ-VAE + prior (`.pt`), watch motion generated live (VAE on NEON, body through the engine) | [UI/README.md](UI/README.md) |
 | `blender/` | Blender add-on: drive a rig with the engine and bake keyframes | `blender/build_addon.sh` |
 | `renderer/` | Vulkan bootstrap for the embodiment renderer (separate from NEON) | [renderer/README.md](renderer/README.md) |
 
@@ -36,6 +37,7 @@ make body-test       # 148 full-body checks
 make actions-test    # action-language docs/examples stay in sync with the code
 make sanitize        # engine + body tests under ASan + UBSan
 make studio          # build the lib and open Nebula Studio at http://127.0.0.1:8765
+make ui              # build the lib and open the VAE/prior console at http://127.0.0.1:8770
 
 make overlay         # needs g++, wayland, wayland-protocols
 make overlay-test    # unit + integration checks (the Sway / AT-SPI ones also need sway, grim, dbus, python3-gobject, at-spi2-core)
