@@ -1,43 +1,44 @@
 #!/usr/bin/env python3
 """
-train_cvqvae.py - PyTorch trainer for a conditional VQ-VAE (cVQ-VAE) over NERVA motion windows, ~20M parameters.
+train_cvqvae.py - ONE script: trains a conditional VQ-VAE (~20M) over NERVA motion windows, tokenises the dataset, trains an autoregressive PRIOR over the codes
+(~5M causal transformer) and samples NEW motion from it (windows chained into longer clips, seams cross-faded, optionally graded by tools/motion_grader.py).
 
-  python tools/build_vae_dataset.py --hours 10                       # 1. make the data (data/vae/train_windows.npz, val_windows.npz, stats.json)
-  python tools/train_cvqvae.py --data data/vae --out runs/cvqvae     # 2. train (cuda / ROCm picked up automatically)
-  python tools/train_cvqvae.py --params-only                         # print the exact parameter count and exit
-  python tools/train_cvqvae.py --data data/vae --epochs 1 --max-steps 30 --out /tmp/cv   # quick smoke run
-  python tools/train_cvqvae.py --data data/vae --out runs/cvqvae --eval-only --ckpt runs/cvqvae/best.pt --export-recon 24 --export-codes
-  python tools/view_clip.py runs/cvqvae/recon_preview.npz --open     # original / reconstruction pairs, same viewer as the dataset preview
+  python tools/build_vae_dataset.py --hours 10                                       # 0. the data (data/vae/*_windows.npz, stats.json)
+  python tools/train_cvqvae.py --data data/vae --out runs/cvqvae                     # everything: VAE -> codebook check -> tokens -> prior -> samples
+  python tools/train_cvqvae.py --data data/vae --out runs/cvqvae --vae-ckpt runs/cvqvae/best.pt     # a VAE you already trained is NOT retrained: tokens -> prior -> samples
+  python tools/train_cvqvae.py --out runs/cvqvae --stage generate --temperature 0.9 --top-k 40 --gen-windows 6 --grade   # only sample (needs best.pt + prior_best.pt)
+  python tools/train_cvqvae.py --data data/vae --stage vae --out runs/cvqvae         # only the VAE (as before)
+  python tools/view_clip.py runs/cvqvae/gen_preview.npz --open                       # look at what it made
+  python tools/train_cvqvae.py --params-only                                         # parameter counts of both models, then exit
 
-Reads what tools/build_vae_dataset.py writes: windows [N, W, 30] (W = 64 by default), `valid` (real frames per window, the rest is padding), `action`
-(index into `action_names`), and stats.json (channel names, which channels are binary flags, which are yaw angles, dt).
+STAGES (--stage all runs them in order; --vae-ckpt skips the VAE training)
+  1 vae       conditional VQ-VAE on windows, validation on unseen performers; best.pt / last.pt                              (details below)
+  2 tokens    every train / val window -> 16 codes with the frozen VAE; prints the CODEBOOK HEALTH (codes used, perplexity, top-10 share) and warns on collapse
+  3 prior     causal transformer over  [ACTION] c1..c16 [SEP] c1..c16 [SEP] ...  (up to --prior-windows consecutive windows of one clip); the action is a prefix token,
+              replaced by NULL for --prior-cond-drop of the sequences, so it also samples unconditionally. prior_best.pt = lowest validation NLL; the report compares it with
+              the unigram baseline (a prior that does not beat that has learned nothing about order)
+  4 generate  samples codes (temperature / top-k / top-p), decodes every window with the VAE, chains the windows (stride = the dataset's, found automatically) and
+              cross-fades the overlaps -> gen_preview.npz (tools/view_clip.py format), gen_codes.npz; with --grade also scores each clip with the CMU grader (PASS_SCORE) and
+              writes gen_passed.npz with the survivors only
 
-MODEL  ("c" = conditional on the ACTION label)
+CHAINS  build_vae_dataset.py cuts windows with a stride (default 32 of 64 frames), so consecutive windows of one clip share half their frames. The script finds those
+        links by comparing the raw frames (no clip ids are stored), which gives the chains the prior is trained on and the stride used to stitch. A window that has no
+        neighbour is a chain of one. Every window is canonicalised (frame 0: pelvis at the origin facing +z), so stitching moves each new window to the pose of the
+        previous one, blends the overlap linearly (flags: the nearer window wins) and keeps yaw channels continuous. Expect small visible seams: the VAE's own error is ~15 cm.
+
+VAE  ("c" = conditional on the ACTION label)
   encoder   Conv1d -> [FiLM residual blocks -> stride-2 conv] x 2          window 64 frames -> 16 latent steps (4x temporal downsampling)
   quantizer one codebook (512 x 256), EMA updates, k-means-style init from data, dead codes restarted from the current batch
   decoder   Conv1d -> [FiLM residual blocks -> nearest x2 + conv] x 2     -> 30 channels per frame
-  The action label (plus a learned "null" label) becomes an embedding that FiLM-modulates every residual block of the encoder AND the decoder, so the codes
-  only have to carry what the label does not say (style, speed, amplitude, ...). The label is dropped to "null" for --cond-drop of the training windows, so the
-  same model also works unconditionally (needed later if you train a prior over the codes, with or without a label).
-  --no-cond-enc  gives the label to the decoder only (the encoder always sees "null").
-  Default sizes (--hidden 528 --code-dim 256 --n-res 3 --emb 128) come to about 19.9 M parameters; --params-only prints the exact number for the data's action count.
+  The label (plus a learned "null" label) FiLM-modulates every residual block of the encoder AND the decoder; it is dropped to "null" for --cond-drop of the windows.
+  --no-cond-enc gives the label to the decoder only. Defaults come to ~19.9 M parameters.
+  LOSS  masked smooth-L1 on the 24 continuous channels + velocity loss + BCE on the 6 flags + commitment. Normalisation stats are recomputed from the canonicalised train
+  windows; flags stay 0/1; padded windows (valid < W) are masked out of every loss.
+  --amp auto: bf16 on Ampere+/ROCm, fp16 with loss scaling on older NVIDIA (T4), none on CPU.
 
-DATA HANDLING (the part that matters most for motion data)
-  * Windows are CANONICALISED: every window is moved so frame 0 has the pelvis at x = z = 0 facing +z (all xz channels are rotated by the frame-0 pelvis yaw,
-    all yaw channels get that yaw subtracted; same conventions as tools/motion_features.py / motion_vary.py: heading = (sin yaw, cos yaw)). Yaw channels are
-    unwrapped along the window first. Without this the model would spend capacity on where in the world the clip happened. Use --no-canon to switch it off.
-  * Normalisation statistics are recomputed from the canonicalised TRAIN windows (stats.json describes the raw data, so it is only used for the layout / dt);
-    flags (contact / on) stay 0/1 in the targets and are predicted as logits (BCE); the encoder sees them as -1 / +1.
-  * Padded windows (valid < W) are masked out of every loss and metric.
-
-LOSS   masked smooth-L1 (or MSE) on the 24 continuous channels  +  velocity loss (frame differences, scaled by their own std)  +  BCE on the 6 flags
-       + commitment loss (EMA codebook, so no codebook loss term).
-METRICS (validation = performers the model never saw, the only honest number):
-       loss terms, pos_rmse_m (RMS error of the 18 position channels in metres), flag_acc, perplexity (effective codes in use), codes_used (share of the codebook).
-HONEST NOTE  build_vae_dataset.py itself warns that variants are repeats with variation, not new motion. A 20M-parameter model on a few hours of real
-       information can memorise: watch the gap between train and val reconstruction, use --dropout / --patience, and judge by `val`.
-
-Files written to --out: best.pt (lowest val total), last.pt (resumable: --resume), norm.json, metrics.jsonl, and on request recon_preview.npz / codes_{train,val}.npz.
+HONEST NOTES  * The prior can only produce what the VAE can decode: reconstruction quality (pos_rmse_m) is the ceiling. * A prior trained on a few hours of real motion plus
+variants can memorise; compare train and val NLL and use the lowest-validation checkpoint (it is saved automatically). * Sampled clips are NOT verified by the engine; --grade
+only applies the CMU-based grader, as for the variants. * Style from a translator, and closing the loop (retraining on passers) are not part of this script.
 """
 import argparse, collections, contextlib, json, math, os, sys, time
 import numpy as np
@@ -73,10 +74,67 @@ def canonicalize(W):
     return W.astype(np.float32)
 
 
+def to_world(w, px, pz, y0):
+    """Inverse of canonicalize for ONE window [T,30]: rotate by the heading y0 and move to (px, pz)."""
+    w = w.astype(np.float64).copy(); c, s = np.cos(y0), np.sin(y0)
+    for xi, zi in XZ:
+        x, z = w[:, xi].copy(), w[:, zi].copy()
+        w[:, xi] = x * c + z * s + px
+        w[:, zi] = -x * s + z * c + pz
+    for y in YAWS:
+        w[:, y] += y0
+    return w
+
+
+def stitch(wins, stride):
+    """List of decoded canonical windows [W,30] (flags 0/1; each starts at the origin facing +z) -> ONE clip [W + (n-1)*stride, 30] in a common frame.
+    Window i starts at frame i*stride; it is moved to the pose of the clip at that frame, its first W-stride frames are cross-faded with the clip's last W-stride frames."""
+    W = wins[0].shape[0]; ov = W - stride
+    out = canonicalize(wins[0][None])[0].astype(np.float64)
+    for w in wins[1:]:
+        w = canonicalize(w[None])[0].astype(np.float64); b = len(out) - ov                  # b: first frame of the overlap in the clip
+        w = to_world(w, out[b, 0], out[b, 2], out[b, 3])
+        for y in YAWS:                                                                      # same 2*pi branch as the clip, so the blend does not spin
+            w[:, y] += 2 * np.pi * np.round((out[b, y] - w[0, y]) / (2 * np.pi))
+        if ov > 0:
+            al = np.linspace(0, 1, ov + 2)[1:-1][:, None]; old, new = out[b:], w[:ov]
+            blend = old * (1 - al) + new * al; blend[:, FLAGS] = np.where(al > 0.5, new[:, FLAGS], old[:, FLAGS])
+            out = np.concatenate([out[:b], blend, w[ov:]])
+        else:
+            out = np.concatenate([out, w])
+    return out.astype(np.float32)
+
+
+def find_chains(X, valid, stride=0):
+    """RAW windows [N,W,30] -> (chain id [N], position in chain [N], stride). Consecutive windows of one clip overlap by W - stride frames: identical values.
+    stride = 0: detect it (the candidate with the most links). No links at all: every window is a chain of one."""
+    N, W, _ = X.shape; full = valid >= W
+    if N < 2:
+        return np.arange(N), np.zeros(N, np.int64), stride or W // 2
+
+    def links(s, hi):
+        return np.all(X[:hi, s:] == X[1:hi + 1, :W - s], axis=(1, 2)) & full[:hi] & full[1:hi + 1]
+    if not stride:
+        cand = sorted({W // 2, W // 4, W // 8, (3 * W) // 4, W // 16} - {0}); sub = min(N - 1, 4000)
+        score = {s: int(links(s, sub).sum()) for s in cand}; stride = max(score, key=score.get)
+        if score[stride] == 0:
+            return np.arange(N), np.zeros(N, np.int64), W // 2
+    link = links(stride, N - 1); start = np.r_[True, ~link]; chain = np.cumsum(start) - 1
+    first = np.maximum.accumulate(np.where(start, np.arange(N), 0))
+    return chain, np.arange(N) - first, stride
+
+
 def load_windows(path):
     z = np.load(path, allow_pickle=False)
     names = [str(n) for n in z["action_names"]]
     return z["windows"].astype(np.float32), z["valid"].astype(np.int64), z["action"].astype(np.int64), names, float(z["dt"])
+
+
+def remap_actions(act, file_names, ref_names):
+    if file_names == ref_names:
+        return act
+    mp = {n: i for i, n in enumerate(ref_names)}
+    return np.array([mp.get(file_names[a], len(ref_names)) for a in act], np.int64)       # unknown name -> the null label
 
 
 def compute_norm(X, valid):
@@ -107,16 +165,7 @@ class WindowSet:
         return (self.x[idx].to(self.device, non_blocking=True), self.valid[idx].to(self.device), self.action[idx].to(self.device))
 
 
-def prepare_split(path, norm, names_ref, canon, device, on_device_limit_gb):
-    X, valid, act, names, dt = load_windows(path)
-    if names != names_ref:                                  # same names in the same order is what build_vae_dataset.py writes; remap anyway if not
-        mp = {n: i for i, n in enumerate(names_ref)}; act = np.array([mp.get(names[a], len(names_ref)) for a in act], np.int64)
-    if canon:
-        X = canonicalize(X)
-    return X, valid, act, dt
-
-
-# ============================================================================================================================ model
+# ============================================================================================================================ VAE model
 class FiLMRes(nn.Module):
     """x + conv1x1(drop(act(conv3(act(FiLM(norm(x), cond))))))   FiLM scale/shift start at 0 (identity) so the label is learned in gradually."""
 
@@ -260,7 +309,7 @@ class CVQVAE(nn.Module):
         return self.vq(self.encode(x, action))[1]
 
     @torch.no_grad()
-    def decode_codes(self, idx, action):                    # code indices [B,N] -> raw output (for a future prior over the codes)
+    def decode_codes(self, idx, action):                    # code indices [B,N] -> raw output (what the prior samples)
         return self.decode(self.vq.embed[idx], action)
 
 
@@ -271,7 +320,7 @@ def to_motion(y, norm):
     return out
 
 
-# ============================================================================================================================ loss / eval
+# ============================================================================================================================ VAE loss / eval
 def compute_loss(model, x, valid, action, norm_t, a, train):
     B, T, _ = x.shape
     mask = (torch.arange(T, device=x.device)[None] < valid[:, None]).float()
@@ -323,7 +372,7 @@ def amp_ctx(device, mode):
     return contextlib.nullcontext()
 
 
-# ============================================================================================================================ io helpers
+# ============================================================================================================================ VAE io helpers
 def build_model(cfg):
     return CVQVAE(**cfg)
 
@@ -346,6 +395,12 @@ def load_ckpt(path, device):
     return model, d, {k: np.asarray(v) for k, v in d["norm"].items()}
 
 
+def write_clips_npz(path, clips, action_names, labels, desc, dt):
+    """tools/view_clip.py format."""
+    np.savez_compressed(path, actions=np.concatenate(clips).astype(np.float32), offsets=np.cumsum([0] + [len(c) for c in clips]), dt=np.float32(dt), action=np.array(action_names),
+                        labels=np.array(labels), description=np.array(desc), style=np.zeros((len(clips), 1), np.float32), style_names=np.array(["none"]))
+
+
 @torch.no_grad()
 def export_recon(model, ds, norm, names, dt, path, n_clips, seed, a):
     model.eval(); rng = np.random.default_rng(seed); per = max(1, n_clips // max(1, len(names))); seen = collections.Counter(); pick = []
@@ -364,44 +419,314 @@ def export_recon(model, ds, norm, names, dt, path, n_clips, seed, a):
         nv = int(v[k]); nm = names[int(act[k])] if int(act[k]) < len(names) else "?"
         for arr, lab in ((orig[k, :nv], "original"), (rec[k, :nv], "reconstruction")):
             clips.append(arr.astype(np.float32)); labs.append(f"{lab} of val window #{i}"); desc.append(lab); acts.append(nm)
-    np.savez_compressed(path, actions=np.concatenate(clips), offsets=np.cumsum([0] + [len(c) for c in clips]), dt=np.float32(dt), action=np.array(acts), labels=np.array(labs),
-                        description=np.array(desc), style=np.zeros((len(clips), 1), np.float32), style_names=np.array(["none"]))
+    write_clips_npz(path, clips, acts, labs, desc, dt)
     print(f"wrote {path}: {len(pick)} val windows as original / reconstruction pairs (canonical frame: frame 0 at the origin facing +z)  ->  python tools/view_clip.py {path} --open")
 
 
-@torch.no_grad()
-def export_codes(model, ds, names, path, bs=256):
+# ============================================================================================================================ stage 1: train the VAE
+def train_vae(a, dev, model, cfg, train, val, norm, norm_t, names, dt):
+    decay = [p for n, p in model.named_parameters() if p.ndim >= 2]; no_decay = [p for n, p in model.named_parameters() if p.ndim < 2]
+    opt = torch.optim.AdamW([dict(params=decay, weight_decay=a.wd), dict(params=no_decay, weight_decay=0.0)], lr=a.lr, betas=(0.9, 0.95))
+    step = epoch0 = 0; best = float("inf")
+    if a.resume:
+        ck = torch.load(a.resume, map_location=dev, weights_only=False); model.load_state_dict(ck["model"]); opt.load_state_dict(ck["opt"])
+        step, epoch0, best = ck["step"], ck["epoch"] + 1, ck["best_val"]; model.vq._ready = True; print(f"resumed from {a.resume}: epoch {epoch0}, step {step}, best val {best:.4f}")
+    spe = max(1, train.n // a.batch); total_steps = a.epochs * spe
+    lr_at = lambda s: a.lr * (s / max(1, a.warmup) if s < a.warmup else a.min_lr_frac + (1 - a.min_lr_frac) * 0.5 * (1 + math.cos(math.pi * (s - a.warmup) / max(1, total_steps - a.warmup))))
+    scaler = torch.amp.GradScaler("cuda", enabled=(a.amp == "fp16" and dev.type == "cuda"))     # a no-op unless fp16
+    mlog = open(os.path.join(a.out, "metrics.jsonl"), "a"); bad = 0; t0 = time.time(); stop = False
+    model.train()
+    for epoch in range(epoch0, a.epochs):
+        perm = torch.randperm(train.n); run = collections.defaultdict(float); nrun = 0; te = time.time()
+        for bi in range(spe):
+            x, v, act = train.batch(perm[bi * a.batch:(bi + 1) * a.batch])
+            for g in opt.param_groups:
+                g["lr"] = lr_at(step)
+            loss, m, _ = compute_loss(model, x, v, act, norm_t, a, train=True)
+            opt.zero_grad(set_to_none=True); scaler.scale(loss).backward(); scaler.unscale_(opt)
+            gn = torch.nn.utils.clip_grad_norm_(model.parameters(), a.clip); scaler.step(opt); scaler.update(); step += 1
+            for k in ("total", "rec", "vel", "bce", "commit", "ppl"):
+                run[k] = run[k] + m[k]                      # stays a device tensor: no GPU sync per step
+            nrun += 1
+            if step % a.log_every == 0:
+                print(f"  ep {epoch:3d} step {step:7d}  loss {float(run['total']) / nrun:.4f}  rec {float(run['rec']) / nrun:.4f}  vel {float(run['vel']) / nrun:.3f}  "
+                      f"flag {float(run['bce']) / nrun:.3f}  commit {float(run['commit']) / nrun:.4f}  ppl {float(run['ppl']) / nrun:5.1f}  gn {float(gn):.2f}  "
+                      f"lr {lr_at(step):.2e}  {(time.time() - t0) / 60:.1f} min", flush=True)
+            if a.max_steps and step >= a.max_steps:
+                stop = True; break
+        ev = evaluate(model, val, norm_t, a); evn = evaluate(model, val, norm_t, a, null_label=True)
+        tr = {k: float(run[k]) / max(nrun, 1) for k in run}
+        improved = ev["total"] < best
+        if improved:
+            best = ev["total"]; bad = 0; save_ckpt(os.path.join(a.out, "best.pt"), model, cfg, norm, names, dt, a, step, epoch, best)
+        else:
+            bad += 1
+        save_ckpt(os.path.join(a.out, "last.pt"), model, cfg, norm, names, dt, a, step, epoch, best, opt)
+        print(f"epoch {epoch:3d}  train {tr.get('total', 0):.4f} (rec {tr.get('rec', 0):.4f})  |  val {ev['total']:.4f} (rec {ev['rec']:.4f}, pos {ev['pos_rmse_m'] * 100:.1f} cm, "
+              f"flags {ev['flag_acc'] * 100:.1f}%, ppl {ev['ppl']:.0f}, codes used {ev['codes_used'] * 100:.0f}%)  |  val with null label: rec {evn['rec']:.4f}  |  "
+              f"{time.time() - te:.0f}s{'  *best*' if improved else ''}", flush=True)
+        mlog.write(json.dumps(dict(epoch=epoch, step=step, train=tr, val=ev, val_null=evn)) + "\n"); mlog.flush()
+        if stop or (a.patience and bad >= a.patience):
+            print("stopping: " + ("--max-steps reached" if stop else f"no validation improvement for {a.patience} epochs")); break
+    best_path = os.path.join(a.out, "best.pt")
+    if os.path.exists(best_path):
+        model = load_ckpt(best_path, dev)[0]
+    print(f"VAE done. best validation total {best:.4f}  ->  {best_path}")
+    return model
+
+
+# ============================================================================================================================ stage 2: tokens + codebook health
+def tokenize(model, ds, a, bs=512):
     model.eval(); out = []
     for i in range(0, ds.n, bs):
-        x, v, act = ds.batch(torch.arange(i, min(i + bs, ds.n))); out.append(model.tokens(x, act).cpu().numpy().astype(np.int16))
-    np.savez(path, codes=np.concatenate(out), action=ds.action.cpu().numpy().astype(np.int16), valid=ds.valid.cpu().numpy().astype(np.int16), action_names=np.array(names))
-    print(f"wrote {path}: {ds.n} windows x {out[0].shape[1]} codes (codebook size {model.vq.K})")
+        x, v, act = ds.batch(torch.arange(i, min(i + bs, ds.n)))
+        with amp_ctx(x.device, a.amp):
+            out.append(model.tokens(x, act).cpu())
+    return torch.cat(out).numpy().astype(np.int64)
+
+
+def codebook_health(codes, K, tag, warn=True):
+    cnt = np.bincount(codes.reshape(-1), minlength=K).astype(np.float64); p = cnt / cnt.sum(); nz = p[p > 0]
+    used = int((cnt > 0).sum()); ent = float(-(nz * np.log(nz)).sum()); ppl = math.exp(ent); top10 = float(np.sort(p)[::-1][:10].sum())
+    print(f"codebook health ({tag}): {used}/{K} codes used, perplexity {ppl:.0f}, entropy {ent:.2f} nats ({ent / math.log(2):.2f} bits per code), top-10 codes carry {top10 * 100:.0f}%")
+    if warn and (used < 0.25 * K or ppl < 0.1 * K):
+        print(f"  WARNING: few codes carry the motion ({used} used, perplexity {ppl:.0f}): a prior over them has little to say. Retrain the VAE (more epochs, "
+              f"--restart-thresh higher, smaller --num-codes) before trusting the samples.")
+    return ent
+
+
+def unigram_ce(codes_train, codes_val, K):
+    cnt = np.bincount(codes_train.reshape(-1), minlength=K).astype(np.float64) + 0.5; p = cnt / cnt.sum()
+    return float(-np.log(p[codes_val.reshape(-1)]).mean())
+
+
+# ============================================================================================================================ stage 3: the prior over codes
+class PriorBlock(nn.Module):
+    def __init__(self, d, heads, dropout):
+        super().__init__()
+        self.h, self.p = heads, dropout
+        self.n1 = nn.LayerNorm(d); self.qkv = nn.Linear(d, 3 * d); self.proj = nn.Linear(d, d)
+        self.n2 = nn.LayerNorm(d); self.ff = nn.Sequential(nn.Linear(d, 4 * d), nn.GELU(), nn.Linear(4 * d, d)); self.drop = nn.Dropout(dropout)
+
+    def forward(self, x):
+        B, T, D = x.shape
+        q, k, v = self.qkv(self.n1(x)).view(B, T, 3, self.h, D // self.h).permute(2, 0, 3, 1, 4)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=self.p if self.training else 0.0)
+        x = x + self.drop(self.proj(y.transpose(1, 2).reshape(B, T, D)))
+        return x + self.drop(self.ff(self.n2(x)))
+
+
+class CodePrior(nn.Module):
+    """Causal transformer. Token ids: codes 0..K-1 | SEP = K | action tokens K+1 .. K+n_actions | NULL = K+1+n_actions | PAD = K+2+n_actions.
+    A sequence is [ACTION] c*n [SEP] c*n [SEP] ... (up to `windows` consecutive windows of one clip, padded at the end). It predicts the next code or SEP."""
+
+    def __init__(self, K, n_actions, n, windows, d=256, layers=6, heads=4, dropout=0.1):
+        super().__init__()
+        self.K, self.n_actions, self.n, self.windows = K, n_actions, n, windows
+        self.SEP, self.ACT0, self.NULL, self.PAD = K, K + 1, K + 1 + n_actions, K + 2 + n_actions
+        self.seq_len = windows * (n + 1)                    # 1 + windows*n + (windows-1)
+        self.tok = nn.Embedding(K + 3 + n_actions, d); self.pos = nn.Embedding(self.seq_len - 1, d); self.drop = nn.Dropout(dropout)
+        self.blocks = nn.ModuleList([PriorBlock(d, heads, dropout) for _ in range(layers)]); self.ln = nn.LayerNorm(d); self.head = nn.Linear(d, K + 1, bias=False)
+        self.apply(self._init)
+
+    @staticmethod
+    def _init(m):
+        if isinstance(m, (nn.Linear, nn.Embedding)):
+            nn.init.normal_(m.weight, std=0.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.zeros_(m.bias)
+
+    def forward(self, tok):                                 # tok [B,T] (T <= seq_len-1) -> logits [B,T,K+1]
+        T = tok.shape[1]
+        x = self.drop(self.tok(tok) + self.pos(torch.arange(T, device=tok.device))[None])
+        for b in self.blocks:
+            x = b(x)
+        return self.head(self.ln(x))
+
+
+def make_prior_tokens(codes, chain, act, Lw, K, n_actions):
+    """codes [N,n], chain id [N], action [N] -> token matrix [N, Lw*(n+1)]: one sequence per window (start), followed by the next windows of the SAME chain."""
+    N, n = codes.shape; SEP, ACT0, PAD = K, K + 1, K + 2 + n_actions
+    idx = np.arange(N)[:, None] + np.arange(Lw)[None]; nc = np.minimum(idx, N - 1); ok = (idx < N) & (chain[nc] == chain[:, None])
+    tok = np.full((N, Lw * (n + 1)), PAD, np.int64); tok[:, 0] = ACT0 + np.minimum(act, n_actions)         # an unknown action (== n_actions) lands on NULL
+    for j in range(Lw):
+        st = 1 + j * (n + 1); tok[:, st:st + n] = np.where(ok[:, j:j + 1], codes[nc[:, j]], PAD)
+        if j < Lw - 1:
+            tok[:, st + n] = np.where(ok[:, j + 1], SEP, PAD)
+    return tok
+
+
+def prior_loss(prior, tok, amp, dev):
+    inp, tgt = tok[:, :-1], tok[:, 1:]
+    with amp_ctx(dev, amp):
+        lg = prior(inp)
+    lg = lg.float().reshape(-1, prior.K + 1); t = tgt.reshape(-1); valid = t != prior.PAD
+    ce = F.cross_entropy(lg, torch.where(valid, t, torch.full_like(t, -100)), reduction="none", ignore_index=-100)
+    code = valid & (t < prior.K)
+    loss = ce[valid].mean(); nll = ce[code].mean()
+    acc = (lg.argmax(-1) == t)[code].float().mean()
+    return loss, nll.detach(), acc.detach()
+
+
+@torch.no_grad()
+def eval_prior(prior, T, a, dev, bs=512):
+    prior.eval(); s = np.zeros(3); nb = 0
+    for i in range(0, len(T), bs):
+        l, nll, acc = prior_loss(prior, T[i:i + bs], a.amp, dev); s += [float(l), float(nll), float(acc)]; nb += 1
+    prior.train(); s /= max(nb, 1); return dict(loss=s[0], nll=s[1], acc=s[2], ppl=math.exp(s[1]))
+
+
+def train_prior(a, dev, codes_t, codes_v, chain_t, chain_v, at, av, K, n_actions, names, stride, dt, uni_val):
+    n = codes_t.shape[1]; Lw = a.prior_windows
+    Tt = torch.from_numpy(make_prior_tokens(codes_t, chain_t, at, Lw, K, n_actions)).to(dev); Tv = torch.from_numpy(make_prior_tokens(codes_v, chain_v, av, Lw, K, n_actions)).to(dev)
+    cfg = dict(K=K, n_actions=n_actions, n=n, windows=Lw, d=a.prior_dim, layers=a.prior_layers, heads=a.prior_heads, dropout=a.prior_dropout)
+    prior = CodePrior(**cfg).to(dev); npar = sum(p.numel() for p in prior.parameters())
+    mult = float(np.mean((Tt[:, 1:] != prior.PAD).sum(1).cpu().numpy()))
+    print(f"prior: {npar / 1e6:.2f} M parameters, sequences of up to {Lw} windows x {n} codes ({Tt.shape[1]} tokens), {len(Tt)} train / {len(Tv)} val sequences "
+          f"(avg {mult:.0f} real tokens); unigram baseline on val: {uni_val:.3f} nats ({math.exp(uni_val):.0f} effective choices per code)")
+    decay = [p for nm, p in prior.named_parameters() if p.ndim >= 2]; nod = [p for nm, p in prior.named_parameters() if p.ndim < 2]
+    opt = torch.optim.AdamW([dict(params=decay, weight_decay=a.prior_wd), dict(params=nod, weight_decay=0.0)], lr=a.prior_lr, betas=(0.9, 0.95))
+    spe = max(1, len(Tt) // a.prior_batch); total = a.prior_epochs * spe; warm = min(200, total // 10)
+    lr_at = lambda s: a.prior_lr * (s / max(1, warm) if s < warm else 0.05 + 0.95 * 0.5 * (1 + math.cos(math.pi * (s - warm) / max(1, total - warm))))
+    scaler = torch.amp.GradScaler("cuda", enabled=(a.amp == "fp16" and dev.type == "cuda"))
+    best = float("inf"); bad = 0; step = 0; t0 = time.time(); path = os.path.join(a.out, "prior_best.pt"); mlog = open(os.path.join(a.out, "prior_metrics.jsonl"), "a"); prior.train()
+    for epoch in range(a.prior_epochs):
+        perm = torch.randperm(len(Tt), device=dev); run = np.zeros(3); nb = 0
+        for bi in range(spe):
+            tok = Tt[perm[bi * a.prior_batch:(bi + 1) * a.prior_batch]].clone()
+            if a.prior_cond_drop > 0:
+                drop = torch.rand(len(tok), device=dev) < a.prior_cond_drop; tok[drop, 0] = prior.NULL
+            for g in opt.param_groups:
+                g["lr"] = lr_at(step)
+            loss, nll, acc = prior_loss(prior, tok, a.amp, dev)
+            opt.zero_grad(set_to_none=True); scaler.scale(loss).backward(); scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(prior.parameters(), 1.0); scaler.step(opt); scaler.update(); step += 1
+            run += [float(loss), float(nll), float(acc)]; nb += 1
+        run /= max(nb, 1); ev = eval_prior(prior, Tv, a, dev); improved = ev["nll"] < best
+        if improved:
+            best = ev["nll"]; bad = 0
+            torch.save(dict(model=prior.state_dict(), cfg=cfg, names=names, stride=stride, dt=dt, val_nll=best, unigram_val=uni_val, args=vars(a)), path)
+        else:
+            bad += 1
+        print(f"prior epoch {epoch:3d}  train nll {run[1]:.3f} acc {run[2] * 100:.1f}%  |  val nll {ev['nll']:.3f} (ppl {ev['ppl']:.0f}) acc {ev['acc'] * 100:.1f}%  |  "
+              f"{(time.time() - t0) / 60:.1f} min{'  *best*' if improved else ''}", flush=True)
+        mlog.write(json.dumps(dict(epoch=epoch, train=dict(loss=run[0], nll=run[1], acc=run[2]), val=ev)) + "\n"); mlog.flush()
+        if a.prior_patience and bad >= a.prior_patience:
+            print(f"stopping the prior: no validation improvement for {a.prior_patience} epochs"); break
+    print(f"prior done. best val nll {best:.3f} nats vs unigram {uni_val:.3f}  ({'learned order: ' if best < uni_val - 0.05 else 'barely beats the unigram baseline: '}"
+          f"{(1 - best / uni_val) * 100:.0f}% fewer nats per code)  ->  {path}")
+    return load_prior(path, dev)[0]
+
+
+def load_prior(path, dev):
+    d = torch.load(path, map_location=dev, weights_only=False); prior = CodePrior(**d["cfg"]).to(dev); prior.load_state_dict(d["model"]); prior.eval(); return prior, d
+
+
+# ============================================================================================================================ stage 4: sample, decode, chain, grade
+def filter_logits(lg, top_k, top_p):
+    if top_k and top_k < lg.size(-1):
+        kth = torch.topk(lg, top_k, dim=-1).values[..., -1, None]; lg = lg.masked_fill(lg < kth, float("-inf"))
+    if top_p < 1.0:
+        sl, si = torch.sort(lg, descending=True, dim=-1); pr = torch.softmax(sl, -1); rm = pr.cumsum(-1) - pr > top_p
+        lg = torch.full_like(lg, float("-inf")).scatter(-1, si, sl.masked_fill(rm, float("-inf")))
+    return lg
+
+
+@torch.no_grad()
+def generate_codes(prior, acts, n_windows, temperature, top_k, top_p):
+    """acts [B] (long, on device; prior.NULL = unconditional) -> codes [B, n_windows, n]. A window is sampled code by code; SEP is appended by force. Once the context holds
+    prior.windows windows the oldest one is dropped (the action prefix stays)."""
+    prior.eval(); n, Lw = prior.n, prior.windows; ctx = (prior.ACT0 + acts)[:, None]; out = []
+    for w in range(n_windows):
+        if w >= Lw:
+            ctx = torch.cat([ctx[:, :1], ctx[:, 1 + n + 1:]], 1)
+        for _ in range(n):
+            lg = prior(ctx)[:, -1, :prior.K].float() / max(temperature, 1e-4)
+            nxt = torch.multinomial(torch.softmax(filter_logits(lg, top_k, top_p), -1), 1); ctx = torch.cat([ctx, nxt], 1)
+        out.append(ctx[:, -n:])
+        if w < n_windows - 1:
+            ctx = torch.cat([ctx, torch.full_like(ctx[:, :1], prior.SEP)], 1)
+    return torch.stack(out, 1)
+
+
+@torch.no_grad()
+def generate(a, dev, vae, norm, prior, names, stride, dt):
+    sel = names if a.gen_actions == "all" else [s.strip() for s in a.gen_actions.split(",") if s.strip()]
+    bad = [s for s in sel if s not in names]
+    if bad:
+        sys.exit(f"unknown action(s) {bad}; the model knows: {', '.join(names)}")
+    act_ids = [names.index(s) for s in sel for _ in range(a.gen_per_action)] if sel else [prior.NULL - prior.ACT0] * a.gen_per_action
+    acts = torch.tensor(act_ids, device=dev); B, nw = len(acts), a.gen_windows; torch.manual_seed(a.gen_seed)
+    codes = generate_codes(prior, acts, nw, a.temperature, a.top_k, a.top_p)                                   # [B,nw,n]
+    y = vae.decode_codes(codes.reshape(B * nw, -1), acts.repeat_interleave(nw)); win = to_motion(y, norm).reshape(B, nw, -1, NCH)
+    clips = [stitch(list(win[b]), stride) for b in range(B)]; an = [names[i] if i < len(names) else "null" for i in act_ids]
+    scores = [None] * B
+    if a.grade:
+        import motion_grader as G
+        prof, _, _ = G.get_profiles(a.real)
+        for b in range(B):
+            if an[b] in prof.p:
+                scores[b] = G.grade_clip(clips[b], dt, an[b], prof)["score"]
+        print("grader (PASS at %.0f):" % G.PASS_SCORE)
+        for n_ in dict.fromkeys(an):
+            ss = [scores[b] for b in range(B) if an[b] == n_]; ok = [s for s in ss if s is not None]
+            print(f"  {n_:14s} " + (f"{sum(s >= G.PASS_SCORE for s in ok)}/{len(ss)} pass, mean score {np.mean(ok):.0f}" if ok else "not a graded action"))
+    sec = len(clips[0]) * dt
+    labels = [f"generated {an[b]} T={a.temperature} k={a.top_k} p={a.top_p}" + (f" score {scores[b]:.0f}" if scores[b] is not None else "") for b in range(B)]
+    desc = [f"{nw} windows, {sec:.1f} s" + (" PASS" if scores[b] is not None and scores[b] >= G.PASS_SCORE else (" FAIL" if scores[b] is not None else "")) for b in range(B)] if a.grade \
+        else [f"{nw} windows, {sec:.1f} s"] * B
+    write_clips_npz(os.path.join(a.out, "gen_preview.npz"), clips, an, labels, desc, dt)
+    np.savez(os.path.join(a.out, "gen_codes.npz"), codes=codes.cpu().numpy().astype(np.int16), action=np.array(act_ids, np.int16), action_names=np.array(names))
+    print(f"wrote {a.out}/gen_preview.npz: {B} clips of {nw} windows ({sec:.1f} s each, seams every {stride * dt:.2f} s)  ->  python tools/view_clip.py {a.out}/gen_preview.npz --open")
+    if a.grade:
+        keep = [b for b in range(B) if scores[b] is not None and scores[b] >= G.PASS_SCORE]
+        if keep:
+            write_clips_npz(os.path.join(a.out, "gen_passed.npz"), [clips[b] for b in keep], [an[b] for b in keep], [labels[b] for b in keep], [desc[b] for b in keep], dt)
+            print(f"wrote {a.out}/gen_passed.npz: {len(keep)} of {B} passed the grader (candidates for tools/motion_memory.py; keep real CMU data in the mix)")
+        else:
+            print("no generated clip passed the grader: lower --temperature / --top-k, or check the codebook health and the prior's val nll above")
 
 
 # ============================================================================================================================ main
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data", default="data/vae"); ap.add_argument("--out", default="runs/cvqvae"); ap.add_argument("--device", default="auto")
+    ap.add_argument("--stage", choices=["all", "vae", "prior", "generate"], default="all", help="all: VAE (unless --vae-ckpt) -> tokens -> prior -> samples; vae: only the VAE; prior: tokens -> prior -> samples (needs a VAE); generate: only sample")
+    ap.add_argument("--vae-ckpt", default="", help="use this trained VAE instead of training one (default for --stage prior / generate: OUT/best.pt)"); ap.add_argument("--ckpt", default="", help="alias of --vae-ckpt")
+    # VAE training
     ap.add_argument("--epochs", type=int, default=60); ap.add_argument("--batch", type=int, default=128); ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--wd", type=float, default=0.01); ap.add_argument("--warmup", type=int, default=500, help="warm-up steps"); ap.add_argument("--clip", type=float, default=1.0, help="grad-norm clip")
-    ap.add_argument("--min-lr-frac", type=float, default=0.05); ap.add_argument("--max-steps", type=int, default=0, help="stop after this many steps (smoke test); 0 = no limit")
-    ap.add_argument("--patience", type=int, default=0, help="stop after this many epochs without a better validation total; 0 = off")
-    # model
+    ap.add_argument("--min-lr-frac", type=float, default=0.05); ap.add_argument("--max-steps", type=int, default=0, help="stop the VAE after this many steps (smoke test); 0 = no limit")
+    ap.add_argument("--patience", type=int, default=0, help="stop the VAE after this many epochs without a better validation total; 0 = off")
+    # VAE model
     ap.add_argument("--hidden", type=int, default=528); ap.add_argument("--emb", type=int, default=128); ap.add_argument("--code-dim", type=int, default=256)
     ap.add_argument("--num-codes", type=int, default=512); ap.add_argument("--downs", type=int, default=2, help="stride-2 stages: 2 -> 4x, 64 frames -> 16 codes")
     ap.add_argument("--n-res", type=int, default=3); ap.add_argument("--dropout", type=float, default=0.1)
     ap.add_argument("--ema-decay", type=float, default=0.99); ap.add_argument("--restart-thresh", type=float, default=0.5)
     ap.add_argument("--cond-drop", type=float, default=0.1, help="share of training windows whose label is replaced by 'null'"); ap.add_argument("--no-cond-enc", action="store_true")
-    # loss
     ap.add_argument("--loss", choices=["huber", "mse"], default="huber"); ap.add_argument("--beta", type=float, default=0.25, help="commitment weight")
     ap.add_argument("--w-vel", type=float, default=0.2); ap.add_argument("--w-flag", type=float, default=0.5)
+    # prior
+    ap.add_argument("--prior-windows", type=int, default=4, help="consecutive windows per training sequence (and the context while sampling)")
+    ap.add_argument("--prior-dim", type=int, default=256); ap.add_argument("--prior-layers", type=int, default=6); ap.add_argument("--prior-heads", type=int, default=4)
+    ap.add_argument("--prior-dropout", type=float, default=0.1); ap.add_argument("--prior-epochs", type=int, default=40); ap.add_argument("--prior-batch", type=int, default=256)
+    ap.add_argument("--prior-lr", type=float, default=3e-4); ap.add_argument("--prior-wd", type=float, default=0.01); ap.add_argument("--prior-patience", type=int, default=6)
+    ap.add_argument("--prior-cond-drop", type=float, default=0.1, help="share of sequences whose action prefix becomes NULL (unconditional sampling)")
+    # sampling
+    ap.add_argument("--gen-per-action", type=int, default=2); ap.add_argument("--gen-windows", type=int, default=4, help="windows per clip: 64 + (n-1)*stride frames")
+    ap.add_argument("--gen-actions", default="all", help="'all' or comma-separated action names"); ap.add_argument("--temperature", type=float, default=1.0)
+    ap.add_argument("--top-k", type=int, default=50); ap.add_argument("--top-p", type=float, default=0.95); ap.add_argument("--gen-seed", type=int, default=0)
+    ap.add_argument("--grade", action="store_true", help="score every sample with tools/motion_grader.py (needs data/real_motions.npz, see --real)"); ap.add_argument("--real", default="data/real_motions.npz")
+    ap.add_argument("--no-generate", action="store_true", help="skip stage 4")
     # runtime
-    ap.add_argument("--amp", choices=["auto", "bf16", "fp16", "none"], default="auto", help="auto: bf16 on Ampere+/ROCm, fp16 (+loss scaling) on older NVIDIA such as the T4, none on CPU"); ap.add_argument("--compile", action="store_true", help="torch.compile the encoder and decoder")
+    ap.add_argument("--amp", choices=["auto", "bf16", "fp16", "none"], default="auto", help="auto: bf16 on Ampere+/ROCm, fp16 (+loss scaling) on older NVIDIA such as the T4, none on CPU")
     ap.add_argument("--no-canon", action="store_true"); ap.add_argument("--data-on-device-gb", type=float, default=3.0, help="keep the windows on the GPU if they take less than this")
-    ap.add_argument("--seed", type=int, default=0); ap.add_argument("--log-every", type=int, default=100); ap.add_argument("--resume", default=""); ap.add_argument("--ckpt", default="")
-    ap.add_argument("--eval-only", action="store_true"); ap.add_argument("--params-only", action="store_true")
+    ap.add_argument("--seed", type=int, default=0); ap.add_argument("--log-every", type=int, default=100); ap.add_argument("--resume", default="", help="resume the VAE from a last.pt")
+    ap.add_argument("--eval-only", action="store_true", help="evaluate the VAE (--vae-ckpt) and do the exports below, then stop"); ap.add_argument("--params-only", action="store_true")
     ap.add_argument("--export-recon", type=int, default=0, help="write this many val windows as original/reconstruction pairs (recon_preview.npz)"); ap.add_argument("--export-codes", action="store_true")
     a = ap.parse_args()
+    if a.ckpt and not a.vae_ckpt:
+        a.vae_ckpt = a.ckpt
 
     dev = torch.device("cuda" if (a.device == "auto" and torch.cuda.is_available()) else ("cpu" if a.device == "auto" else a.device))
     if a.amp == "auto":
@@ -414,97 +739,84 @@ def main():
         torch.backends.cuda.matmul.allow_tf32 = True; torch.backends.cudnn.allow_tf32 = True; torch.backends.cudnn.benchmark = True
     os.makedirs(a.out, exist_ok=True)
 
-    # ---- parameter count only (needs no data: 24 actions is the number tools/motion_actions.py defines; the real count is printed again when training starts)
     if a.params_only:
         cfg = dict(n_actions=24, window=64, hidden=a.hidden, emb=a.emb, code_dim=a.code_dim, num_codes=a.num_codes, downs=a.downs, n_res=a.n_res, dropout=a.dropout,
                    ema_decay=a.ema_decay, restart_thresh=a.restart_thresh, cond_enc=not a.no_cond_enc)
-        tot, parts = count_params(build_model(cfg)); print(f"{tot / 1e6:.2f} M trainable parameters (assuming 24 actions)  {parts}"); return
+        tot, parts = count_params(build_model(cfg)); print(f"VAE:   {tot / 1e6:.2f} M trainable parameters (assuming 24 actions)  {parts}")
+        pr = CodePrior(a.num_codes, 24, 64 // 2 ** a.downs, a.prior_windows, a.prior_dim, a.prior_layers, a.prior_heads); print(f"prior: {sum(p.numel() for p in pr.parameters()) / 1e6:.2f} M parameters"); return
 
-    # ---- data
+    if a.eval_only and not a.vae_ckpt:
+        sys.exit("--eval-only needs --vae-ckpt PATH")
+    if a.stage in ("prior", "generate") and not a.vae_ckpt:
+        a.vae_ckpt = os.path.join(a.out, "best.pt")
+        if not os.path.exists(a.vae_ckpt):
+            sys.exit(f"--stage {a.stage} needs a trained VAE: pass --vae-ckpt PATH (looked for {a.vae_ckpt})")
+
+    # ---------------------------------------------------------------------------------------------------------------- stage 4 only: no data needed
+    if a.stage == "generate":
+        vae, ck, norm = load_ckpt(a.vae_ckpt, dev); prior, pk = load_prior(os.path.join(a.out, "prior_best.pt"), dev)
+        print(f"VAE {a.vae_ckpt}, prior {a.out}/prior_best.pt (val nll {pk['val_nll']:.3f}); amp {a.amp}")
+        generate(a, dev, vae, norm, prior, ck["action_names"], pk["stride"], ck["dt"]); return
+
+    # ---------------------------------------------------------------------------------------------------------------- data
     stats = json.load(open(os.path.join(a.data, "stats.json")))
     assert stats["channels"] and len(stats["channels"]) == NCH, "stats.json does not describe 30 channels"
-    if a.eval_only:
-        assert a.ckpt, "--eval-only needs --ckpt"
-        model, ck, norm = load_ckpt(a.ckpt, dev); names = ck["action_names"]; dt = ck["dt"]; canon = not ck["args"].get("no_canon", False)
+    model = None; norm = None; ref_names = None
+    if a.vae_ckpt:
+        model, ck, norm = load_ckpt(a.vae_ckpt, dev); ref_names = ck["action_names"]; canon = not ck["args"].get("no_canon", False); print(f"VAE loaded from {a.vae_ckpt} (not retrained)")
     else:
-        Xt, vt, at, names, dt = load_windows(os.path.join(a.data, "train_windows.npz")); canon = not a.no_canon
-        if canon:
-            Xt = canonicalize(Xt)
-        norm = compute_norm(Xt, vt)
-    Xv, vv, av, dtv = prepare_split(os.path.join(a.data, "val_windows.npz"), norm, names, canon, dev, a.data_on_device_gb)
+        canon = not a.no_canon
+    Xt_raw, vt, at, names_f, dt = load_windows(os.path.join(a.data, "train_windows.npz"))
+    names = ref_names or names_f; at = remap_actions(at, names_f, names)
+    Xv_raw, vv, av, names_v, dtv = load_windows(os.path.join(a.data, "val_windows.npz")); av = remap_actions(av, names_v, names)
     assert abs(dtv - dt) < 1e-6, "train and val windows have different dt"
-    W = Xv.shape[1]; json.dump({k: np.asarray(v).tolist() for k, v in norm.items()} | dict(dt=dt, canonicalised=canon, channels=stats["channels"]), open(os.path.join(a.out, "norm.json"), "w"), indent=1)
-    on_dev = dev.type == "cuda" and (Xv.nbytes + (0 if a.eval_only else Xt.nbytes)) < a.data_on_device_gb * 1e9
-    val = WindowSet(Xv, vv, av, norm, dev, on_dev); norm_t = norm_tensors(norm, dev)
-    if not a.eval_only:
-        train = WindowSet(Xt, vt, at, norm, dev, on_dev)
-        print(f"train: {train.n} windows of {W} frames   val: {val.n} windows   actions: {len(names)}   dt {dt:.4f}s   canonical frame: {canon}   device {dev} amp {a.amp}   data on device: {on_dev}")
+    if model is not None:
+        assert abs(ck["dt"] - dt) < 1e-6, "the VAE was trained on a different dt"
+    W = Xt_raw.shape[1]
+    chain_t, pos_t, stride = find_chains(Xt_raw, vt); chain_v, pos_v, _ = find_chains(Xv_raw, vv, stride)
+    nct, ncv = int(chain_t.max()) + 1, int(chain_v.max()) + 1
+    print(f"windows: {len(Xt_raw)} train in {nct} chains (avg {len(Xt_raw) / nct:.1f}, longest {int(pos_t.max()) + 1}), {len(Xv_raw)} val in {ncv} chains; stride {stride} of {W} frames; "
+          f"{len(names)} actions; dt {dt:.4f}s; canonical frame {canon}; device {dev}, amp {a.amp}")
+    Xt = canonicalize(Xt_raw) if canon else Xt_raw; Xv = canonicalize(Xv_raw) if canon else Xv_raw
+    if norm is None:
+        norm = compute_norm(Xt, vt)
+    json.dump({k: np.asarray(v).tolist() for k, v in norm.items()} | dict(dt=dt, canonicalised=canon, channels=stats["channels"], stride=stride), open(os.path.join(a.out, "norm.json"), "w"), indent=1)
+    on_dev = dev.type == "cuda" and (Xv.nbytes + Xt.nbytes) < a.data_on_device_gb * 1e9
+    train = WindowSet(Xt, vt, at, norm, dev, on_dev); val = WindowSet(Xv, vv, av, norm, dev, on_dev); norm_t = norm_tensors(norm, dev)
+
+    # ---------------------------------------------------------------------------------------------------------------- stage 1: VAE
+    if model is None:
         cfg = dict(n_actions=len(names), window=W, hidden=a.hidden, emb=a.emb, code_dim=a.code_dim, num_codes=a.num_codes, downs=a.downs, n_res=a.n_res, dropout=a.dropout,
                    ema_decay=a.ema_decay, restart_thresh=a.restart_thresh, cond_enc=not a.no_cond_enc)
-        model = build_model(cfg).to(dev)
-        tot, parts = count_params(model)
-        print(f"model: {tot / 1e6:.2f} M parameters {parts}; {train.n * W * 30 / 1e6:.1f} M training values = {train.n * W * 30 / tot:.2f} values per parameter "
+        model = build_model(cfg).to(dev); tot, parts = count_params(model)
+        print(f"VAE: {tot / 1e6:.2f} M parameters {parts}; {train.n * W * 30 / 1e6:.1f} M training values = {train.n * W * 30 / tot:.2f} values per parameter "
               f"(windows overlap by stride, variants repeat their sources: expect to overfit, trust the validation numbers)")
-        if a.compile:
-            try:
-                model.enc.compile(); model.dec.compile()
-            except Exception as ex:
-                print(f"torch.compile unavailable ({str(ex)[:100]}): continuing eager")
-        decay = [p for n, p in model.named_parameters() if p.ndim >= 2]; no_decay = [p for n, p in model.named_parameters() if p.ndim < 2]
-        opt = torch.optim.AdamW([dict(params=decay, weight_decay=a.wd), dict(params=no_decay, weight_decay=0.0)], lr=a.lr, betas=(0.9, 0.95))
-        step = epoch0 = 0; best = float("inf")
-        if a.resume:
-            ck = torch.load(a.resume, map_location=dev, weights_only=False); model.load_state_dict(ck["model"]); opt.load_state_dict(ck["opt"])
-            step, epoch0, best = ck["step"], ck["epoch"] + 1, ck["best_val"]; model.vq._ready = True; print(f"resumed from {a.resume}: epoch {epoch0}, step {step}, best val {best:.4f}")
-        spe = max(1, train.n // a.batch); total_steps = a.epochs * spe
-        lr_at = lambda s: a.lr * (s / max(1, a.warmup) if s < a.warmup else a.min_lr_frac + (1 - a.min_lr_frac) * 0.5 * (1 + math.cos(math.pi * (s - a.warmup) / max(1, total_steps - a.warmup))))
-        scaler = torch.amp.GradScaler("cuda", enabled=(a.amp == "fp16" and dev.type == "cuda"))     # a no-op unless fp16
-        mlog = open(os.path.join(a.out, "metrics.jsonl"), "a"); bad = 0; t0 = time.time(); stop = False
-        model.train()
-        for epoch in range(epoch0, a.epochs):
-            perm = torch.randperm(train.n); run = collections.defaultdict(float); nrun = 0; te = time.time()
-            for bi in range(spe):
-                x, v, act = train.batch(perm[bi * a.batch:(bi + 1) * a.batch])
-                for g in opt.param_groups:
-                    g["lr"] = lr_at(step)
-                loss, m, _ = compute_loss(model, x, v, act, norm_t, a, train=True)
-                opt.zero_grad(set_to_none=True); scaler.scale(loss).backward(); scaler.unscale_(opt)
-                gn = torch.nn.utils.clip_grad_norm_(model.parameters(), a.clip); scaler.step(opt); scaler.update(); step += 1
-                for k in ("total", "rec", "vel", "bce", "commit", "ppl"):
-                    run[k] = run[k] + m[k]                      # stays a device tensor: no GPU sync per step
-                nrun += 1
-                if step % a.log_every == 0:
-                    print(f"  ep {epoch:3d} step {step:7d}  loss {run['total'] / nrun:.4f}  rec {run['rec'] / nrun:.4f}  vel {run['vel'] / nrun:.3f}  flag {run['bce'] / nrun:.3f}  "
-                          f"commit {run['commit'] / nrun:.4f}  ppl {run['ppl'] / nrun:5.1f}  gn {float(gn):.2f}  lr {lr_at(step):.2e}  {(time.time() - t0) / 60:.1f} min", flush=True)
-                if a.max_steps and step >= a.max_steps:
-                    stop = True; break
-            ev = evaluate(model, val, norm_t, a); evn = evaluate(model, val, norm_t, a, null_label=True)
-            tr = {k: float(run[k]) / max(nrun, 1) for k in run}
-            improved = ev["total"] < best
-            if improved:
-                best = ev["total"]; bad = 0; save_ckpt(os.path.join(a.out, "best.pt"), model, cfg, norm, names, dt, a, step, epoch, best)
-            else:
-                bad += 1
-            save_ckpt(os.path.join(a.out, "last.pt"), model, cfg, norm, names, dt, a, step, epoch, best, opt)
-            print(f"epoch {epoch:3d}  train {tr.get('total', 0):.4f} (rec {tr.get('rec', 0):.4f})  |  val {ev['total']:.4f} (rec {ev['rec']:.4f}, pos {ev['pos_rmse_m'] * 100:.1f} cm, "
-                  f"flags {ev['flag_acc'] * 100:.1f}%, ppl {ev['ppl']:.0f}, codes used {ev['codes_used'] * 100:.0f}%)  |  val with null label: rec {evn['rec']:.4f}  |  "
-                  f"{time.time() - te:.0f}s{'  *best*' if improved else ''}", flush=True)
-            mlog.write(json.dumps(dict(epoch=epoch, step=step, train=tr, val=ev, val_null=evn)) + "\n"); mlog.flush()
-            if stop or (a.patience and bad >= a.patience):
-                print("stopping: " + ("--max-steps reached" if stop else f"no validation improvement for {a.patience} epochs")); break
-        model, _, _ = load_ckpt(os.path.join(a.out, "best.pt"), dev) if os.path.exists(os.path.join(a.out, "best.pt")) else (model, None, None)
-        print(f"done. best validation total {best:.4f}  ->  {os.path.join(a.out, 'best.pt')}")
+        model = train_vae(a, dev, model, cfg, train, val, norm, norm_t, names, dt)
     else:
         ev = evaluate(model, val, norm_t, a); evn = evaluate(model, val, norm_t, a, null_label=True)
-        print("val: " + "  ".join(f"{k} {v:.4f}" for k, v in ev.items())); print("val with null label: " + "  ".join(f"{k} {v:.4f}" for k, v in evn.items()))
-        train = None
-
+        print("VAE val: " + "  ".join(f"{k} {v:.4f}" for k, v in ev.items())); print("VAE val with null label: " + "  ".join(f"{k} {v:.4f}" for k, v in evn.items()))
     if a.export_recon:
         export_recon(model, val, norm, names, dt, os.path.join(a.out, "recon_preview.npz"), a.export_recon, a.seed, a)
+    if a.stage == "vae" and not a.export_codes:
+        return
+
+    # ---------------------------------------------------------------------------------------------------------------- stage 2: tokens + codebook health
+    codes_t = tokenize(model, train, a); codes_v = tokenize(model, val, a); K = model.vq.K
+    codebook_health(codes_t, K, "train"); codebook_health(codes_v, K, "val", warn=False)
+    uni_val = unigram_ce(codes_t, codes_v, K)
     if a.export_codes:
-        if train is None:
-            Xt, vt, at, _, _ = load_windows(os.path.join(a.data, "train_windows.npz")); Xt = canonicalize(Xt) if canon else Xt; train = WindowSet(Xt, vt, at, norm, dev, False)
-        export_codes(model, train, names, os.path.join(a.out, "codes_train.npz")); export_codes(model, val, names, os.path.join(a.out, "codes_val.npz"))
+        np.savez(os.path.join(a.out, "codes_train.npz"), codes=codes_t.astype(np.int16), action=at.astype(np.int16), valid=vt.astype(np.int16), chain=chain_t, pos=pos_t, action_names=np.array(names))
+        np.savez(os.path.join(a.out, "codes_val.npz"), codes=codes_v.astype(np.int16), action=av.astype(np.int16), valid=vv.astype(np.int16), chain=chain_v, pos=pos_v, action_names=np.array(names))
+        print(f"wrote {a.out}/codes_train.npz and codes_val.npz")
+    if a.eval_only or a.stage == "vae":
+        return
+
+    # ---------------------------------------------------------------------------------------------------------------- stage 3: prior
+    prior = train_prior(a, dev, codes_t, codes_v, chain_t, chain_v, at, av, K, len(names), names, stride, dt, uni_val)
+
+    # ---------------------------------------------------------------------------------------------------------------- stage 4: samples
+    if not a.no_generate:
+        generate(a, dev, model, norm, prior, names, stride, dt)
 
 
 if __name__ == "__main__":
