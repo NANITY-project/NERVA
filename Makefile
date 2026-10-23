@@ -51,6 +51,9 @@ clean:
 studio: lib
 	python3 studio/server.py
 
+ui: lib
+	python3 UI/server.py
+
 # Real-NEON tests need a NEON binary (auto-detected next to this project, or set NEON_BIN / NEON_SRC); they skip without one.
 NEON_BIN_FOUND := $(shell python3 -c "import sys; sys.path.insert(0,'studio'); import neon_bridge as n; print(n.find_binary() or '')" 2>/dev/null)
 
@@ -81,7 +84,7 @@ actions-test:
 
 test-all: test body-test studio-test blender-test overlay-test
 
-.PHONY: all test bench sanitize clean lib studio studio-test blender-test test-all body-test overlay overlay-test actions-test motion-test motion-test-quick motion-headers vae-data vae-data-quick vae-data vae-data-quick
+.PHONY: all test bench sanitize clean lib studio ui studio-test blender-test test-all body-test overlay overlay-test actions-test motion-test motion-test-quick motion-headers vae-data vae-data-quick vae-data vae-data-quick
 
 # --- Motion grader: real CMU examples per action, grader validation, C++ headers (see tools/motion_test.py) ---
 motion-test:
