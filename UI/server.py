@@ -8,9 +8,11 @@ NERVA UI server - drag a trained cVQ-VAE (best.pt) and prior (prior_best.pt) int
 
 What runs where
   VAE      best.pt  -> exported with NEON's own conversion/nanity_export_cvqvae.py -> GGUF -> decoded by NEON
-           (preferred: `neon --motion-model X.gguf --interactive`, op cvq_decode; fallback: NEON's cvqvae_cli)
-  Prior    prior_best.pt -> a small numpy re-implementation of tools/train_cvqvae.py's CodePrior (KV cache, no torch at sampling time).
-           NEON has no runtime for the prior yet, so this part is NOT on NEON.
+  Prior    prior_best.pt -> exported with conversion/nanity_export_cvqprior.py -> GGUF -> sampled by NEON
+           Both run in ONE motion-only NEON process:  neon --motion-model vae.gguf --motion-model prior.gguf --interactive
+           (ops cvq_prior_reset / cvq_prior_next with decode:true; no language model needed).
+           Fallback when that NEON binary is missing or too old: the prior runs as a small numpy twin of tools/train_cvqvae.py's
+           CodePrior inside this server and the VAE decodes through NEON's cvqvae_cli. The header shows which path is active.
   Body     decoded windows are stitched exactly like train_cvqvae.stitch (incremental) and replayed through libnebula
            (the IK engine) frame by frame, so the browser shows the engine's body. No libnebula -> the browser draws a preview skeleton
            from the 30 action channels instead.
@@ -120,8 +122,11 @@ class NeonInteractive:
     """neon --motion-model X.gguf --interactive; JSON lines in, {"motion":{...}} + {"done":true} out."""
     name = "NEON --interactive"
 
-    def __init__(self, neon_bin, gguf, threads=0):
-        cmd = [neon_bin, "--motion-model", gguf, "--interactive"]
+    def __init__(self, neon_bin, ggufs, threads=0):
+        cmd = [neon_bin]
+        for g in ([ggufs] if isinstance(ggufs, str) else ggufs):
+            cmd += ["--motion-model", g]
+        cmd += ["--interactive"]
         if threads:
             cmd += ["--threads", str(threads)]
         self.p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
@@ -143,7 +148,7 @@ class NeonInteractive:
                 self.ready.set()
         self.ready.set()
 
-    def _ask(self, motion):
+    def ask(self, motion):
         self.p.stdin.write(json.dumps({"motion": motion}) + "\n")
         self.p.stdin.flush()
         reply, error = None, None
@@ -166,7 +171,7 @@ class NeonInteractive:
         return reply
 
     def decode(self, codes, action):
-        r = self._ask({"op": "cvq_decode", "codes": [int(c) for c in codes], "action": action if action is not None else "null"})
+        r = self.ask({"op": "cvq_decode", "codes": [int(c) for c in codes], "action": action if action is not None else "null"})
         return np.asarray(r["frames"], np.float32)
 
     def close(self):
@@ -196,25 +201,36 @@ class NeonCli:
         pass
 
 
-def start_decoder(gguf, neon_dir):
+def start_session(ggufs, has_prior, neon_dir):
+    """Returns (session, native_prior). Prefers one NEON process holding VAE (+ prior); falls back to cvqvae_cli + the numpy prior."""
     nb = find_neon_bin(neon_dir)
     if nb:
-        try:
-            d = NeonInteractive(nb, gguf, ARGS.threads)
-            probe = d.decode([0] * 4, None)               # a real round trip: proves the cvq ops are wired in this binary
-            if probe.ndim == 2 and probe.shape[1] == NCH:
-                log(f"decoder: {d.name} ({nb})")
-                return d
-            d.close()
-        except Exception as e:
-            log(f"NEON --interactive could not decode ({e}); trying cvqvae_cli")
+        for use in ((ggufs, True), (ggufs[:1], False)) if has_prior else ((ggufs, False),):
+            files, want_prior = use
+            try:
+                d = NeonInteractive(nb, files, ARGS.threads)
+                probe = d.decode([0] * 4, None)               # a real round trip: proves the cvq ops are wired in this binary
+                if not (probe.ndim == 2 and probe.shape[1] == NCH):
+                    d.close()
+                    continue
+                native = False
+                if want_prior and not ARGS.numpy_prior:
+                    try:
+                        d.ask({"op": "cvq_prior_reset", "action": "null", "seed": 0})
+                        native = True
+                    except Exception as e:
+                        log(f"this NEON has no usable prior op ({e}); the prior will run in numpy")
+                log(f"NEON: {nb}  (VAE decode on NEON, prior on {'NEON' if native else 'numpy'})")
+                return d, native
+            except Exception as e:
+                log(f"NEON --interactive failed ({e}); " + ("retrying without the prior GGUF" if want_prior else "trying cvqvae_cli"))
     cli = build_cli(neon_dir) if neon_dir else None
     if cli:
-        d = NeonCli(cli, gguf)
+        d = NeonCli(cli, ggufs[0])
         d.decode([0] * 4, None)
-        log(f"decoder: {d.name}")
-        return d
-    raise RuntimeError("no NEON decoder available: build NEON (g++ -std=c++20 -O2 -pthread -mavx2 -mfma runtime/NEON-3.cpp -o neon) and set NEON_BIN, "
+        log(f"NEON: {d.name} (VAE decode on NEON, prior on numpy). Build a current NEON (see NANITY-NEON README) to run the prior on NEON too.")
+        return d, False
+    raise RuntimeError("no NEON available: build NEON (g++ -std=c++20 -O2 -pthread -mavx2 -mfma -mf16c runtime/NEON-3.cpp -o neon) and set NEON_BIN, "
                        "or install a C++ compiler so cvqvae_cli can be built")
 
 
@@ -402,6 +418,9 @@ class State:
         self.vae = None        # dict: cfg, names, dt, gguf, decoder, file
         self.prior = None      # Prior
         self.prior_file = None
+        self.prior_gguf = None  # exported nanity-cvqprior GGUF (None if export failed)
+        self.session = None     # NeonInteractive / NeonCli
+        self.native_prior = False
         self.engine = None
         self.engine_err = None
         self.gen_id = 0
@@ -463,15 +482,39 @@ def gguf_meta(path):
     return cfg, names, dt
 
 
-def set_vae(cfg, names, dt, gguf_path, fname):
+def rebuild():
+    """(Re)start the NEON session for whatever is loaded now. Both GGUFs live in one process, so any change restarts it."""
+    if S.session:
+        S.session.close()
+    S.session, S.native_prior = None, False
+    if not S.vae:
+        return
     if S.neon_dir is None:
         S.neon_dir = find_neon_dir()
-    old = S.vae
-    S.vae = None
-    if old and old.get("decoder"):
-        old["decoder"].close()
-    dec = start_decoder(gguf_path, S.neon_dir)
-    S.vae = dict(cfg=cfg, names=list(names), dt=float(dt), gguf=gguf_path, decoder=dec, file=fname)
+    ggufs = [S.vae["gguf"]] + ([S.prior_gguf] if S.prior_gguf else [])
+    S.session, S.native_prior = start_session(ggufs, bool(S.prior_gguf), S.neon_dir)
+
+
+def set_vae(cfg, names, dt, gguf_path, fname):
+    S.vae = dict(cfg=cfg, names=list(names), dt=float(dt), gguf=gguf_path, file=fname)
+    rebuild()
+
+
+def load_exporter(name):
+    if S.neon_dir is None:
+        S.neon_dir = find_neon_dir()
+    if not S.neon_dir:
+        raise RuntimeError(f"NEON checkout not found (needed for conversion/{name}.py). Clone NANITY-project/NANITY-NEON next to this repo or set NEON_DIR.")
+    path = os.path.join(S.neon_dir, "conversion", name + ".py")
+    if not os.path.exists(path):
+        raise RuntimeError(f"{path} is missing: update your NANITY-NEON checkout (git pull).")
+    spec = importlib.util.spec_from_file_location(name, path)
+    ex = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(ex)
+    except SystemExit as e:
+        raise RuntimeError(str(e))
+    return ex
 
 
 def handle_upload(path, fname):
@@ -486,16 +529,7 @@ def handle_upload(path, fname):
     if not isinstance(ck, dict) or "model" not in ck or "cfg" not in ck:
         raise RuntimeError(f"{fname} is not a train_cvqvae.py checkpoint (expected a dict with 'model' and 'cfg').")
     if "norm" in ck:                                     # ---- VAE
-        if S.neon_dir is None:
-            S.neon_dir = find_neon_dir()
-        if not S.neon_dir:
-            raise RuntimeError("NEON checkout not found (needed for conversion/nanity_export_cvqvae.py). Clone NANITY-project/NANITY-NEON next to this repo or set NEON_DIR.")
-        spec = importlib.util.spec_from_file_location("nanity_export_cvqvae", os.path.join(S.neon_dir, "conversion", "nanity_export_cvqvae.py"))
-        ex = importlib.util.module_from_spec(spec)
-        try:
-            spec.loader.exec_module(ex)
-        except SystemExit as e:
-            raise RuntimeError(str(e))
+        ex = load_exporter("nanity_export_cvqvae")
         os.makedirs(CACHE, exist_ok=True)
         out = os.path.join(CACHE, os.path.splitext(os.path.basename(fname))[0] + ".cvqvae.gguf")
         log(f"exporting {fname} -> {os.path.basename(out)} with NEON's exporter")
@@ -511,7 +545,23 @@ def handle_upload(path, fname):
         S.prior = Prior(sd, ck["cfg"], ck.get("names", []), ck.get("stride", 0))
         S.prior_file = fname
         log(f"prior loaded: {S.prior.params / 1e6:.2f} M parameters, {S.prior.K} codes, {S.prior.windows} windows of context")
-        return dict(kind="prior", file=fname, note="")
+        note = ""
+        try:                                              # the same checkpoint, as a GGUF for NEON's own prior runtime
+            ex = load_exporter("nanity_export_cvqprior")
+            out = os.path.join(CACHE, os.path.splitext(os.path.basename(fname))[0] + ".cvqprior.gguf")
+            log(f"exporting {fname} -> {os.path.basename(out)} with NEON's prior exporter")
+            try:
+                ex.export_ckpt(ck, out, "f32")
+            except SystemExit as e:
+                raise RuntimeError(str(e))
+            S.prior_gguf = out
+            note = "exported to GGUF"
+        except Exception as e:
+            S.prior_gguf = None
+            note = "numpy prior only (NEON export failed: " + str(e)[:120] + ")"
+            log(note)
+        rebuild()
+        return dict(kind="prior", file=fname, note=note)
     raise RuntimeError(f"{fname}: could not tell whether this is a VAE (needs 'norm') or a prior (cfg needs 'K' and 'windows').")
 
 
@@ -528,15 +578,15 @@ def status():
         if p.n_actions != v["cfg"]["n_actions"]:
             warn.append(f"prior knows {p.n_actions} actions, VAE knows {v['cfg']['n_actions']}")
     return dict(
-        vae=None if not v else dict(file=v["file"], window=v["cfg"]["window"], codes=v["cfg"]["num_codes"], downs=v["cfg"]["downs"], dt=v["dt"], backend=v["decoder"].name),
-        prior=None if not p else dict(file=S.prior_file, params=p.params, K=p.K, n=p.n, windows=p.windows, stride=p.stride, layers=len(p.L), d=p.d),
+        vae=None if not v else dict(file=v["file"], window=v["cfg"]["window"], codes=v["cfg"]["num_codes"], downs=v["cfg"]["downs"], dt=v["dt"], backend=S.session.name if S.session else "—"),
+        prior=None if not p else dict(backend="NEON" if S.native_prior else "numpy", file=S.prior_file, params=p.params, K=p.K, n=p.n, windows=p.windows, stride=p.stride, layers=len(p.L), d=p.d),
         actions=names, neon_dir=S.neon_dir, engine=bool(S.engine), engine_error=S.engine_err, warnings=warn, ready=bool(v and p and not warn), log=LOG[-12:])
 
 
 # ================================================================================================================ generation (a Python generator of UI events)
 def generate(q, stop):
     v, p = S.vae, S.prior
-    if not (v and p):
+    if not (v and p and S.session):
         raise RuntimeError("drop both a VAE (best.pt) and a prior (prior_best.pt) first")
     tc = train_cvqvae_mod()
     cfg = v["cfg"]
@@ -553,34 +603,50 @@ def generate(q, stop):
     eng = get_engine()
     rp = Replay(eng) if eng else None
     st = Stitcher(tc, W, stride)
-    p.reset()
-    yield dict(type="start", dt=dt, window=W, n=n, stride=stride, action=act_name if a is not None else "null", bone_names=rp.b.names if rp else None,
-               engine=bool(rp), backend=v["decoder"].name, seed=seed, windows=n_windows)
+    native = S.native_prior
+    act_arg = act_name if a is not None else "null"
+    if native:
+        with LOCK:
+            S.session.ask({"op": "cvq_prior_reset", "action": act_arg, "seed": seed})      # NEON keeps the KV cache / context policy itself
+    else:
+        p.reset()
+    yield dict(type="start", dt=dt, window=W, n=n, stride=stride, action=act_arg, bone_names=rp.b.names if rp else None,
+               engine=bool(rp), backend=S.session.name, prior_backend="NEON" if native else "numpy", seed=seed, windows=n_windows)
     ctx, w, sent, t_start = [first], 0, 0, time.time()
     try:
         while (n_windows == 0 or w < n_windows) and not stop():
-            if w >= p.windows:                            # same context policy as train_cvqvae.generate_codes: drop the oldest window, keep the action prefix
-                ctx = [ctx[0]] + ctx[1 + n + 1:]
-                p.reset()
-            t0, codes = time.time(), []
-            for i in range(n):
-                if stop():
-                    return
-                tok, ent, pt = p.sample(ctx, rng, temp, top_k, top_p)
-                ctx.append(tok)
-                codes.append(tok)
-                yield dict(type="code", w=w, i=i, c=tok, ent=round(ent, 3), p=round(pt, 4))
-            ctx.append(p.SEP)
-            t1 = time.time()
-            with LOCK:
-                win = v["decoder"].decode(codes, act_name if a is not None else None)
+            if native:
+                t0 = time.time()
+                with LOCK:
+                    r = S.session.ask({"op": "cvq_prior_next", "temperature": temp, "top_k": top_k, "top_p": top_p, "decode": True, "normalized": False})
+                codes = [int(c) for c in r["codes"]]
+                win = np.asarray(r["frames"], np.float32)
+                t1 = t2 = time.time()
+                for i in range(n):                         # NEON returns a whole window at once: replay the codes into the grid
+                    yield dict(type="code", w=w, i=i, c=codes[i], ent=round(float(r["entropy"][i]), 3), p=round(float(r["probs"][i]), 4))
+            else:
+                if w >= p.windows:                         # same context policy as train_cvqvae.generate_codes: drop the oldest window, keep the action prefix
+                    ctx = [ctx[0]] + ctx[1 + n + 1:]
+                    p.reset()
+                t0, codes = time.time(), []
+                for i in range(n):
+                    if stop():
+                        return
+                    tok, ent, pt = p.sample(ctx, rng, temp, top_k, top_p)
+                    ctx.append(tok)
+                    codes.append(tok)
+                    yield dict(type="code", w=w, i=i, c=tok, ent=round(ent, 3), p=round(pt, 4))
+                ctx.append(p.SEP)
+                t1 = time.time()
+                with LOCK:
+                    win = S.session.decode(codes, act_name if a is not None else None)
+                t2 = time.time()
             win[:, FLAGS] = (win[:, FLAGS] > 0.5).astype(np.float32)
-            t2 = time.time()
             fresh = st.add(win)
             ev = emit_frames(fresh, sent, dt, rp)
             sent += len(fresh)
             t3 = time.time()
-            yield dict(type="window", w=w, prior_ms=round((t1 - t0) * 1000), decode_ms=round((t2 - t1) * 1000), engine_ms=round((t3 - t2) * 1000), frames=len(fresh))
+            yield dict(type="window", w=w, fused=native, prior_ms=round((t1 - t0) * 1000), decode_ms=round((t2 - t1) * 1000), engine_ms=round((t3 - t2) * 1000), frames=len(fresh))
             yield ev
             w += 1
         if not stop():
@@ -698,6 +764,7 @@ def main():
     ap.add_argument("--neon-dir", help="NANITY-NEON checkout (default: next to this repo / NEON_DIR / ~/NANITY-NEON)")
     ap.add_argument("--neon-bin", help="a built NEON binary (default: NEON_BIN / PATH / inside the checkout)")
     ap.add_argument("--no-clone", action="store_true", help="never git clone the NEON repo automatically")
+    ap.add_argument("--numpy-prior", action="store_true", help="force the numpy prior even if NEON can run it (for comparing the two)")
     ap.add_argument("--no-engine", action="store_true", help="skip libnebula; the browser draws a preview skeleton")
     ap.add_argument("--threads", type=int, default=0, help="threads for NEON (0 = its default)")
     ap.add_argument("--trust-pickle", action="store_true", help="torch.load(weights_only=False) as a fallback; only for files you made yourself")
@@ -715,8 +782,8 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        if S.vae and S.vae.get("decoder"):
-            S.vae["decoder"].close()
+        if S.session:
+            S.session.close()
 
 
 if __name__ == "__main__":
