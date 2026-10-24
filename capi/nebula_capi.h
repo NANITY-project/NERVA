@@ -73,7 +73,9 @@ NEBULA_API int  nebula_body_command(NebulaBody*, const char* line, char* msg, in
 NEBULA_API void nebula_body_update(NebulaBody*, float dt);
 /* keys: safe_margin, step_time_scale, max_stride, max_step_up, max_step_down, fall_margin, fall_time,
  *       shift_settle_speed, hand_idle_m, balance (1 assist / 0 none),
- *       dynamic_gait (1/0), recover_time, arm_swing_gain, twist_gain, head_turn_omega, leg_len_frac, step_ds_time, swing_reach_slack */
+ *       dynamic_gait (1/0), recover_time, arm_swing_gain, twist_gain, head_turn_omega, leg_len_frac, step_ds_time, swing_reach_slack,
+ *       torso_prior (1 = the spine takes the pose real people take, 0 = the old equal-bend chain), torso_limit_scale (joint limits, 1 = as measured, 0 = off),
+ *       torso_stiffness (scales the prior covariance: <1 stiffer back) */
 NEBULA_API int  nebula_body_set_param(NebulaBody*, const char* key, float value);
 NEBULA_API int  nebula_body_add_surface(NebulaBody*, float x0, float x1, float z0, float z1, float y);
 NEBULA_API void nebula_body_clear_surfaces(NebulaBody*);
@@ -113,6 +115,17 @@ NEBULA_API int         nebula_body_restore(NebulaBody* dst, const NebulaBody* sr
    with the issues most severe first. Returns the number of bad frames (frames needing a correction above 5 mm or losing balance), -1 on bad arguments. */
 NEBULA_API int nebula_body_evaluate_clip(NebulaBody*, const float* actions, int n, float dt, int commit, float* reports, float* states, char* json, int json_cap);
 NEBULA_API void nebula_body_reset(NebulaBody*);     /* back to the standing pose, same parameters */
+
+/* ---- torso orientation targets, joint limits and pose prior (include/ik_torso.hpp; additive, the ABI version stays 3) ---------------------------------
+ * `torso` = n * nebula_body_torso_dim() (28) floats: per frame the orientation of spine1 spine2 spine3 neck head clavicle_L clavicle_R as quaternions (w,x,y,z) in the
+ * pelvis HEADING frame (tools/bvh_to_clip.py saves them as `torso`). Each joint is clamped to its fitted hinge / side-bend / twist range. Without them the torso follows the
+ * prior (natural S-curve, bends where real people bend). Otherwise like nebula_body_track_clip / nebula_body_replay_clip; -1 on bad arguments. */
+NEBULA_API int   nebula_body_torso_dim(void);
+NEBULA_API int   nebula_body_track_clip_torso(NebulaBody*, const float* actions, const float* torso, int n, float dt, float* reports, float* states);
+/* torso may be NULL (the prior); torso_stats (optional, n * 2 floats) receives per frame: radians moved to respect the limits, prior energy. Returns bad frames. */
+NEBULA_API int   nebula_body_replay_clip_torso(NebulaBody*, const float* actions, const float* torso, int n, float dt, float* reports, float* states, float* bones, float* torso_stats);
+NEBULA_API float nebula_body_torso_limited(NebulaBody*);   /* radians the last tracked frame had to be moved to respect the joint limits */
+NEBULA_API float nebula_body_torso_energy(NebulaBody*);    /* how typical the last torso pose is under the prior: ~1 = a real pose, >>1 = contorted */
 
 #ifdef __cplusplus
 }
