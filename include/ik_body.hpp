@@ -30,6 +30,7 @@
 #include <vector>
 #include <memory>
 #include "ik_engine.hpp"
+#include "ik_torso.hpp"
 
 namespace ik {
 
@@ -122,6 +123,10 @@ public:
         float twist_gain = 0.17f;           // pelvis yaw (rad) per m of foot fore-aft offset; the chest counter-rotates (0 = off)
         float head_turn_omega = 14.f;       // rad/s, head/gaze dynamics (critically damped; 0 = instant like a camera)
         float recover_time = 1.5f;          // s after a fall before the body stands itself back up (0 = stay fallen until STAND)
+        // ---- torso (ik_torso.hpp): orientation targets, joint limits, pose prior
+        float torso_prior = 1.f;            // 1: the spine takes the pose real people take (fitted prior, natural S-curve); 0: the old equal-bend FABRIK chain
+        float torso_limit_scale = 1.f;      // spine / neck / head / clavicle joint limits (hinge, side bend, twist) as fitted to motion capture: 1 = as measured, 0 = off
+        float torso_stiffness = 1.f;        // scales the prior's covariance: below 1 a stiffer back (bends less where it can), above 1 a looser one
     };
     struct Result { bool ok; std::string msg; };
     struct Surface { float x0, x1, z0, z1, y; };
@@ -311,15 +316,33 @@ public:
         r[10] = unb ? -std::fabs(margin_) : margin_; float v = r[0] + r[1] + r[2] + r[3] + r[4] + r[5] + r[6] + r[8] + r[9]; r[11] = (v > 0.005f || unb) ? 1.f : 0.f;
                 report_unbalanced_ = unb;
         track_land_has_[0] = track_land_has_[1] = false;                                  // a hint is for one frame only
+        torso_in_ = false;                                                                // so are the torso orientation targets
     }
     // Optional look-ahead for ONE track() call: where foot s will touch down next. A generator output is a whole clip, so the caller can
     // see this; the balance check then counts the landing footprint (as the walking engine does) instead of guessing from the foot's velocity.
     void track_land(int s, Vec3 p, float yaw) { if (s < 0 || s > 1) return; track_land_has_[s] = true; track_land_[s] = p; track_land_yaw_[s] = yaw; }
+    // Torso orientation targets for ONE track() call (like track_land): 7 quaternions (w,x,y,z), in order spine1 spine2 spine3 neck head clavicle_L clavicle_R, each the
+    // wanted orientation of that bone in the pelvis HEADING frame (upright, facing the body's yaw; Y along the bone, Z = front). This is what tools/bvh_to_clip.py saves
+    // as `torso`. Each joint's rotation is clamped to its limits (ik_torso.hpp); torso_limited() says by how much. nullptr clears them (the torso then follows the prior).
+    void set_torso_targets(const float* q) {
+        if (!q) { torso_in_ = false; return; }
+        for (int k = 0; k < torso::kJoints; ++k) {
+            Quat t(q[4 * k], q[4 * k + 1], q[4 * k + 2], q[4 * k + 3]);
+            if (!std::isfinite(t.w + t.x + t.y + t.z) || t.w * t.w + t.x * t.x + t.y * t.y + t.z * t.z < 1e-6f) { torso_in_ = false; return; }
+            torso_in_q_[k] = t.normalized();
+        }
+        torso_in_ = true;
+    }
+    // how far (radians) the last pose had to be moved to respect the torso joint limits (0 = none), and how typical the torso pose is under the fitted prior
+    // (Mahalanobis distance squared per coordinate: about 1 for a typical real pose, much higher for a contorted one; only computed with torso_prior on)
+    float torso_limited() const { return torso_limited_; }
+    float torso_energy() const { return torso_energy_; }
     // Track a whole clip (n frames of ACTION_DIM floats): looks ahead for each lifted foot's next touchdown. reports: n*REPORT_DIM, states: n*STATE_DIM
     // (either may be null). Returns the number of frames that reported a loss of balance.
-    int track_clip(const float* a, int n, float dt, float* reports, float* states) { return track_clip_each(a, n, dt, reports, states, [](int) {}); }
+    // torso (optional): n * 28 floats, per frame the 7 torso quaternions of set_torso_targets (nullptr = none)
+    int track_clip(const float* a, int n, float dt, float* reports, float* states, const float* torso = nullptr) { return track_clip_each(a, n, dt, reports, states, [](int) {}, torso); }
     // The same, calling each(i) after frame i has been tracked (e.g. to read the bones of that frame).
-    template <class Fn> int track_clip_each(const float* a, int n, float dt, float* reports, float* states, Fn&& each) {
+    template <class Fn> int track_clip_each(const float* a, int n, float dt, float* reports, float* states, Fn&& each, const float* torso = nullptr) {
         float tmp[REPORT_DIM]; int bad = 0;
         for (int i = 0; i < n; ++i) {
             const float* ai = a + (size_t)i * ACTION_DIM;
@@ -333,6 +356,7 @@ public:
                 }
                 for (int j = from + 1; j < n; ++j) if (contact(j, s)) { const float* aj = a + (size_t)j * ACTION_DIM + 4 + 5 * s; track_land(s, Vec3(aj[0], aj[1], aj[2]), aj[3]); break; }
             }
+            set_torso_targets(torso ? torso + (size_t)i * 4 * torso::kJoints : nullptr);
             track(ai, dt, reports ? reports + (size_t)i * REPORT_DIM : tmp);
             if (track_unbalanced()) ++bad;
             if (states) get_state(states + (size_t)i * STATE_DIM);
@@ -391,7 +415,7 @@ public:
     }
     // Track a clip FROM THE CURRENT STATE and judge it. This body ADVANCES to the clip's end; to try a candidate without committing, use preview_clip.
     // reports (n*REPORT_DIM) and states (n*STATE_DIM) are optional.
-    ClipVerdict evaluate_clip(const float* a, int n, float dt, float* reports = nullptr, float* states = nullptr) {
+    ClipVerdict evaluate_clip(const float* a, int n, float dt, float* reports = nullptr, float* states = nullptr, const float* torso = nullptr) {
         ClipVerdict v; v.frames = n < 0 ? 0 : n; if (n <= 0 || !a) return v;
         for (size_t i = 0; i < (size_t)n * ACTION_DIM; ++i) if (!std::isfinite(a[i])) {
             v.feasible = false; v.bad_frames = n; v.score = 1e3f; v.worst_frame = (int)(i / ACTION_DIM);
@@ -399,7 +423,7 @@ public:
             return v;
         }
         std::vector<float> own; float* r = reports; if (!r) { own.resize((size_t)n * REPORT_DIM); r = own.data(); }
-        track_clip(a, n, dt, r, states);
+        track_clip(a, n, dt, r, states, torso);
         float sum = 0.f;
         for (int i = 0; i < n; ++i) {
             const float* ri = r + (size_t)i * REPORT_DIM; float c = frame_cost(ri, params.fall_margin);
@@ -409,7 +433,7 @@ public:
         return v;
     }
     // Try a candidate clip from the current state on a COPY: this body is left exactly as it was.
-    ClipVerdict preview_clip(const float* a, int n, float dt, float* reports = nullptr, float* states = nullptr) const { Body t(*this); return t.evaluate_clip(a, n, dt, reports, states); }
+    ClipVerdict preview_clip(const float* a, int n, float dt, float* reports = nullptr, float* states = nullptr, const float* torso = nullptr) const { Body t(*this); return t.evaluate_clip(a, n, dt, reports, states, torso); }
 
     // Leave tracking: the commanded-control state (feet planted where they are, hands relaxed, gait controller back on) resumes from the current pose.
     void track_end() {
@@ -517,6 +541,9 @@ private:
     std::vector<BoneOut> bones_; std::shared_ptr<std::vector<std::string>> names_ = std::make_shared<std::vector<std::string>>(); std::vector<float> mass_; std::vector<std::string> events_;
     struct Idx { int clav[2], upper[2], fore[2], hand[2], finger0[2], thigh[2], shin[2], foot[2], toe[2], nfingers = 0; } I{};
     Quat chest_q_;
+    // torso: per-frame orientation targets (tracking), the solved spine frames, and what the limits / prior did
+    bool torso_in_ = false; Quat torso_in_q_[torso::kJoints]; bool spine_framed_ = false; Quat spq_[3]; Quat clav_q_[2]; bool clav_framed_ = false;
+    torso::SpinePose spine_pose_ = torso::spine_mean(); float torso_limited_ = 0.f, torso_energy_ = 0.f, torso_resid_ = 0.f; bool torso_warned_ = false;
     // dynamic gait state
     body_detail::V2 cm_, cmv_, cop_f_, lean_, head_dev_; bool dyn_init_ = false;
     // Arm swing target for arm s (m forward): driven by the DIFFERENCE of the two feet's fore-aft offsets (a smooth, symmetric swing: the arm goes forward
@@ -1145,17 +1172,63 @@ private:
         Vec3 root = pelvis_ + up * D.pelvis_bone;
         float total = D.spine[0] + D.spine[1] + D.spine[2];
         spine_.root_position = root; spine_.root_orientation = Quat::rotation_between(Vec3(1, 0, 0), up);
-        Vec3 t = (torso_user_ ? torso_tgt_ - root : up * total + Vec3(lean_.x + head_dev_.x, 0.f, lean_.z + head_dev_.z) );
-        float l = t.length(); if (l < 1e-4f) t = up * total, l = total;
-        Vec3 dir = t * (1.f / l);
-        if (dir.y < std::cos(55.f * PI / 180.f)) { Vec3 hz(dir.x, 0, dir.z); hz = hz.normalized(); dir = up * std::cos(55.f * PI / 180.f) + hz * std::sin(55.f * PI / 180.f); }
-        solve_fabrik(spine_, root + dir * std::min(l, 0.995f * total), 1e-3f, 8);
-        Vec3 sp[4]; spine_.world_positions(sp);
-        Vec3 cup = (sp[3] - sp[2]).normalized(); if (cup.length_sq() < 0.5f) cup = up;
+        const bool orient = torso_in_ && tracking_, prior = params.torso_prior > 0.5f, lim = params.torso_limit_scale > 0.f;
+        const Quat Rh = Quat::from_axis_angle(up, yaw_), Rhi = Rh.conjugate();                  // heading frame -> world (the pelvis is upright, facing yaw_)
+        const float lens[3] = {D.spine[0], D.spine[1], D.spine[2]};
+        auto qyaw = [](float a) { return Quat::from_axis_angle(Vec3(0, 1, 0), a); };
+        auto qpit = [](float a) { return Quat::from_axis_angle(Vec3(1, 0, 0), -a); };
+        Vec3 sp[4]; Vec3 cup; torso_limited_ = 0.f; spine_framed_ = clav_framed_ = false;
+        Quat tw_[torso::kJoints];                                                               // (orientation mode) solved frames, heading frame
+        torso::Coord tc_[torso::kJoints];
+        auto place_spine = [&](const Quat* qh) {                                                // heading-frame spine frames -> world frames and joint positions
+            sp[0] = root;
+            for (int i = 0; i < 3; ++i) { spq_[i] = (Rh * qh[i]).normalized(); sp[i + 1] = sp[i] + spq_[i].rotate(Vec3(0, 1, 0)) * lens[i]; }
+            cup = spq_[2].rotate(Vec3(0, 1, 0)); spine_framed_ = true;
+        };
+        Quat qch[3];
+        if (orient) {
+            // ORIENTATION TARGETS (motion capture): the three spine frames, the neck, head and clavicles are given; limit each joint and rebuild the chain from the pelvis
+            Quat cn[2];
+            for (int s = 0; s < 2; ++s) { Vec3 d = Vec3(sg(s) * 0.97f, -0.12f, -0.08f).normalized(); cn[s] = frameQ(d, Vec3(0, 0, 1)); }   // the engine's clavicle rest frame, chest coordinates
+            torso_limited_ = torso::solve_orientation(torso_in_q_, cn, params.torso_limit_scale, tw_, tc_);
+            for (int i = 0; i < 3; ++i) qch[i] = tw_[i];
+            place_spine(qch);
+            torso_energy_ = (torso::spine_energy([&] { torso::SpinePose q; for (int j = 0; j < 3; ++j) { q.x[3 * j] = tc_[j].flex; q.x[3 * j + 1] = tc_[j].lat; q.x[3 * j + 2] = tc_[j].twist; } return q; }()) * 9.f
+                             + torso::joint_energy(0, tc_[torso::Neck]) * 3.f + torso::joint_energy(1, tc_[torso::Head]) * 3.f) / 15.f;
+            if (torso_limited_ > 0.087f && !torso_warned_) { event("torso orientation limited by a joint range (spine / neck / head / clavicle limits fitted to motion capture)"); torso_warned_ = true; }
+            spine_pose_ = [&] { torso::SpinePose q; for (int j = 0; j < 3; ++j) { q.x[3 * j] = tc_[j].flex; q.x[3 * j + 1] = tc_[j].lat; q.x[3 * j + 2] = tc_[j].twist; } return q; }();
+        } else if (prior) {
+            // POSE PRIOR: the spine takes the pose real people take to put the neck base where it is wanted: the natural S-curve when it is straight above the pelvis
+            Vec3 t = (torso_user_ ? torso_tgt_ - root : up * total + Vec3(lean_.x + head_dev_.x, 0.f, lean_.z + head_dev_.z));
+            float l = t.length(); if (l < 1e-4f) t = up * total, l = total;
+            Vec3 dir = t * (1.f / l);
+            if (dir.y < std::cos(55.f * PI / 180.f)) { Vec3 hz(dir.x, 0, dir.z); hz = hz.normalized(); dir = up * std::cos(55.f * PI / 180.f) + hz * std::sin(55.f * PI / 180.f); }
+            // the natural S-curve is not perfectly straight, so "upright" is a little shorter than the sum of the bones: aim at the natural neck base when the wish is upright
+            torso::SpinePose nat = torso::spine_mean(); Quat nq[3]; Vec3 nat_pos = torso::spine_fk(nat, lens, nq);
+            float reach = std::min(l, 0.995f * total); Vec3 goal = Rhi.rotate(dir * reach);
+            if (!torso_user_ && std::fabs(lean_.x + head_dev_.x) + std::fabs(lean_.z + head_dev_.z) < 1e-5f) goal = nat_pos;
+            else if (goal.length() > nat_pos.length() + 1e-4f && !torso_user_) goal = goal * (nat_pos.length() / goal.length());
+            else if (torso_user_ && tracking_) goal = Rhi.rotate(dir) * nat_pos.length();       // a tracked clip's neck-base target carries the trunk's LEAN, not its length: the capture skeleton's
+                                                                                                //  trunk is another length (about 0.35 m above the pelvis against this body's 0.48), and a real trunk's chord stays nearly constant as it bends
+            float tw = init ? chest_twist_ : hl_chest_ + chest_twist_;
+            spine_pose_ = torso::solve_spine(goal, tw, lens, params.torso_limit_scale, params.torso_stiffness, init ? &nat : &spine_pose_, &torso_resid_);
+            for (int i = 0; i < 3; ++i) qch[i] = torso::from_coord({0, 0, 0});                    // (filled below)
+            { Quat qq[3]; torso::spine_fk(spine_pose_, lens, qq); for (int i = 0; i < 3; ++i) qch[i] = qq[i]; }
+            place_spine(qch);
+            torso_energy_ = torso::spine_energy(spine_pose_);
+        } else {
+            Vec3 t = (torso_user_ ? torso_tgt_ - root : up * total + Vec3(lean_.x + head_dev_.x, 0.f, lean_.z + head_dev_.z) );
+            float l = t.length(); if (l < 1e-4f) t = up * total, l = total;
+            Vec3 dir = t * (1.f / l);
+            if (dir.y < std::cos(55.f * PI / 180.f)) { Vec3 hz(dir.x, 0, dir.z); hz = hz.normalized(); dir = up * std::cos(55.f * PI / 180.f) + hz * std::sin(55.f * PI / 180.f); }
+            solve_fabrik(spine_, root + dir * std::min(l, 0.995f * total), 1e-3f, 8);
+            spine_.world_positions(sp);
+            cup = (sp[3] - sp[2]).normalized(); if (cup.length_sq() < 0.5f) cup = up;
+        }
         // head look (relative to the chest frame)
         Vec3 headc = sp[3] + cup * (D.neck + D.head * 0.5f);
         float lyaw = 0, lpitch = 0, chest_yaw = yaw_;
-        if (look_user_) {
+        if (look_user_ && !orient) {
             Vec3 d = (look_tgt_ - headc).normalized();
             float hz = std::hypot(d.x, d.z), hw = clampf((hz - 0.05f) / 0.35f, 0.f, 1.f);       // gaze almost straight up/down: its heading is meaningless, keep the current one
             float gy = std::atan2(d.x, d.z); chest_yaw = yaw_ + hw * clampf(0.35f * wrap(gy - yaw_), -0.44f, 0.44f);
@@ -1166,18 +1239,32 @@ private:
             if ((std::fabs(lyaw) > ym || lpitch > pu || lpitch < pd) && !look_warned_) { event("LOOK limited by neck range (75 deg turn, +50/-55 deg tilt); the body must turn to look further"); look_warned_ = true; }
             lyaw = clampf(lyaw, -ym, ym); lpitch = clampf(lpitch, pd, pu);
         }
-        {   // head and gaze have inertia: a LOOK target is chased by a critically damped spring instead of snapping like a camera
+        if (!orient) {   // head and gaze have inertia: a LOOK target is chased by a critically damped spring instead of snapping like a camera
             float co = chest_yaw - yaw_;
             if (init || dt <= 0.f || params.head_turn_omega <= 0.f) { hl_chest_ = co; hl_yaw_ = lyaw; hl_pitch_ = lpitch; hl_vchest_ = hl_vyaw_ = hl_vpitch_ = 0.f; }
             else { damp1(hl_chest_, hl_vchest_, co, 0.7f * params.head_turn_omega, dt); damp1(hl_yaw_, hl_vyaw_, lyaw, params.head_turn_omega, dt); damp1(hl_pitch_, hl_vpitch_, lpitch, params.head_turn_omega, dt); }
             chest_yaw = yaw_ + hl_chest_ + chest_twist_; lyaw = hl_yaw_; lpitch = hl_pitch_;
+        } else { hl_chest_ = hl_yaw_ = hl_pitch_ = hl_vchest_ = hl_vyaw_ = hl_vpitch_ = 0.f; }
+        if (!orient && prior) {   // the chest turn is now known: share it among the three spine joints (those that twist most in real people take most), keeping the neck base where it is
+            torso::SpinePose ps = torso::solve_spine([&] { Quat qq[3]; return torso::spine_fk(spine_pose_, lens, qq); }(), wrap(chest_yaw - yaw_), lens, params.torso_limit_scale, params.torso_stiffness, &spine_pose_, &torso_resid_);
+            spine_pose_ = ps; Quat qq[3]; torso::spine_fk(spine_pose_, lens, qq); for (int i = 0; i < 3; ++i) qch[i] = qq[i];
+            place_spine(qch); torso_energy_ = torso::spine_energy(spine_pose_);
         }
-        Quat qc = frameQ(cup, fwd(chest_yaw)); chest_q_ = qc;
-        auto qyaw = [](float a) { return Quat::from_axis_angle(Vec3(0, 1, 0), a); };
-        auto qpit = [](float a) { return Quat::from_axis_angle(Vec3(1, 0, 0), -a); };
-        Quat qn = qc * qyaw(lyaw * 0.4f) * qpit(lpitch * 0.4f), qh = qc * qyaw(lyaw) * qpit(lpitch);
-        neck_q_ = qn; head_q_ = qh;
-        neck_tip_ = sp[3] + qn.rotate(Vec3(0, 1, 0)) * D.neck; head_tip_ = neck_tip_ + qh.rotate(Vec3(0, 1, 0)) * D.head;
+        Quat qc = spine_framed_ ? spq_[2] : frameQ(cup, fwd(chest_yaw)); chest_q_ = qc;
+        if (orient) {
+            neck_q_ = (Rh * tw_[torso::Neck]).normalized(); head_q_ = (Rh * tw_[torso::Head]).normalized();
+            for (int s = 0; s < 2; ++s) clav_q_[s] = (Rh * tw_[torso::ClavL + s]).normalized();
+            clav_framed_ = true;
+        } else {
+            Quat Rt = qyaw(lyaw) * qpit(lpitch), N0 = qyaw(lyaw * 0.4f) * qpit(lpitch * 0.4f);
+            if (lim && prior) {   // the head and neck share the gaze within THEIR ranges (the head turns about 26 degrees on its own, the neck takes the rest)
+                torso::Coord hc = torso::to_coord(N0.conjugate() * Rt); float m1 = torso::clamp_limits(torso::Head, hc, params.torso_limit_scale); Quat H = torso::from_coord(hc);
+                torso::Coord nc = torso::to_coord(Rt * H.conjugate()); float m2 = torso::clamp_limits(torso::Neck, nc, params.torso_limit_scale);
+                Quat N = torso::from_coord(nc); torso_limited_ = std::max({torso_limited_, m1, m2});
+                neck_q_ = (qc * N).normalized(); head_q_ = (qc * N * H).normalized();
+            } else { neck_q_ = qc * N0; head_q_ = qc * Rt; }
+        }
+        neck_tip_ = sp[3] + neck_q_.rotate(Vec3(0, 1, 0)) * D.neck; head_tip_ = neck_tip_ + head_q_.rotate(Vec3(0, 1, 0)) * D.head;
         head_center_ = (neck_tip_ + head_tip_) * 0.5f;
         for (int i = 0; i < 4; ++i) sp_[i] = sp[i];
         // clavicles + arms
@@ -1186,7 +1273,8 @@ private:
             float g = sg(s);
             Vec3 attach = sp[3] + X * (g * D.clav_attach);
             Vec3 rest = (X * (g * 0.97f) + Y * -0.12f + Z * -0.08f).normalized(), cd = rest;
-            if (hands_[s].target_mode && hands_[s].has_cmd) {
+            if (clav_framed_) cd = clav_q_[s].rotate(Vec3(0, 1, 0));                     // a captured clavicle: its own direction (hands still reach by the arm, not by the clavicle)
+            else if (hands_[s].target_mode && hands_[s].has_cmd) {
                 Vec3 toh = (hands_[s].cmd - attach).normalized();
                 if (toh.length_sq() > 0.5f) cd = clamp_to_cone((rest * 0.7f + toh * 0.3f).normalized(), rest, std::cos(30.f * PI / 180.f), std::sin(30.f * PI / 180.f));
             }
@@ -1236,12 +1324,15 @@ private:
         Vec3 up(0, 1, 0), pf = fwd(hyaw());
         put(0, pelvis_, pelvis_ + up * D.pelvis_bone, pf);
         Vec3 zc = chest_q_.rotate(Vec3(0, 0, 1)), Xc = chest_q_.rotate(Vec3(1, 0, 0));
-        for (int i = 0; i < 3; ++i) { float k = (i + 1) / 3.f; put(1 + i, sp_[i], sp_[i + 1], pf * (1.f - k) + zc * k); }
+        for (int i = 0; i < 3; ++i) {
+            if (spine_framed_) { bones_[1 + i].head = sp_[i]; bones_[1 + i].tail = sp_[i + 1]; bones_[1 + i].q = spq_[i]; }        // the solved frames: real twist and side bend
+            else { float k = (i + 1) / 3.f; put(1 + i, sp_[i], sp_[i + 1], pf * (1.f - k) + zc * k); }
+        }
         put(4, sp_[3], neck_tip_, neck_q_.rotate(Vec3(0, 0, 1)));
         put(5, neck_tip_, head_tip_, head_q_.rotate(Vec3(0, 0, 1)));
         for (int s = 0; s < 2; ++s) {
             float g = sg(s);
-            put(I.clav[s], clav_attach_[s], shoulder_[s], zc);
+            put(I.clav[s], clav_attach_[s], shoulder_[s], clav_framed_ ? clav_q_[s].rotate(Vec3(0, 0, 1)) : zc);
             Vec3 pole = (zc * -0.6f + Xc * (g * 0.25f) + Vec3(0, -1, 0));
             put(I.upper[s], shoulder_[s], elbow_[s], -pole); put(I.fore[s], elbow_[s], wrist_[s], -pole);
             Vec3 f = (wrist_[s] - elbow_[s]).normalized(), n = -Xc * g;                 // palm faces the body at rest
