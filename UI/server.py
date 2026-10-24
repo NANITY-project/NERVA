@@ -447,15 +447,17 @@ def train_cvqvae_mod():
     return S.tc
 
 
-def load_pt(path):
+def load_pt(path, trust=False):
     torch = torch_mod()
+    if trust:                                            # the user confirmed this file in the UI
+        return torch.load(path, map_location="cpu", weights_only=False)
     try:
         return torch.load(path, map_location="cpu", weights_only=True)
     except Exception as e:
         if ARGS.trust_pickle:
             return torch.load(path, map_location="cpu", weights_only=False)
-        raise RuntimeError(f"torch.load(weights_only=True) refused {os.path.basename(path)} ({type(e).__name__}). If you made this file yourself, "
-                           f"start the server with --trust-pickle.")
+        raise RuntimeError(f"torch.load(weights_only=True) refused {os.path.basename(path)} ({type(e).__name__}). "
+                           f"It needs full unpickling, so only trust it if you made it yourself.")
 
 
 def get_engine():
@@ -517,7 +519,7 @@ def load_exporter(name):
     return ex
 
 
-def handle_upload(path, fname):
+def handle_upload(path, fname, trust=False):
     """Classify and load one dropped file. Returns a dict for the UI."""
     with open(path, "rb") as f:
         magic = f.read(4)
@@ -525,7 +527,7 @@ def handle_upload(path, fname):
         cfg, names, dt = gguf_meta(path)
         set_vae(cfg, names, dt, path, fname)
         return dict(kind="vae", file=fname, note="GGUF used as is")
-    ck = load_pt(path)
+    ck = load_pt(path, trust)
     if not isinstance(ck, dict) or "model" not in ck or "cfg" not in ck:
         raise RuntimeError(f"{fname} is not a train_cvqvae.py checkpoint (expected a dict with 'model' and 'cfg').")
     if "norm" in ck:                                     # ---- VAE
@@ -720,7 +722,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             try:
                 with LOCK:
                     S.gen_id += 1                         # stop any running generation: the models are changing
-                    info = handle_upload(path, fname)
+                    info = handle_upload(path, fname, q.get("trust") == "1")
                 self._json(dict(ok=True, info=info, status=status()))
             except Exception as e:
                 log(f"upload {fname} failed: {e}")
