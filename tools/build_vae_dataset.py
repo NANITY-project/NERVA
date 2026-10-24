@@ -5,12 +5,12 @@ build_vae_dataset.py - start everything and build the training set for the motio
   python tools/build_vae_dataset.py                          # ~10 h of motion into data/vae  (make vae-data does the same)
   python tools/build_vae_dataset.py --hours 30               # more, mostly more variants (see the honest note below)
   python tools/build_vae_dataset.py --hours 0.3 --out /tmp/v # a quick smoke run (about a minute)
-  python tools/build_vae_dataset.py --no-cmu                 # engine + your own stored motions only (no real CMU data in the set)
+  python tools/build_vae_dataset.py --include-cmu            # opt-in: ALSO use the real CMU clips (and variants of them) as training sources; off by default
   python tools/build_vae_dataset.py --no-engine              # no compiler / engine: memory only
   python tools/view_clip.py data/vae/preview.npz --open      # look at a random sample of what it made
 
 What it does, in order (each step prints what it did and how long it took)
-  1. real CMU motions   downloads them the first time (data/real_motions.npz); they are the grader's yardstick, and, unless --no-cmu, also source motions
+  1. real CMU motions   downloads them the first time (data/real_motions.npz); they are the grader's yardstick only: unless --include-cmu they are NOT training sources (the training set is engine clips plus the motions you stored in the memory, e.g. CC BY sets)
   2. memory             opens data/memory (tools/motion_memory.py) and, if empty, seeds it with every CMU example (kind known, origin cmu)
   3. engine clips       builds the engine, generates --engine-clips walking clips, drops the ones the engine's own verdict rejects, stores the ones that pass the grader gates
   4. split              (exact duplicate CMU clips are dropped first) by SOURCE (CMU: by performer; engine/user: by clip) into train and validation: a variant never lands in a different split than its source
@@ -26,7 +26,7 @@ Channel layout (30): see CHANNELS in this file and stats.json. Flags (contact / 
 HONEST NOTES (also in report.txt, with the numbers of this run)
   * The engine can only generate walking so far. Everything else in the set (sit, run, jump, ...) is derived from the real CMU clips, which the ENGINE REJECTS (the report
     prints the measured share: balance lost, planted feet slide; a retargeting / contact-flag problem of bvh_to_clip.py, not of the grader). They are graded by the
-    CMU-based grader, not verified by the engine. engine_ok in each record says which is which. --no-cmu gives a set the engine can vouch for, but only walking.
+    CMU-based grader, not verified by the engine. engine_ok in each record says which is which. Without --include-cmu (the default) the set is what the engine can vouch for, plus your stored motions: walking from the engine, other actions only if you add them.
   * Variants are the same motion performed differently. 10 h built from 1 h of sources is 1 h of information at ten times the weight. For an 80M-parameter model the report
     prints the number of training values per parameter: expect memorisation unless you use dropout / KL weight / early stopping on the validation split, and treat
     the validation loss (original clips from performers it never saw) as the only honest measure.
@@ -63,12 +63,13 @@ def main():
     ap.add_argument("--hours", type=float, default=10.0, help="training motion to build, in hours (originals + variants); default 10")
     ap.add_argument("--out", default="data/vae"); ap.add_argument("--memory", default=MM.DEFAULT_DIR); ap.add_argument("--real", default=G.REAL_DEFAULT)
     ap.add_argument("--engine-clips", type=int, default=1500, help="walking clips to ask the engine for (duplicates and infeasible ones are dropped)"); ap.add_argument("--no-engine", action="store_true")
-    ap.add_argument("--no-cmu", action="store_true", help="leave the real CMU clips out of the set (they stay the grader's yardstick)")
+    ap.add_argument("--include-cmu", action="store_true", help="also use the real CMU clips (and variants of them) as training sources. Off by default: CMU stays the grader's yardstick only")
+    ap.add_argument("--no-cmu", action="store_true", help=argparse.SUPPRESS)      # old name, now the default; accepted so old command lines still work
     ap.add_argument("--val", type=float, default=0.08, help="share of the source frames held out for validation (CMU: whole performers, for all actions at once; engine/user: single clips)")
     ap.add_argument("--window", type=int, default=64); ap.add_argument("--stride", type=int, default=32); ap.add_argument("--no-windows", action="store_true"); ap.add_argument("--no-jsonl", action="store_true")
     ap.add_argument("--balance", type=float, default=0.5, help="a name's share of the set ~ (its number of sources) ** balance; 1 = as in the sources, 0 = every name equal")
     ap.add_argument("--uncommon", type=float, default=0.12); ap.add_argument("--seed", type=int, default=0); ap.add_argument("--try-factor", type=float, default=8.0, help="give up on a name after this many tries per wanted variant")
-    a = ap.parse_args(); os.makedirs(a.out, exist_ok=True); rng = np.random.default_rng(a.seed)
+    a = ap.parse_args(); a.no_cmu = not a.include_cmu; os.makedirs(a.out, exist_ok=True); rng = np.random.default_rng(a.seed)
 
     # 1 ------------------------------------------------------------------------------------------------------------ real data + grader
     zr, RF = G.load_real(a.real); prof = G.Profiles(RF, zr["action"]); dt = float(zr["dt"])
@@ -104,7 +105,7 @@ def main():
     if dup:
         keep = [i for i in keep if i not in dup]; log(f"dropped {len(dup)} CMU clips that are exact duplicates of another performer's clip (the copy stays out of both splits)")
     if not keep:
-        sys.exit("nothing to build from: the memory is empty (drop --no-cmu / --no-engine, or add motions)")
+        sys.exit("nothing to build from: the memory is empty (add motions to the memory with tools/motion_memory.py add, leave out --no-engine, or opt in to CMU sources with --include-cmu)")
     name = {i: mem.entries[i]["name"] for i in keep}; origin = {i: mem.entries[i].get("origin", "user") for i in keep}; nfr = {i: len(mem.clips[i]) for i in keep}
 
     # 4 ------------------------------------------------------------------------------------------------------------ split by source group
