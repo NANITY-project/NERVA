@@ -24,3 +24,9 @@ neon_bridge.log
 data/
 
 UI/.cache/
+
+# Real motion-capture clips exported with `tools/export_headers.py --with-clips` (CMU data: never commit or publish).
+# The grader profiles, the core header and the index header stay tracked.
+include/motion/nerva_motion_*.hpp
+!include/motion/nerva_motion_core.hpp
+!include/motion/nerva_motion_profiles.hpp
