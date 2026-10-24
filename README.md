@@ -64,13 +64,6 @@ python3 nerva_bridge.py \
 - Episodes are written to `rollouts.jsonl` in the training format of [docs/ACTIONS.md](docs/ACTIONS.md#7-training-data-episodes); lint them with `python3 overlay/tools/nerva_actions.py lint rollouts.jsonl`.
 - The pointer is `dry-run` by default (`--session-args "--a11y --mouse --pointer dry-run"`). Real clicks need `--pointer` set to the real backend **and** a window granted by you with `nerva-overlay --ctl grant`; the model cannot grant.
 
-## Known issues
-
-- `make body-test` currently reports **147 passed, 1 failed**: `src/body_test.cpp:182` expects the refusal for a 70 cm step up to contain `step up of`,
-  but `include/ik_body.hpp` now says `lifting the foot 0.70 m is higher than the leg can go (max 0.60 m)`. Not investigated yet; `make test-all` stops at this check until it is resolved.
-- `overlay/` clicks have only been exercised with the dry-run pointer, a fake Hyprland socket and headless Sway; real `/dev/uinput` and real Hyprland are unverified.
-- The Q4_0/Q8_0 NEON GEMM paths are outside this repo; see the NEON repo for their status.
-
 ## Safety model, in one paragraph
 
 Everything the model can do is the action list in [docs/ACTIONS.md](docs/ACTIONS.md). It cannot type, press keys, drag, grant itself access, or
