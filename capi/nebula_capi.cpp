@@ -122,7 +122,8 @@ int nebula_body_set_param(NebulaBody* h, const char* k, float v) {
         {"max_step_up", &p.max_step_up, 0.f, 1.f}, {"max_step_down", &p.max_step_down, 0.f, 2.f}, {"fall_margin", &p.fall_margin, -1.f, 0.f},
         {"fall_time", &p.fall_time, 0.f, 5.f}, {"shift_settle_speed", &p.shift_settle_speed, 0.f, 1e9f},
         {"recover_time", &p.recover_time, 0.f, 60.f}, {"arm_swing_gain", &p.arm_swing_gain, 0.f, 2.f}, {"twist_gain", &p.twist_gain, 0.f, 1.f}, {"head_turn_omega", &p.head_turn_omega, 0.f, 100.f},
-        {"leg_len_frac", &p.leg_len_frac, 0.8f, 0.999f}, {"step_ds_time", &p.step_ds_time, 0.02f, 0.5f}, {"swing_reach_slack", &p.swing_reach_slack, 0.f, 0.15f}};
+        {"leg_len_frac", &p.leg_len_frac, 0.8f, 0.999f}, {"step_ds_time", &p.step_ds_time, 0.02f, 0.5f}, {"swing_reach_slack", &p.swing_reach_slack, 0.f, 0.15f},
+        {"torso_prior", &p.torso_prior, 0.f, 1.f}, {"torso_limit_scale", &p.torso_limit_scale, 0.f, 2.f}, {"torso_stiffness", &p.torso_stiffness, 0.05f, 20.f}};
     for (auto& e : t) if (!std::strcmp(e.n, k)) { *e.f = std::min(std::max(v, e.lo), e.hi); return 1; }
     return 0;
 }
@@ -189,6 +190,30 @@ int nebula_body_replay_clip(NebulaBody* h, const float* a, int n, float dt, floa
         }
     });
 }
+
+/* ---- torso (ABI v3, additive): orientation targets, limits, prior. torso = n * 28 floats, per frame the 7 bones' quaternions (w,x,y,z). */
+int nebula_body_torso_dim(void) { return 4 * ik::torso::kJoints; }
+int nebula_body_track_clip_torso(NebulaBody* h, const float* a, const float* torso, int n, float dt, float* reports, float* states) {
+    if (!h || !a || !torso || n <= 0) return -1;
+    return h->b.track_clip(a, n, dt, reports, states, torso);
+}
+int nebula_body_replay_clip_torso(NebulaBody* h, const float* a, const float* torso, int n, float dt, float* reports, float* states, float* bones, float* torso_stats) {
+    if (!h || !a || n <= 0) return -1;
+    const size_t nb = h->b.bones().size();
+    return h->b.track_clip_each(a, n, dt, reports, states, [&](int i) {
+        if (torso_stats) { torso_stats[2 * i] = h->b.torso_limited(); torso_stats[2 * i + 1] = h->b.torso_energy(); }
+        if (!bones) return;
+        const auto& bs = h->b.bones(); float* base = bones + (size_t)i * nb * 10;
+        for (size_t k = 0; k < nb; ++k) {
+            float* o = base + 10 * k;
+            o[0] = bs[k].head.x; o[1] = bs[k].head.y; o[2] = bs[k].head.z; o[3] = bs[k].tail.x; o[4] = bs[k].tail.y; o[5] = bs[k].tail.z;
+            o[6] = bs[k].q.w; o[7] = bs[k].q.x; o[8] = bs[k].q.y; o[9] = bs[k].q.z;
+        }
+    }, torso);
+}
+/* Per-frame limit violation (radians; 0 = none) and prior energy of the LAST tracked frame. */
+float nebula_body_torso_limited(NebulaBody* h) { return h ? h->b.torso_limited() : 0.f; }
+float nebula_body_torso_energy(NebulaBody* h) { return h ? h->b.torso_energy() : 0.f; }
 void nebula_body_track_end(NebulaBody* h) { if (h) h->b.track_end(); }
 void nebula_body_reset(NebulaBody* h) { if (h) { ik::Body::Params p = h->b.params; h->b.~Body(); new (&h->b) ik::Body(p); } }
 
