@@ -183,11 +183,11 @@ body.running #go{display:none}body:not(.running) #stop{display:none}
 body.dragging #over{opacity:1;visibility:visible;transition:opacity .3s}
 
 /* guide */
-#guide{position:fixed;inset:0;z-index:80;display:flex;align-items:center;justify-content:center;padding:24px;background:rgba(0,0,0,.45);backdrop-filter:blur(6px);
+#guide,.modal-bg{position:fixed;inset:0;z-index:80;display:flex;align-items:center;justify-content:center;padding:24px;background:rgba(0,0,0,.45);backdrop-filter:blur(6px);
   opacity:0;visibility:hidden;transition:opacity .4s var(--ease),visibility 0s .4s}
-#guide.open{opacity:1;visibility:visible;transition:opacity .4s var(--ease)}
-#guide .sheet{width:min(780px,100%);max-height:100%;overflow-y:auto;border-radius:var(--radius-lg);padding:28px 30px 30px;transform:translateY(16px) scale(.98);transition:transform .6s var(--ease)}
-#guide.open .sheet{transform:none}
+#guide.open,.modal-bg.open{opacity:1;visibility:visible;transition:opacity .4s var(--ease)}
+#guide .sheet,.modal-bg .sheet{width:min(780px,100%);max-height:100%;overflow-y:auto;border-radius:var(--radius-lg);padding:28px 30px 30px;transform:translateY(16px) scale(.98);transition:transform .6s var(--ease)}
+#guide.open .sheet,.modal-bg.open .sheet{transform:none}
 .sheet .head{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:22px}
 .sheet h2{font:300 34px/1 var(--serif);letter-spacing:.02em}
 .sheet .x{background:none;border:0;color:var(--dim);font-size:10px;letter-spacing:.2em;text-transform:uppercase;padding:6px 8px;transition:color .25s}
@@ -202,6 +202,14 @@ body.dragging #over{opacity:1;visibility:visible;transition:opacity .3s}
 .sw.l{background:#e03a3a}.sw.rr{background:var(--ivory)}.sw.code{background:hsla(350,75%,45%,.8);border-radius:3px}.sw.live{border:1px solid var(--red-glow);border-radius:3px;box-shadow:0 0 6px rgba(224,58,58,.7)}.sw.ent{height:2px;width:14px;border-radius:2px;background:var(--red-hi)}
 kbd{font:10px var(--mono);border:1px solid var(--glass-border);border-radius:4px;padding:1px 6px;margin-right:6px;color:var(--ivory)}
 .keys{display:grid;grid-template-columns:repeat(3,1fr);gap:8px 20px;color:var(--dim);font-size:11px}
+
+
+/* trust prompt */
+#trust .sheet{width:min(440px,100%);padding:26px 28px 24px}
+#trust h2{font-size:30px;margin-bottom:12px}
+#trust p{color:var(--dim);font-size:11.5px;margin-bottom:6px}
+#trust p b{color:var(--ivory);font-weight:400;word-break:break-all}
+#trust .acts{display:flex;gap:10px;justify-content:flex-end;margin-top:22px}
 
 @media (max-width:900px){
   .chips{display:none}
@@ -348,6 +356,15 @@ kbd{font:10px var(--mono);border:1px solid var(--glass-border);border-radius:4px
   </div>
 </div>
 
+<div id="trust" class="modal-bg" role="alertdialog" aria-modal="true" aria-label="Trust this file">
+  <div class="sheet glass">
+    <h2>Trust this file?</h2>
+    <p><b id="trustName"></b> holds Python objects that PyTorch will not load safely.</p>
+    <p>Only continue if you made this file yourself. Loading runs code from the file.</p>
+    <div class="acts"><button class="btn quiet" id="trustNo">Cancel</button><button class="btn main" id="trustYes">Trust and load</button></div>
+  </div>
+</div>
+
 <script>
 'use strict';
 const $ = id => document.getElementById(id);
@@ -433,14 +450,30 @@ addEventListener('drop', e => { e.preventDefault(); dragDepth = 0; document.body
 $('drop').onclick = () => $('file').click();
 $('file').onchange = e => { upload([...e.target.files]); e.target.value = ''; };
 
+function askTrust(name){
+  return new Promise(res => {
+    $('trustName').textContent = name; const m = $('trust'); m.classList.add('open');
+    const done = v => { m.classList.remove('open'); $('trustYes').onclick = $('trustNo').onclick = null; res(v); };
+    $('trustYes').onclick = () => done(true); $('trustNo').onclick = () => done(false);
+  });
+}
+const needsTrust = msg => /trust-pickle|UnpicklingError|weights_only/i.test(msg || '');
+async function post(f, trust){
+  const r = await fetch('/api/upload?name=' + encodeURIComponent(f.name) + (trust ? '&trust=1' : ''), {method: 'POST', body: f});
+  return r.json();
+}
 async function upload(files){
   stopGen();
   files.sort((a, b) => /prior/i.test(a.name) - /prior/i.test(b.name));
   for (const f of files){
     log(`uploading ${f.name} (${(f.size/1e6).toFixed(1)} MB)…`);
     try{
-      const r = await fetch('/api/upload?name=' + encodeURIComponent(f.name), {method: 'POST', body: f});
-      const j = await r.json(); ST = j.status;
+      let j = await post(f, false);
+      if (!j.ok && needsTrust(j.error)){
+        if (await askTrust(f.name)){ log(`trusting ${f.name}…`); j = await post(f, true); }
+        else { log(`skipped ${f.name}`); continue; }
+      }
+      ST = j.status || ST;
       if (j.ok) log(`✓ ${j.info.kind}: ${j.info.file}${j.info.note ? ' (' + j.info.note + ')' : ''}`);
       else { log('✗ ' + j.error); setCtl(true); note('errbox', f.name + ': ' + j.error); }
     }catch(err){ log('✗ upload failed: ' + err); }
@@ -468,7 +501,7 @@ document.querySelectorAll('[data-v]').forEach(b => b.onclick = () => {
 $('seek').oninput = () => { playhead = +$('seek').value; playing = false; $('play').textContent = 'play'; };
 $('grid').addEventListener('wheel', e => { if (Math.abs(e.deltaY) > Math.abs(e.deltaX)){ $('grid').scrollLeft += e.deltaY; e.preventDefault(); } }, {passive: false});
 addEventListener('keydown', e => {
-  if (e.key === 'Escape'){ setGuide(false); setCtl(false); return; }
+  if (e.key === 'Escape'){ if ($('trust').classList.contains('open')){ $('trustNo').click(); return; } setGuide(false); setCtl(false); return; }
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT' || e.target.tagName === 'BUTTON' || e.metaKey || e.ctrlKey || e.altKey) return;
   if (e.code === 'Space'){ $('play').onclick(); e.preventDefault(); }
   else if (e.key === 'c' || e.key === 'C') $('ctlBtn').click();
