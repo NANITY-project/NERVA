@@ -18,9 +18,10 @@ What runs where
            from the 30 action channels instead.
 
 Needs: python3, numpy, torch (only to read .pt files), gguf (the exporter), and the NANITY-NEON checkout
+(if torch/gguf are missing when you drop a .pt, the page lists the Python environments it found - .venv, conda, ... - or makes a new .venv and installs them, then restarts itself; see torch_env.py)
 (found next to this repo, or set NEON_DIR; cloned into UI/.cache if missing, unless --no-clone). A C++ compiler for libnebula / cvqvae_cli.
 """
-import argparse, base64, ctypes, glob, http.server, importlib.util, json, math, os, shutil, subprocess, sys, threading, time, urllib.parse, webbrowser
+import argparse, base64, ctypes, faulthandler, glob, http.server, importlib.util, json, math, os, shutil, subprocess, sys, threading, time, urllib.parse, webbrowser
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -31,8 +32,11 @@ UPLOADS = os.path.join(CACHE, "uploads")
 NCH = 30
 FLAGS = [8, 13, 17, 21, 25, 29]
 NEON_REPO_URL = "https://github.com/NANITY-project/NANITY-NEON.git"
+sys.path.insert(0, HERE)
+import torch_env                      # finds / creates a Python environment with torch (UI/torch_env.py)
 
 ARGS = None
+BOOT = time.time()                      # changes on every (re)start: the page uses it to see that the server came back
 LOG = []
 LOCK = threading.RLock()
 
@@ -425,9 +429,25 @@ class State:
         self.engine_err = None
         self.gen_id = 0
         self.tc = None         # train_cvqvae module (canonicalize / to_world / YAWS)
+        self.pending = []      # dropped files that could not be read yet (no torch); reloaded after the restart into the chosen environment
+        self.env_job = torch_env.Job()
+        self.env_scan = []     # last scan of environments: only these interpreters may be used by /api/env/start
+        self.env_new_venv = None
 
 
 S = State()
+
+
+class NeedEnv(RuntimeError):
+    """The Python running this server lacks packages the dropped file needs. The page then offers environments to use or create (torch_env.py)."""
+
+    def __init__(self, missing, fname=None):
+        self.missing, self.fname = list(missing), fname
+        super().__init__("this Python (" + sys.executable + ") has no " + " / ".join(self.missing) + ", which this file needs")
+
+
+def missing_modules(*mods):
+    return [m for m in mods if importlib.util.find_spec(m) is None]
 
 
 def torch_mod():
@@ -435,7 +455,7 @@ def torch_mod():
         import torch
         return torch
     except ImportError:
-        raise RuntimeError("PyTorch is needed to read .pt files: pip install torch (CPU build is enough)")
+        raise NeedEnv(["torch"])
 
 
 def train_cvqvae_mod():
@@ -523,6 +543,13 @@ def handle_upload(path, fname, trust=False):
     """Classify and load one dropped file. Returns a dict for the UI."""
     with open(path, "rb") as f:
         magic = f.read(4)
+    need = missing_modules("gguf") if magic == b"GGUF" else missing_modules("torch", "gguf")
+    if need:                                              # remember the file: it is loaded again after the restart into the chosen environment
+        if fname not in S.pending:
+            S.pending.append(fname)
+        raise NeedEnv(need, fname)
+    if fname in S.pending:
+        S.pending.remove(fname)
     if magic == b"GGUF":
         cfg, names, dt = gguf_meta(path)
         set_vae(cfg, names, dt, path, fname)
@@ -582,6 +609,7 @@ def status():
     return dict(
         vae=None if not v else dict(file=v["file"], window=v["cfg"]["window"], codes=v["cfg"]["num_codes"], downs=v["cfg"]["downs"], dt=v["dt"], backend=S.session.name if S.session else "—"),
         prior=None if not p else dict(backend="NEON" if S.native_prior else "numpy", file=S.prior_file, params=p.params, K=p.K, n=p.n, windows=p.windows, stride=p.stride, layers=len(p.L), d=p.d),
+        torch=not missing_modules("torch"), python=sys.executable, boot=BOOT, pending=list(S.pending),
         actions=names, neon_dir=S.neon_dir, engine=bool(S.engine), engine_error=S.engine_err, warnings=warn, ready=bool(v and p and not warn), log=LOG[-12:])
 
 
@@ -671,6 +699,75 @@ def emit_frames(acts, start, dt, rp):
 
 
 # ================================================================================================================ HTTP
+# ================================================================================================================ python environment (torch)
+def env_info():
+    """Scan this machine for Python environments. Slow (it imports torch in each one that has it), so the page asks once and shows a spinner."""
+    S.env_scan = torch_env.scan(ROOT)
+    S.env_new_venv = torch_env.default_new_venv(ROOT)
+    need = missing_modules("torch", "gguf")
+    envs = []
+    for d in S.env_scan:
+        cmds = torch_env.plan(d["python"], d["missing"])[0] if d["missing"] and d["can_install"] else []
+        envs.append(dict(python=d["python"], label=d["label"], prefix=d["prefix"], version=d["version"], torch=d["torch"], numpy=d["numpy"], gguf=d["gguf"],
+                         ready=d["ready"], can_install=d["can_install"], missing=d["missing"], why_not=d.get("why_not", ""),
+                         current=os.path.abspath(d["python"]) == os.path.abspath(sys.executable), commands=[" ".join(c) for c in cmds]))
+    new_cmds = torch_env.plan(None, list(torch_env.NEEDED), new_venv=S.env_new_venv)[0]
+    return dict(python=sys.executable, missing=need, pending=list(S.pending), envs=envs, new_venv=S.env_new_venv,
+                new_commands=[" ".join(c) for c in new_cmds], job=S.env_job.snapshot())
+
+
+def env_restart(python):
+    """Job finished: restart this server under `python`; the dropped files are loaded again as soon as it is up."""
+    try:
+        with open(os.path.join(CACHE, "pending.json"), "w") as f:
+            json.dump(list(S.pending), f)
+    except OSError as e:
+        log(f"could not save the pending file list: {e}")
+    log(f"restarting under {python} ...")
+    if S.session:
+        S.session.close()
+    time.sleep(1.5)                                       # let the page read the final job state
+    torch_env.relaunch(python, os.path.abspath(__file__), sys.argv[1:])
+
+
+def env_start(body):
+    """Only an interpreter from the last scan, or the server-chosen new-venv path, can be used: a web page cannot name an arbitrary program to run."""
+    if body.get("new_venv"):
+        if not S.env_new_venv:
+            raise RuntimeError("scan first")
+        S.env_job.start(new_venv=S.env_new_venv, base_python=sys.executable, on_done=env_restart)
+        return
+    py = body.get("python", "")
+    if py not in {d["python"] for d in S.env_scan}:
+        raise RuntimeError("that interpreter was not in the scan")
+    S.env_job.start(python=py, on_done=env_restart)
+
+
+def load_pending():
+    """After a restart: read the files that were dropped before it (VAE first, prior last)."""
+    p = os.path.join(CACHE, "pending.json")
+    if not os.path.exists(p):
+        return
+    try:
+        with open(p) as f:
+            names = json.load(f)
+        os.remove(p)
+    except (OSError, ValueError):
+        return
+    names.sort(key=lambda n: "prior" in n.lower())
+    for n in names:
+        path = os.path.join(UPLOADS, os.path.basename(n))
+        if not os.path.isfile(path):
+            continue
+        try:
+            with LOCK:
+                S.gen_id += 1
+                info = handle_upload(path, os.path.basename(n))
+            log(f"loaded {n} after the restart ({info['kind']})")
+        except Exception as e:
+            log(f"could not load {n} after the restart: {e} (drop it again)")
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     server_version = "NERVA-UI/1"
 
@@ -701,6 +798,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(status())
         elif u.path == "/api/generate":
             self._sse(q)
+        elif u.path == "/api/env":
+            self._json(env_info())
+        elif u.path == "/api/env/job":
+            self._json(S.env_job.snapshot())
         else:
             self.send_error(404)
 
@@ -724,9 +825,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     S.gen_id += 1                         # stop any running generation: the models are changing
                     info = handle_upload(path, fname, q.get("trust") == "1")
                 self._json(dict(ok=True, info=info, status=status()))
+            except NeedEnv as e:
+                log(f"{fname}: {e}")
+                self._json(dict(ok=False, need_env=dict(missing=e.missing, file=fname), error=str(e), status=status()), 200)
             except Exception as e:
                 log(f"upload {fname} failed: {e}")
                 self._json(dict(ok=False, error=str(e), status=status()), 200)
+        elif u.path == "/api/env/start":
+            if self.headers.get("X-NERVA-UI") != "1":            # a custom header cannot be sent cross-origin without a preflight, which this server never answers
+                self.send_error(403)
+                return
+            try:
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0)) or 0) or b"{}")
+                env_start(body)
+                self._json(dict(ok=True))
+            except Exception as e:
+                self._json(dict(ok=False, error=str(e)))
         elif u.path == "/api/stop":
             S.gen_id += 1
             self._json(dict(ok=True))
@@ -772,7 +886,9 @@ def main():
     ap.add_argument("--trust-pickle", action="store_true", help="torch.load(weights_only=False) as a fallback; only for files you made yourself")
     ARGS = ap.parse_args()
     os.makedirs(CACHE, exist_ok=True)
-    threading.Thread(target=lambda: (get_engine(), None), daemon=True).start()     # build/load the engine while the page loads
+    faulthandler.enable(all_threads=True)                 # a native crash (libnebula, torch ...) prints the Python stack that was running instead of dying silently
+    threading.Thread(target=lambda: (get_engine(), None), daemon=True).start()
+    threading.Thread(target=load_pending, daemon=True).start()     # build/load the engine while the page loads
     srv = http.server.ThreadingHTTPServer((ARGS.host, ARGS.port), Handler)
     srv.daemon_threads = True
     url = f"http://{ARGS.host}:{ARGS.port}"
