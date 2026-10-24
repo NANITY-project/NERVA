@@ -14,8 +14,37 @@ A walk is a sequence of `FOOT` coordinates; reusable skills are built from those
   `none` = no help: lifting a foot with the weight centred, or leaning outside the feet, really falls.
 - **Falling** = state `fallen` + a reported cause (the pose is frozen; `STAND` resets it). No collapse animation yet.
 - **Arms**: clavicle assists reaches; hands reuse the tested engine (min-jerk, straight-ish paths, retarget without a snap).
-- **Head**: neck+head share a turn (limits 75° yaw, +50/−55° tilt, reported when clamped). Torso lean via the 3-bone spine.
+- **Head**: neck+head share a turn (limits 75° yaw, +50/−55° tilt, reported when clamped), each within its own fitted range. Torso: see **Torso** below.
 - **Feedback**: every refusal says why with numbers ("step too long (1.24 m, max 0.90 m)"); `status_json()` returns state + events.
+
+## Torso (`include/ik_torso.hpp`, `include/ik_torso_prior.hpp`)
+Spine (3 bones), neck, head and both clavicles are anatomical joints, each with three coordinates (`tools/torso_math.py` is the Python mirror):
+**flex** (the hinge, + = forward), **lat** (side bend, + = toward the body's right), **twist** (about the bone, + = left).
+1. **Orientation targets** — what a motion capture has. `Body.set_torso_targets(q)` / `track_clip(..., torso=)` / C `nebula_body_*_torso`: seven quaternions per
+   frame (spine1 spine2 spine3 neck head clavicle_L clavicle_R) in the pelvis *heading* frame. `tools/bvh_to_clip.py` saves them as `torso [F,7,4]`, read from the
+   BVH rotations of CMU's LowerBack / Spine / Spine1 / Neck / Neck1 / Head / shoulder joints (found by hierarchy, not by name). Orientations only, never positions:
+   scaled to the engine's legs the CMU trunk is ~0.35 m above the pelvis against the engine's 0.48 m, so positions do not transfer and rotations do.
+   The CMU head joint is not calibrated across performers (walking head tilt 3–35° between people, the neck chord says 4–11°), so the head axis is calibrated per
+   file against the neck chord; its motion relative to the neck is untouched.
+2. **Joint limits** — per joint hinge, side-bend and twist ranges, fitted to real people (`tools/fit_torso_prior.py`, 0.2/99.8 percentile + margin, anatomical caps,
+   lying-down clips excluded). A joint asked past its limit stops there, the error goes up the chain, `torso_limited()` says by how much and an event is raised.
+   `torso_limit_scale` widens/narrows them (0 = off).
+3. **Pose prior** — a Gaussian over the nine spine coordinates fitted to the same data (natural posture = a gentle S-curve of a few degrees per joint, no net lean;
+   covariance = how real people share a bend among the joints). Without orientation targets, asked to put the neck base somewhere, the spine takes the pose closest
+   to the natural one in that metric instead of bending every bone equally; the chest turn is shared among the three joints that twist most. `torso_prior=0` is the
+   old equal-bend FABRIK chain; `torso_stiffness` scales the covariance. While *tracking*, the neck-base target is read as the trunk's lean direction (the capture
+   trunk's length is another skeleton's).
+`torso_energy()` scores a pose under the prior (Mahalanobis² per coordinate: ≈1 typical of real people, ≫1 contorted).
+
+**Measured** (`tools/validate_torso.py`, 58 CMU clips from 16 performers the fit never saw, 18 actions):
+| | before (as shipped) | prior only | orientation targets |
+|---|---|---|---|
+| mean orientation error of spine1-3, neck, head vs the capture | 22.7° | 15.4° | 0.08° |
+| frames with spine/neck/head inside the joint limits | 14 % | 100 % | 100 % |
+| pose typicality (the real clips: 0.88) | 5.0 | 1.05 | 0.89 |
+| clavicle motion error | 7.4° | 6.7° | 2.3° |
+Without orientation targets the neck and head stay ~18–24° off: nothing says where the person looked. Refit: `python tools/fit_torso_prior.py`; check: `python tools/test_torso.py`,
+`make body-test`.
 
 ## Commands (text, one per line; case-insensitive)
 ```
@@ -36,7 +65,7 @@ y at a surface height = a step, higher = a foot held in the air.
 
 ## Python
 `python/nebula.py` → `nebula.Body(scale, finger_lod, assist)`: `command(line)->(ok,msg)`, `update`, `run`, `status()`, `bones()`,
-`set_param`, `add_surface`. C API: `nebula_body_*` in `capi/nebula_capi.h` (ABI version 2).
+`set_param`, `add_surface`, `track_clip(actions, torso=None)`. C API: `nebula_body_*` in `capi/nebula_capi.h` (ABI version 3; the torso functions are additive).
 
 ## NOT done yet (next steps, in order)
 1. **Python tests** for the body binding (the C++ suite covers the physics; the ctypes layer was only smoke-tested).
@@ -51,5 +80,7 @@ y at a surface height = a step, higher = a foot held in the air.
 8. A **retargeting path** from the new bones (named like Mixamo/VRM-friendly) to `studio/web/avatar.js` for `.glb` models.
 
 ## Known limits
+Torso: the clavicle is a direction, not a shoulder girdle (no scapula); the prior is fitted to CMU's 100-odd performers (mostly adults, mostly Western motion types) and to what the CMU skeleton's
+rotations can express; neck/head pitch without orientation targets is not predicted; hand reaches do not yet recruit the trunk (a reach assist is the next step).
 Flat-foot contact only (no heel/toe rolling), contact assumed full if the sole origin is over a surface, hands do not collide,
 no props/other bodies, fall = flag (no animation), walking is slow by default, one body per `Body` object.
