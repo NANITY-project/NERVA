@@ -221,6 +221,20 @@ kbd{font:10px var(--mono);border:1px solid var(--glass-border);border-radius:4px
   .bar{flex-wrap:wrap}
 }
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.001ms!important;animation-iteration-count:1!important;transition-duration:.001ms!important}}
+/* python environment chooser */
+.envlist{display:flex;flex-direction:column;gap:7px;margin:12px 0 4px;max-height:44vh;overflow-y:auto}
+.env{display:block;border:1px solid var(--glass-border);border-radius:var(--radius-sm);padding:9px 12px;cursor:pointer;transition:border-color .3s var(--ease),background .3s var(--ease)}
+.env:hover{border-color:var(--glass-border-hi)}
+.env.sel{border-color:var(--red-hi);background:rgba(166,0,0,.12)}
+.env.off{opacity:.45;cursor:not-allowed}
+.env input{margin-right:8px;accent-color:var(--red-hi)}
+.env b{font-weight:500}
+.env .meta{color:var(--dim);font-size:10.5px;margin-top:2px;word-break:break-all}
+.env .cmd{color:var(--faint);font-size:10px;margin-top:4px;white-space:pre-wrap;word-break:break-all}
+.env .tag{display:inline-block;margin-left:6px;padding:0 6px;border-radius:9px;font-size:9.5px;border:1px solid var(--glass-border)}
+.env .tag.ok{color:var(--ok);border-color:rgba(95,214,138,.4)} .env .tag.warn{color:var(--warn);border-color:rgba(255,180,84,.4)}
+#envLog{margin-top:10px;max-height:26vh;overflow-y:auto;white-space:pre-wrap;font-size:10px;color:var(--dim);border-top:1px solid var(--glass-border);padding-top:8px}
+#envLog:empty{display:none}
 </style>
 </head>
 <body>
@@ -365,6 +379,17 @@ kbd{font:10px var(--mono);border:1px solid var(--glass-border);border-radius:4px
   </div>
 </div>
 
+<div id="envm" class="modal-bg" role="dialog" aria-modal="true" aria-label="Choose a Python environment">
+  <div class="sheet glass">
+    <h2>PyTorch not found</h2>
+    <p id="envWhy"></p>
+    <p style="color:var(--dim)">Pick an environment to use. If it lacks anything, the commands shown are run to install it, then this page restarts its server in that environment and loads your files again.</p>
+    <div class="envlist" id="envList"><div class="env off">Looking for Python environments…</div></div>
+    <div id="envLog"></div>
+    <div class="acts"><button class="btn quiet" id="envNo">Cancel</button><button class="btn main" id="envYes" disabled>Use selected</button></div>
+  </div>
+</div>
+
 <script>
 'use strict';
 const $ = id => document.getElementById(id);
@@ -457,6 +482,65 @@ function askTrust(name){
     $('trustYes').onclick = () => done(true); $('trustNo').onclick = () => done(false);
   });
 }
+// ---- no torch (or gguf) in the server's Python: list the environments found on this machine, or create one
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+async function chooseEnv(info){
+  const m = $('envm'), list = $('envList'), yes = $('envYes'), no = $('envNo'), lg = $('envLog');
+  $('envWhy').textContent = `The Python running this server has no ${info.missing.join(' / ')}, which ${info.file} needs.`;
+  list.innerHTML = '<div class="env off">Looking for Python environments… (each one that has torch takes a few seconds to check)</div>';
+  lg.textContent = ''; yes.disabled = true; yes.textContent = 'Use selected'; no.disabled = false; m.classList.add('open');
+  let data;
+  try{ data = await (await fetch('/api/env')).json(); }catch(e){ list.innerHTML = ''; lg.textContent = 'could not scan: ' + e; }
+  if (!data){ no.onclick = () => m.classList.remove('open'); return 'cancelled'; }
+  const rows = []; let sel = null;
+  const pick = r => { sel = r; rows.forEach(x => x.el.classList.toggle('sel', x === r)); yes.disabled = !r; };
+  const add = (r, html, cmds, enabled) => {
+    const el = document.createElement('label'); el.className = 'env' + (enabled ? '' : ' off');
+    el.innerHTML = '<input type="radio" name="env"' + (enabled ? '' : ' disabled') + '>' + html + (cmds.length ? '<div class="cmd">$ ' + cmds.map(escapeHtml).join('\n$ ') + '</div>' : '');
+    r.el = el; rows.push(r); list.append(el);
+    if (enabled) el.addEventListener('click', () => pick(r));
+  };
+  list.innerHTML = '';
+  for (const e of data.envs){
+    const tag = e.ready ? '<span class="tag ok">torch ' + escapeHtml(e.torch) + ' ready</span>'
+              : e.can_install ? '<span class="tag warn">will install: ' + escapeHtml(e.missing.join(', ')) + '</span>' : '';
+    add({kind: 'use', python: e.python},
+        '<b>' + escapeHtml(e.label) + '</b>' + (e.current ? ' (this server)' : '') + tag +
+        '<div class="meta">Python ' + escapeHtml(e.version) + ' · ' + escapeHtml(e.prefix) + (e.why_not ? '<br>' + escapeHtml(e.why_not) : '') + '</div>',
+        e.commands, e.ready || e.can_install);
+  }
+  add({kind: 'new'}, '<b>Create a new virtual environment</b><span class="tag warn">downloads torch (CPU build)</span><div class="meta">' + escapeHtml(data.new_venv) + '</div>',
+      data.new_commands, true);
+  const first = rows.find(r => r.kind === 'use' && data.envs.find(e => e.python === r.python && e.ready)) || rows[rows.length - 1];
+  first.el.querySelector('input').checked = true; pick(first);
+
+  return new Promise(res => {
+    const close = v => { m.classList.remove('open'); yes.onclick = no.onclick = null; res(v); };
+    no.onclick = () => close('cancelled');
+    yes.onclick = async () => {
+      if (!sel) return;
+      yes.disabled = true; no.disabled = true; yes.textContent = 'Working…';
+      const boot0 = (await (await fetch('/api/status')).json()).boot;
+      const body = sel.kind === 'new' ? {new_venv: true} : {python: sel.python};
+      const r = await (await fetch('/api/env/start', {method: 'POST', headers: {'Content-Type': 'application/json', 'X-NERVA-UI': '1'}, body: JSON.stringify(body)})).json();
+      if (!r.ok){ lg.textContent = 'ERROR: ' + r.error; no.disabled = false; yes.textContent = 'Use selected'; yes.disabled = false; return; }
+      // follow the job; once it succeeds the server restarts itself (same pid on POSIX), so wait for a different `boot` value from /api/status
+      for (let i = 0; i < 1800; i++){
+        await sleep(1000);
+        try{
+          const st = await (await fetch('/api/status')).json();
+          if (st.boot !== boot0 && st.torch){ ST = st; render(); log('✓ restarted under ' + st.python); close('restarted'); refresh(); return; }
+          const j = await (await fetch('/api/env/job')).json();
+          lg.textContent = j.lines.join('\n'); lg.scrollTop = lg.scrollHeight;
+          if (j.state === 'error'){ no.disabled = false; yes.textContent = 'Try again'; yes.disabled = false; return; }
+          if (j.state === 'done') yes.textContent = 'Restarting…';
+        }catch(e){ yes.textContent = 'Restarting…'; }          // the server is mid-restart
+      }
+      lg.textContent += '\nTimed out waiting for the server; restart `make ui` by hand.'; no.disabled = false;
+    };
+  });
+}
+const escapeHtml = t => String(t == null ? '' : t).replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
 const needsTrust = msg => /trust-pickle|UnpicklingError|weights_only/i.test(msg || '');
 async function post(f, trust){
   const r = await fetch('/api/upload?name=' + encodeURIComponent(f.name) + (trust ? '&trust=1' : ''), {method: 'POST', body: f});
@@ -465,6 +549,7 @@ async function post(f, trust){
 async function upload(files){
   stopGen();
   files.sort((a, b) => /prior/i.test(a.name) - /prior/i.test(b.name));
+  let needEnv = null;
   for (const f of files){
     log(`uploading ${f.name} (${(f.size/1e6).toFixed(1)} MB)…`);
     try{
@@ -474,11 +559,13 @@ async function upload(files){
         else { log(`skipped ${f.name}`); continue; }
       }
       ST = j.status || ST;
+      if (!j.ok && j.need_env){ needEnv = needEnv || j.need_env; log(`… ${f.name} is waiting for a Python environment with ${j.need_env.missing.join(' + ')}`); continue; }
       if (j.ok) log(`✓ ${j.info.kind}: ${j.info.file}${j.info.note ? ' (' + j.info.note + ')' : ''}`);
       else { log('✗ ' + j.error); setCtl(true); note('errbox', f.name + ': ' + j.error); }
     }catch(err){ log('✗ upload failed: ' + err); }
     if (ST) render();
   }
+  if (needEnv){ const how = await chooseEnv(needEnv); if (how === 'cancelled') log('skipped: no Python environment chosen'); return; }
   refresh();
 }
 
