@@ -84,7 +84,7 @@ actions-test:
 
 test-all: test body-test studio-test blender-test overlay-test
 
-.PHONY: all test bench sanitize clean lib studio ui studio-test blender-test test-all body-test overlay overlay-test actions-test motion-test motion-test-quick motion-headers vae-data vae-data-quick vae-data vae-data-quick
+.PHONY: all test bench sanitize clean lib studio ui studio-test blender-test test-all body-test overlay overlay-test actions-test motion-test motion-test-quick motion-headers vae-data vae-data-quick gen-actions
 
 # --- Motion grader: real CMU examples per action, grader validation, C++ headers (see tools/motion_test.py) ---
 motion-test:
@@ -104,3 +104,6 @@ vae-data:
 
 vae-data-quick:
 	python3 tools/build_vae_dataset.py --hours 0.3 --out /tmp/vae_quick --memory /tmp/vae_quick_mem
+
+gen-actions:
+	python3 tools/gen_actions.py --n 40 --out data/eng_actions
