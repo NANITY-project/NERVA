@@ -9,7 +9,8 @@ get_cc_motions.py - build NERVA's CC BY motion set from 100STYLE and ACCAD / Ohi
   python tools/get_cc_motions.py --map my_labels.csv          # your own labelling rules: lines "regex,action" (action "skip" drops the file)
 
 What it makes: data/cc_motions.npz in the same layout as data/real_motions.npz (tools/get_real_motions.py): actions [F,30], offsets, dt, angles, labels, action, performer,
-description, features + feature_names, action_names ... plus  source ("100style" / "accad")  and  style_label.  Every clip is a window cut from a mocap take, retargeted to the
+description, features + feature_names, action_names ... plus  source ("100style" / "accad"),  style_label  and  torso [F,7,4]  (orientations of the spine, neck, head and clavicles from tools/bvh_to_clip.py convert_full: for
+Body.track_clip(actions, torso=...) and for refitting the torso prior from CC data instead of CMU).  Every clip is a window cut from a mocap take, retargeted to the
 NERVA skeleton by tools/bvh_to_clip.py (joints are found by name, so the two datasets' different skeletons need no setup; `bvh_to_clip.py --probe file.bvh` shows how a file is read).
 This set has two jobs:
   * model training      tools/build_vae_dataset.py trains on it (originals + graded variants). Both licences (CC BY) allow this and allow redistributing the converted data
@@ -252,13 +253,18 @@ def accad_entries(members, extra):
 
 
 # ------------------------------------------------------------------------------------------------------------------ conversion
-def resample(A, ang, dt, fps):
-    """To exactly `fps` (linear; yaw is already unwrapped; contact / on flags stay 0/1). A file whose rate is not a multiple of fps (100 Hz, ...) needs this."""
+def resample(A, ang, dt, fps, tq=None):
+    """To exactly `fps` (linear; yaw is already unwrapped; contact / on flags stay 0/1). A file whose rate is not a multiple of fps (100 Hz, ...) needs this.
+    tq: the torso quaternions [F,7,4] (bvh_to_clip.convert_full); they are continuous in time (no sign flips), so a linear blend renormalised is exact enough. With tq the result has 4 items."""
     if abs(dt * fps - 1.0) < 0.01:
-        return A, ang, dt
+        return (A, ang, dt) if tq is None else (A, ang, dt, tq)
     n = int(np.floor((len(A) - 1) * dt * fps)) + 1; t = np.arange(n) / fps; src = np.arange(len(A)) * dt
     A2 = np.stack([np.interp(t, src, A[:, k]) for k in range(A.shape[1])], 1); A2[:, FLAGS] = (A2[:, FLAGS] > 0.5)
-    return A2.astype(np.float32), np.stack([np.interp(t, src, ang[:, k]) for k in range(ang.shape[1])], 1).astype(np.float32), 1.0 / fps
+    ang2 = np.stack([np.interp(t, src, ang[:, k]) for k in range(ang.shape[1])], 1).astype(np.float32)
+    if tq is None:
+        return A2.astype(np.float32), ang2, 1.0 / fps
+    q = np.stack([np.stack([np.interp(t, src, tq[:, b, c]) for c in range(4)], 1) for b in range(tq.shape[1])], 1); q /= np.linalg.norm(q, axis=-1, keepdims=True) + 1e-12
+    return A2.astype(np.float32), ang2, 1.0 / fps, q.astype(np.float32)
 
 
 def action_obj(name):
@@ -289,12 +295,14 @@ def build(entries, a):
             continue
         path = None
         try:
-            path = fetch(e["member"], tmp); A, ang, dt = bvh_to_clip.convert(path, a.fps, rows=e["cut"])
-            A, ang, dt = resample(A, ang, dt, a.fps)
+            path = fetch(e["member"], tmp); A, ang, tq, dt = bvh_to_clip.convert_full(path, a.fps, rows=e["cut"])
+            if tq is None:                                                    # a skeleton without a recognisable spine / clavicles: the clip is fine, it just has no torso orientations
+                tq = np.full((len(A), 7, 4), np.nan, np.float32)
+            A, ang, dt, tq = resample(A, ang, dt, a.fps, tq)
             if e["source"] == "100style" and not e["cut"]:
                 trim = int(round(1.0 / dt))
                 if len(A) > 4 * trim:
-                    A, ang = A[trim:-trim], ang[trim:-trim]
+                    A, ang, tq = A[trim:-trim], ang[trim:-trim], tq[trim:-trim]
             wins = GR.windows(A, dt, act, a.per_file)
         except Exception as ex:
             skipped.append((e["member"].name, f"{type(ex).__name__}: {str(ex)[:160]}")); continue
@@ -304,7 +312,7 @@ def build(entries, a):
         for k, (i0, i1) in enumerate(wins):
             if e["source"] == "100style" and per.get(key, 0) >= a.per_style:
                 break
-            clips.append((GR.canonical(A[i0:i1]), ang[i0:i1], dt)); per[key] = per.get(key, 0) + 1; per[(e["source"], e["action"])] = per.get((e["source"], e["action"]), 0) + 1
+            clips.append((GR.canonical(A[i0:i1]), ang[i0:i1], dt, tq[i0:i1])); per[key] = per.get(key, 0) + 1; per[(e["source"], e["action"])] = per.get((e["source"], e["action"]), 0) + 1
             meta.append(dict(label=f"{e['source']}:{e['member'].stem}#{k}", action=e["action"], performer=e["performer"], desc=e["desc"], source=e["source"], style=e["style"]))
         if (n + 1) % 50 == 0:
             say(f"  {n + 1}/{len(todo)} files, {len(clips)} clips, {time.time() - t0:.0f}s")
@@ -315,10 +323,16 @@ def build(entries, a):
 def save(path, clips, meta):
     dt = float(np.mean([c[2] for c in clips])); off = np.cumsum([0] + [len(c[0]) for c in clips]); feats = np.array([mf.extract(c[0], c[2]) for c in clips], np.float32)
     S = lambda k: np.array([m[k] for m in meta])
+    has_t = all(np.isfinite(c[3]).all() for c in clips); extra = {}
+    if has_t:                                          # [frames,7,4] in the pelvis heading frame, rows aligned with `actions` (tools/torso_math.py, include/ik_torso.hpp)
+        import torso_math
+        extra = dict(torso=np.concatenate([c[3] for c in clips]).astype(np.float32), torso_names=np.array(torso_math.NAMES))
+    else:
+        say(f"  note: {sum(1 for c in clips if not np.isfinite(c[3]).all())} of {len(clips)} clips have no torso orientations (unrecognised spine / clavicles): torso left out of the file; bvh_to_clip.py --probe shows why")
     np.savez_compressed(path, actions=np.concatenate([c[0] for c in clips]).astype(np.float32), offsets=off, angles=np.concatenate([c[1] for c in clips]), dt=np.float32(dt),
                         labels=S("label"), action=S("action"), performer=S("performer"), description=S("desc"), features=feats, feature_names=np.array(mf.NAMES),
                         action_names=np.array(sorted({m["action"] for m in meta})), kind=np.array(["real"] * len(clips)), style=np.zeros((len(clips), 1), np.float32), style_names=np.array(["real"]),
-                        source=S("source"), style_label=S("style"))
+                        source=S("source"), style_label=S("style"), **extra)
     return dt, off
 
 
