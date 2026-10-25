@@ -1,12 +1,10 @@
-// motion_headers_test.cpp - do the generated motion headers (tools/export_headers.py) compile, and are the grader profiles sane?
+// motion_headers_test.cpp - do the generated motion headers (tools/export_headers.py) compile and decode into sane motion?
 //
 //   g++ -std=c++17 -O1 -Wall -Wextra -Iinclude/motion src/motion_headers_test.cpp -o motion_headers_test && ./motion_headers_test
 //   (or: make motion-test, which also exports the headers and grades the data first)
 //
-// Always checked: every grader profile has finite, nested ranges and enough measures, and find_profile() works.
-// Only when the headers were exported with --with-clips (local use, defines NERVA_MOTION_HAS_CLIPS): per action set, clip and frame counts add up, every decoded
-// value is finite and inside the human range, each clip starts at the origin facing +Z, contact flags are 0/1, the pelvis stays at a plausible height.
-// Exit status 1 on the first violation, so it can sit in a build pipeline.
+// Checks per action set: clip and frame counts add up, every decoded value is finite and inside the human range, each clip starts at the origin facing +Z,
+// contact flags are 0/1, the pelvis stays at a plausible height. Exit status 1 on the first violation, so it can sit in a build pipeline.
 #include "nerva_motion.hpp"
 
 #include <cmath>
@@ -20,9 +18,8 @@ static int g_fail = 0;
 #define CHECK(cond, ...) do { if (!(cond)) { std::printf("  FAIL %s:%d  ", __FILE__, __LINE__); std::printf(__VA_ARGS__); std::printf("\n"); ++g_fail; } } while (0)
 
 int main() {
-    long total_frames_all = 0;
-#ifdef NERVA_MOTION_HAS_CLIPS
     std::printf("%-12s %-11s %6s %8s %6s %10s %12s\n", "action", "group", "clips", "frames", "fps", "seconds", "pelvis y");
+    long total_frames_all = 0;
     for (const ActionSet& s : kActions) {
         const int total = total_frames(s);
         CHECK(s.clips > 0, "%s has no clips", s.name);
@@ -51,13 +48,8 @@ int main() {
         CHECK(find(s.name) == &s, "find(\"%s\") does not return the set", s.name);
     }
     CHECK(find("no_such_action") == nullptr, "find() of an unknown name must be null");
-#endif
-#ifdef NERVA_MOTION_HAS_CLIPS
-    CHECK(kProfileCount == kActionCount, "profiles %d vs sets %d", kProfileCount, kActionCount);
-#endif
-    CHECK(kProfileCount > 0, "no profiles");
-    CHECK(find_profile("no_such_action") == nullptr, "find_profile() of an unknown name must be null");
-    CHECK(find_profile(kProfiles[0].action) == &kProfiles[0], "find_profile(\"%s\") does not return the profile", kProfiles[0].action);
+    CHECK(kProfileCount >= kActionCount, "profiles %d, sets %d", kProfileCount, kActionCount);      // every action has a profile; only the actions the CC BY sets cover have clips
+    for (const ActionSet& s : kActions) CHECK(find_profile(s.name) != nullptr, "%s has clips but no profile", s.name);
     for (int p = 0; p < kProfileCount; ++p) {
         const Profile& pr = kProfiles[p]; int known = 0;
         for (int j = 0; j < kFeatureCount; ++j) {
@@ -65,11 +57,6 @@ int main() {
         }
         CHECK(known >= kFeatureCount / 2, "%s profile has only %d measures", pr.action, known);
     }
-#ifdef NERVA_MOTION_HAS_CLIPS
     std::printf("\n%d action sets, %ld frames in total, %d profiles: %s\n", kActionCount, total_frames_all, kProfileCount, g_fail ? "FAILED" : "all checks passed");
-#else
-    (void)total_frames_all;
-    std::printf("\n%d profiles (no clips): %s\n", kProfileCount, g_fail ? "FAILED" : "all checks passed");
-#endif
     return g_fail ? 1 : 0;
 }
