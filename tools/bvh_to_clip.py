@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-bvh_to_clip.py - turn real motion capture (BVH, e.g. the CMU database) into the same 30-number action clips the engine uses.
+bvh_to_clip.py - turn real motion capture (BVH: CMU, 100STYLE, ACCAD/OSU ...) into the same 30-number action clips the engine uses.
 
   python tools/bvh_to_clip.py 07_01.bvh 08_01.bvh --out real.npz
   python tools/bvh_to_clip.py *.bvh --out real.npz --fps 30
@@ -8,14 +8,14 @@ bvh_to_clip.py - turn real motion capture (BVH, e.g. the CMU database) into the 
 Why: a realism grader is only worth something if real people score well on it. This lets you grade real walks with exactly the same code
 as engine / generator clips (tools/realism.py), and, if you want, replay them in the viewer.
 
-What it does: forward kinematics of the BVH skeleton (CMU joint names), uniformly scaled so the leg (hip to ankle) is the engine's length,
+What it does: forward kinematics of the BVH skeleton, uniformly scaled so the leg (hip to ankle) is the engine's length (so the file's unit - cm, inch, m - does not matter),
 rotated/translated so the clip starts at the origin facing +Z, then reads off pelvis, foot soles, foot yaw, contact flags (foot low AND slow),
 wrists, neck base and a gaze point. It also saves the joint angles the engine cannot be asked for (knee, elbow, trunk lean) as `angles`.
-Output npz keys match gen_dataset.py (actions, offsets, dt, ...) plus: angles [F,5] (kneeL kneeR elbowL elbowR trunk_lean, degrees), labels.
+Skeletons: joints are found by NAME, whatever the capture system called them (CMU LeftUpLeg/LeftLeg/LeftFoot/LeftToeBase, 100STYLE LeftHip/LeftKnee/LeftAnkle/LeftToe with\nLeftShoulder = upper arm, Mixamo, Bip01 L Thigh ...; see PARTS below). A file whose up axis is not +Y (some exports are Z-up) is turned upright first. If a joint cannot be\nfound the error lists the joint names of the file: `python tools/bvh_to_clip.py --probe file.bvh` shows how each one was read.\nOutput npz keys match gen_dataset.py (actions, offsets, dt, ...) plus: angles [F,5] (kneeL kneeR elbowL elbowR trunk_lean, degrees), labels.
 Contact detection is a heuristic; mocap feet roll and slip a little, so real clips will not pass the engine's strict "planted feet never slide"
 verdict. That is expected: judge them with realism.py, not with the physics verdict.
 """
-import argparse, os, re, sys
+import argparse, os, re, sys, warnings
 import numpy as np
 
 ENGINE_LEG = 0.867      # hip joint to ankle joint, metres (thigh 0.437 + shin 0.430 in the engine)
@@ -44,6 +44,83 @@ def load_bvh(path):
     fr = int(re.search(r"Frames:\s*(\d+)", mot).group(1)); ft = float(re.search(r"Frame Time:\s*([\d.eE+-]+)", mot).group(1))
     data = np.array(mot.split("Time:", 1)[1].split()[1:], dtype=np.float64).reshape(fr, -1)
     return joints, data, ft
+
+
+# ---------------------------------------------------------------------------------------------------------------- skeleton adapters
+# The converter below is written in CMU joint names. Any other skeleton is renamed to them first, by reading each joint name as (side, body part).
+# PARTS: CMU name of the role -> body-part words that mean the same joint in other skeletons, best first. The joint's own position is what counts:
+# "knee" is where the thigh ends, "ankle" where the shin ends, "wrist" is the hand joint, "elbow" the forearm joint (the CMU / 100STYLE offsets mean the same).
+PARTS = {"UpLeg": ["upleg", "upperleg", "thigh", "hip", "legupper", "femur"], "Leg": ["leg", "lowerleg", "calf", "shin", "knee", "leglower", "tibia"],
+         "Foot": ["foot", "ankle"], "ToeBase": ["toebase", "toe", "toes", "toe0", "ball"],
+         "Arm": ["arm", "upperarm", "uparm", "armupper", "humerus"], "ForeArm": ["forearm", "lowerarm", "elbow", "armlower", "lowarm"], "Hand": ["hand", "wrist"]}
+CENTRE = {"Neck": ["neck", "neck1", "neck0", "necklower"], "Head": ["head"]}
+_SIDES = {"left": "Left", "l": "Left", "lft": "Left", "right": "Right", "r": "Right", "rgt": "Right"}
+
+
+def _side_part(name):
+    """'LeftUpLeg' -> ('Left', 'upleg'); 'Bip01 L Thigh' -> ('Left', 'thigh'); 'arm.R' -> ('Right', 'arm'); 'Neck' -> (None, 'neck')."""
+    raw = name.split(":")[-1]; glued = re.match(r"^([LR])(?=[A-Z])", raw)             # LThigh, RThumb, LHipJoint
+    toks = re.sub(r"[^A-Za-z0-9]+", " ", re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", raw)).lower().split()
+    toks = [t for t in toks if t not in ("bip01", "bip", "mixamorig")]
+    if glued and toks:
+        side = "Left" if glued.group(1) == "L" else "Right"; toks[0] = toks[0][1:] or None; toks = [t for t in toks if t]; return side, "".join(toks)
+    if toks and toks[0] in _SIDES and len(toks) > 1:
+        return _SIDES[toks[0]], "".join(toks[1:])
+    if toks and toks[-1] in _SIDES and len(toks) > 1:
+        return _SIDES[toks[-1]], "".join(toks[:-1])
+    return None, "".join(toks)
+
+
+def resolve_roles(joints):
+    """{CMU name: index of the joint that plays that role}. Raises ValueError listing the file's joints when a role is missing."""
+    sp = [_side_part(j["name"]) for j in joints]; found = {}
+    for side in ("Left", "Right"):
+        for role, words in PARTS.items():
+            cand = list(words) + (["shoulder"] if role == "Arm" else [])          # "shoulder" is the upper arm in 100STYLE (its clavicle is "Collar"); in CMU it is the clavicle, but CMU has "Arm" and wins first
+            for w in cand:
+                hit = [i for i, (s, p) in enumerate(sp) if s == side and p == w]
+                if hit:
+                    found[side + role] = hit[0]; break
+    for role, words in CENTRE.items():
+        for w in words:
+            hit = [i for i, (s, p) in enumerate(sp) if s is None and p == w]
+            if hit:
+                found[role] = hit[0]; break
+    need = [s + r for s in ("Left", "Right") for r in PARTS] + list(CENTRE)
+    miss = [n for n in need if n not in found]
+    if miss:
+        raise ValueError("cannot find joint(s) " + ", ".join(miss) + " in this skeleton; its joints are: " + ", ".join(j["name"] for j in joints))
+    return {n: found[n] for n in need}
+
+
+def adapt_skeleton(joints):
+    """Rename the joints that play the converter's roles to the CMU names it uses (in place). Returns the {role: original name} that was read."""
+    roles = resolve_roles(joints); orig = {n: joints[i]["name"] for n, i in roles.items()}; targets = set(roles.values())
+    for k, j in enumerate(joints):
+        if k not in targets and j["name"] in roles:                                    # an unrelated joint that happens to carry a CMU name: step aside
+            j["name"] = "_" + j["name"]
+    for n, i in roles.items():
+        joints[i]["name"] = n
+    return orig
+
+
+def up_rotation(rest):
+    """3x3 rotation that turns the skeleton's own 'up' (feet to head in its rest pose) to +Y. Identity for the usual Y-up BVH; Z-up exports are laid upright."""
+    u = rest["Head"][0][0] - 0.5 * (rest["LeftFoot"][0][0] + rest["RightFoot"][0][0]); n = float(np.linalg.norm(u))
+    if n < 1e-9 or np.abs(u).max() < 0.7 * n:
+        warnings.warn("cannot tell which axis is up from the rest pose; assuming +Y"); return np.eye(3)
+    k = int(np.argmax(np.abs(u))); up = np.zeros(3); up[k] = np.sign(u[k])
+    if k == 1 and up[1] > 0:
+        return np.eye(3)
+    y = np.array([0.0, 1.0, 0.0]); c = float(up @ y)
+    if c < -0.999:
+        return np.diag([-1.0, -1.0, 1.0])                                          # upside down: half a turn about Z
+    v = np.cross(up, y); V = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+    return np.eye(3) + V + V @ V / (1.0 + c)
+
+
+def rotate_world(sk, Q):
+    return {n: (p @ Q.T, np.einsum("ij,fjk->fik", Q, R)) for n, (p, R) in sk.items()}
 
 
 def rot(axis, deg):
@@ -101,18 +178,30 @@ def lowpass(x, fs, fc=6.0, order=4):
     return np.fft.irfft(np.fft.rfft(rp, axis=0) * h, len(rp), axis=0)[pad:pad + F] + ramp
 
 
-def convert(path, fps=30, hand_cutoff_hz=6.0):
+def convert(path, fps=30, hand_cutoff_hz=6.0, rows=None):
     """BVH file -> (actions [F,30], angles [F,5], dt). hand_cutoff_hz: the CMU hand joints jitter by about 2 cm (marker noise: 0.4-1 m/s of >6 Hz velocity even
     while standing still), so hands, neck and gaze are low-passed at this cutoff at the file's native rate (120 Hz) before the clip is decimated to `fps`.
-    Human voluntary motion lives well below 6 Hz; without this the 'real' reference would teach a grader that jitter is normal. None/0 turns it off."""
-    joints, data, ft = load_bvh(path)
+    Human voluntary motion lives well below 6 Hz; without this the 'real' reference would teach a grader that jitter is normal. None/0 turns it off.
+    rows: (first, last) frame of the FILE to convert (its native rate), e.g. the cut points a dataset ships; None = the whole file."""
+    joints, data, ft = load_bvh(path); adapt_skeleton(joints)
+    if rows is not None:
+        data = data[max(0, int(rows[0])):int(rows[1])]
+        if len(data) < 2:
+            raise ValueError(f"frame range {tuple(rows)} leaves no frames")
     # corrupt rows (all zeros) appear at the start/end of a few CMU files. Only those are trimmed: the old "hips below half the median height" rule
     # also deleted the lying / crouching / sitting frames of non-walking clips, which are exactly the frames those actions are about.
     ok = np.abs(data).sum(axis=1) > 1e-9
     if not ok.any():
         raise ValueError("every row of the file is zero")
     idx = np.where(ok)[0]; data = data[idx[0]:idx[-1] + 1]
-    sk = forward_kinematics(joints, data); P = lambda n: sk[n][0]
+    sk = forward_kinematics(joints, data); rest = forward_kinematics(joints, np.zeros((1, data.shape[1]))); Q = up_rotation(rest)      # all-zero channels = the skeleton's rest pose
+    # which way the head's own axes look at rest: the body faces left x up, and at rest (all rotations zero) a joint's axes ARE the file's axes. CMU: +Z. Snapped to the
+    # nearest file axis (a rest pose is axis-aligned by convention) so tiny asymmetries in the offsets do not rotate the gaze.
+    f0 = np.cross(rest["LeftUpLeg"][0][0] - rest["RightUpLeg"][0][0], Q.T @ np.array([0.0, 1.0, 0.0])); f0 = f0 / (np.linalg.norm(f0) + 1e-12)
+    ax = np.zeros(3); k0 = int(np.argmax(np.abs(f0))); ax[k0] = np.sign(f0[k0]); head_fwd = ax if float(f0 @ ax) > np.cos(np.radians(8.0)) else f0
+    if not np.allclose(Q, np.eye(3)):
+        sk = rotate_world(sk, Q); rest = rotate_world(rest, Q)
+    P = lambda n: sk[n][0]
     # engine-sized: leg length from the skeleton's own offsets
     off = {j["name"]: np.linalg.norm(j["off"]) for j in joints if j["off"] is not None}
     scale = ENGINE_LEG / (off["LeftLeg"] + off["LeftFoot"])
@@ -152,14 +241,13 @@ def convert(path, fps=30, hand_cutoff_hz=6.0):
     ls, ly = foot(lank, ltoe, lc); rs, ry = foot(rank, rtoe, rc)
     for a_ in (lank, rank, ltoe, rtoe):
         a_[:, 1] -= floor
-    rest = forward_kinematics(joints, np.zeros((1, data.shape[1])))                                  # all-zero channels = the skeleton's rest pose
     rv = (rest["Neck"][0][0] - 0.5 * (rest["LeftUpLeg"][0][0] + rest["RightUpLeg"][0][0])) * scale      # neck above the hip centre in the skeleton's own upright rest pose
     rest_xz = np.array([rv[0], rv[2]])                                                              # its horizontal part is the skeleton's built-in lean/offset
     neck = canon(P("Neck")); head = canon(P("Head")); lw, rw = canon(P("LeftHand")), canon(P("RightHand"))
     for a_ in (neck, head, lw, rw):
         a_[:, 1] -= floor
     neck[:, 0] -= rest_xz[0] * np.cos(yaw_c) + rest_xz[1] * np.sin(yaw_c); neck[:, 2] -= -rest_xz[0] * np.sin(yaw_c) + rest_xz[1] * np.cos(yaw_c)   # an upright trunk = zero lean
-    hf = np.einsum("fij,j->fi", sk["Head"][1], [0, 0, 1]); hf = np.stack([hf[:, 0] * cy + hf[:, 2] * sy, hf[:, 1], -hf[:, 0] * sy + hf[:, 2] * cy], 1)
+    hf = np.einsum("fij,j->fi", sk["Head"][1], head_fwd); hf = np.stack([hf[:, 0] * cy + hf[:, 2] * sy, hf[:, 1], -hf[:, 0] * sy + hf[:, 2] * cy], 1)
     look = head + 2.0 * hf
     if hand_cutoff_hz:
         lw, rw, neck, look = (lowpass(q, 1.0 / dt0, hand_cutoff_hz) for q in (lw, rw, neck, look))
@@ -179,7 +267,17 @@ def convert(path, fps=30, hand_cutoff_hz=6.0):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("bvh", nargs="+"); ap.add_argument("--out", default="real.npz"); ap.add_argument("--fps", type=int, default=30)
+    ap.add_argument("--probe", action="store_true", help="only show how the skeleton of each file is read (joint roles, up axis, frames, rate), convert nothing")
     a = ap.parse_args(); acts, angs, labels, dts = [], [], [], []
+    if a.probe:
+        for p in a.bvh:
+            joints, data, ft = load_bvh(p); print(f"{p}: {len(joints)} joints, {len(data)} frames at {1 / ft:.1f} Hz")
+            try:
+                orig = adapt_skeleton(joints); rest = forward_kinematics(joints, np.zeros((1, data.shape[1]))); Q = up_rotation(rest)
+                print("  roles read as:  " + ", ".join(f"{k} <- {v}" for k, v in orig.items()) + f"\n  up axis: {'+Y' if np.allclose(Q, np.eye(3)) else 'not +Y, turned upright'}")
+            except ValueError as e:
+                print("  " + str(e))
+        return
     for p in a.bvh:
         A, ang, dt = convert(p, a.fps); acts.append(A); angs.append(ang); labels.append(os.path.splitext(os.path.basename(p))[0]); dts.append(dt)
         print(f"  {labels[-1]}: {len(A)} frames ({len(A) * dt:.1f} s)")
