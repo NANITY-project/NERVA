@@ -1,37 +1,40 @@
 #!/usr/bin/env python3
 """
-export_headers.py - write the grader's reference ranges as plain C++17 header files you can commit.
+export_headers.py - write the grader's reference ranges, and example motion clips, as plain C++17 header files you can commit.
 
-  python tools/export_headers.py                                  # -> include/motion/  (core types + grader profiles + index: numbers only, no motion clips)
-  python tools/export_headers.py --out /tmp/hdr --with-clips      # LOCAL USE ONLY: also writes the real example clips (see the warning below)
+  python tools/export_headers.py                                  # -> include/motion/  (core types + grader profiles + index + example clips of every action the CC BY sets cover)
+  python tools/export_headers.py --out /tmp/hdr --no-clips        # only the numbers: profiles + core + index, no motion clips
   python tools/export_headers.py --actions sit stand walk         # only these actions
+  python tools/export_headers.py --out data/headers_cmu --cmu-local   # LOCAL USE ONLY: example clips may also come from the CMU examples (see the warning below)
 
-Files written by default (all generated: do not edit by hand, re-run this instead)
-  nerva_motion_core.hpp        kActionDim and the layout of an action vector
-  nerva_motion_profiles.hpp    the grader's per-action reference ranges (typical / tolerable range, weight, median of every measure)
-  nerva_motion.hpp             include this one: pulls in the above and gives you  nerva::motion::find_profile("sit")
+Files written (all generated: do not edit by hand, re-run this instead)
+  nerva_motion_core.hpp         kActionDim and the layout of an action vector (with clips: also ActionSet and decode_clip)
+  nerva_motion_profiles.hpp     the grader's per-action reference ranges (typical / tolerable range, weight, median of every measure): numbers only, for EVERY action the grader knows
+  nerva_motion.hpp              include this one: pulls in the above and gives you  nerva::motion::find_profile("sit")  (and find("sit") when clips are present)
+  nerva_motion_<action>.hpp     example clips of one action as int16 data (about 6 clips, 15 fps, <= 4 s each) - ONLY from sources whose licence allows redistribution
 
-With --with-clips (opt-in, local only) it also writes, one per action, nerva_motion_<action>.hpp holding real motion-capture clips as int16 data, plus
-decode helpers (ActionSet, decode_clip ...) and  nerva::motion::kActions[] / find().
-  !! Those headers are converted copies of third-party motion capture (CMU Graphics Lab database). Do NOT commit or publish them: CMU allows use but not
-  !! resale or redistribution of the data, even in converted form. .gitignore keeps them out of the repository.
+Where the example clips come from: ACCAD / Ohio State University motion capture (CC BY 3.0) and 100STYLE (CC BY 4.0), converted by tools/bvh_to_clip.py via tools/get_cc_motions.py
+(data/cc_motions.npz). Both licences allow redistributing the converted data with credit and a note of the changes; every header carries both, and docs/CREDITS.md has the full text.
+An action the CC BY sets do not cover has a profile but no clips. CMU clips are never exported into include/.
+  !! --cmu-local also lets CMU examples into the clips. CMU allows use but not resale or redistribution of its data, even converted: such headers are for your machine only. The script
+  !! refuses to write them below include/, and every file says so.
 
 Data format: an action vector is 30 numbers per frame in the engine's layout (pelvis xyz yaw | footL xyz yaw contact | footR xyz yaw contact | handL xyz on |
-handR xyz on | look xyz on | torso xyz on). Clip data (with --with-clips) is int16 = value x 1000 (metres -> mm, radians -> mrad wrapped to +-pi, flags 0/1 -> 0/1000).
+handR xyz on | look xyz on | torso xyz on). Clip data is int16 = value x 1000 (metres -> mm, radians -> mrad wrapped to +-pi, flags 0/1 -> 0/1000).
 Every clip starts at the origin facing +Z, y up, x = the body's left, 1.0 = engine-sized skeleton (leg 0.87 m).
-Source of the reference ranges: see docs/CREDITS.md.
+Source of the reference ranges and the clips: see docs/CREDITS.md.
 """
 import argparse, math, os, sys
 import numpy as np
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+HERE_DIR = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE_DIR)
 import get_real_motions, motion_features as mf, motion_grader as G
 
 COLS = 30
 
 
-def pick(prof, F, act, perf, action, k):
-    """Indices of k clips of `action`: highest typicality score, taking one per performer in turn."""
-    idx = [i for i in range(len(act)) if act[i] == action]; sc = {}
+def pick(prof, F, act, perf, action, k, ok=None):
+    """Indices of k clips of `action`: highest typicality score, taking one per performer in turn. ok: boolean mask of the clips that may be exported."""
+    idx = [i for i in range(len(act)) if act[i] == action and (ok is None or ok[i])]; sc = {}
     for i in idx:
         r = G.grade_features(F[i], action, prof)
         sc[i] = r["score"] if r["score"] is not None else -1
@@ -64,7 +67,8 @@ def wrap_lines(vals, per=COLS):
 
 CORE_CLIPS = r'''// GENERATED by tools/export_headers.py - do not edit by hand.
 // Real motion-capture examples in the NERVA action layout. See tools/export_headers.py for the format.
-// Data: CMU Graphics Lab Motion Capture Database (mocap.cs.cmu.edu), BVH conversion by B. Hahne (cgspeed).
+// Data: ACCAD / The Ohio State University motion capture (CC BY 3.0) and 100STYLE (Mason, Starke, Komura; CC BY 4.0). Converted and cut: see docs/CREDITS.md. The grader profiles
+// are also derived from the CMU Graphics Lab Motion Capture Database (mocap.cs.cmu.edu), whose clips are NOT included.
 #pragma once
 #include <cstdint>
 #include <cmath>
@@ -82,7 +86,7 @@ struct ActionSet {
     int fps;                            // frames per second of the stored clips
     const int16_t* frames;              // frames[c] = number of frames of clip c
     const int16_t* values;              // all clips concatenated, kActionDim values per frame, value x 1000
-    const char* const* source;          // source[c] = which CMU trial clip c comes from
+    const char* const* source;          // source[c] = which source clip c was cut from (set: file name)
 };
 
 // Total frames of the set, and the frame index where clip c starts.
@@ -129,25 +133,41 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", default="include/motion"); ap.add_argument("--real", default=G.REAL_DEFAULT); ap.add_argument("--actions", nargs="+")
     ap.add_argument("--clips", type=int, default=6, help="clips per action"); ap.add_argument("--fps", type=int, default=15, choices=(10, 15, 30)); ap.add_argument("--max-secs", type=float, default=4.0)
-    ap.add_argument("--with-clips", action="store_true", help="LOCAL USE ONLY: also write the real CMU example clips (never commit them; --clips/--fps/--max-secs only apply with this)")
-    a = ap.parse_args(); prof, z, F = G.get_profiles(a.real); os.makedirs(a.out, exist_ok=True)
+    ap.add_argument("--cc", default=None, help="CC BY set to read (default: data/cc_motions.npz next to --real, if it exists)")
+    ap.add_argument("--no-clips", action="store_true", help="write only profiles, core and index headers (no example clips)")
+    ap.add_argument("--cmu-local", action="store_true", help="LOCAL USE ONLY: let CMU examples into the clips too (never commit them; refused below include/)")
+    ap.add_argument("--with-clips", action="store_true", help=argparse.SUPPRESS)      # old flag (it exported CMU clips): now the clips are the default and come from the CC BY sets
+    a = ap.parse_args(); prof, z, F = G.get_profiles(a.real, cc=a.cc); os.makedirs(a.out, exist_ok=True)
+    if a.with_clips:
+        sys.exit("--with-clips is gone: example clips are now written by default from ACCAD/OSU + 100STYLE (licence allows it). For CMU clips on your own machine use --cmu-local with an --out outside include/.")
+    root = os.path.dirname(HERE_DIR); inc = os.path.realpath(os.path.join(root, "include"))
+    if a.cmu_local and os.path.realpath(a.out).startswith(inc):
+        sys.exit("refusing --cmu-local into " + a.out + ": CMU clips must never land in include/ (they may not be redistributed). Use e.g. --out data/headers_cmu")
+    with_clips = not a.no_clips; allowed = {"accad", "100style"} | ({"cmu"} if a.cmu_local else set())
     A, off, dt = z["actions"], z["offsets"], float(z["dt"]); act = z["action"]; perf = z["performer"]; lab = z["labels"]; desc = z["description"]
     step = max(1, int(round(1.0 / (a.fps * dt)))); fps = int(round(1.0 / (dt * step))); maxf = int(round(a.max_secs * fps))
-    import motion_actions as MA; meta = {x.name: x for x in MA.ACTIONS}
+    import motion_actions as MA, get_cc_motions as CC; meta = {x.name: x for x in MA.ACTIONS + CC.STYLE_ACTIONS}
+    srcs = np.array([str(x) for x in z["source"]]) if "source" in z.files else np.array(["cmu"] * len(act)); ok = np.isin(srcs, sorted(allowed))
+    if with_clips and not ok.any():
+        sys.exit("no clips from a source that may be exported (" + ", ".join(sorted(allowed)) + ") in the reference set: run  python tools/get_cc_motions.py  first, or use --no-clips")
     names = [n for n in prof.names if not a.actions or n in a.actions]
     if not names:
         sys.exit("no such action; known: " + ", ".join(prof.names))
     written = []; sets = []
+    LEGAL = ("// Real motion capture: ACCAD / The Ohio State University (CC BY 3.0, https://creativecommons.org/licenses/by/3.0/) and 100STYLE, Mason, Starke, Komura (CC BY 4.0,\n"
+             "// https://creativecommons.org/licenses/by/4.0/). Changes: retargeted to the NERVA skeleton, converted to 30-channel action vectors, cut to short windows, int16-quantised. See docs/CREDITS.md.")
+    if a.cmu_local:
+        LEGAL = "// LOCAL USE ONLY: may contain converted CMU Graphics Lab clips (mocap.cs.cmu.edu), which may not be redistributed. DO NOT COMMIT OR PUBLISH."
     def write(name, text):
         path = os.path.join(a.out, name); open(path, "w").write(text); written.append((name, os.path.getsize(path)))
-    write("nerva_motion_core.hpp", CORE_CLIPS if a.with_clips else CORE_LEAN)
-    for n in (names if a.with_clips else []):
-        ids = pick(prof, F, act, perf, n, a.clips); clips = [encode(A[off[i]:off[i + 1]], step, maxf) for i in ids]
+    write("nerva_motion_core.hpp", CORE_CLIPS if with_clips else CORE_LEAN)
+    for n in (names if with_clips else []):
+        ids = pick(prof, F, act, perf, n, a.clips, ok); clips = [encode(A[off[i]:off[i + 1]], step, maxf) for i in ids]
         if not clips:
             continue
         src = [f"{lab[i]}: {desc[i]}"[:90].replace("\\", "/").replace('"', "'") for i in ids]; ns = f"data_{n}"
         about = meta[n].about if n in meta else n; group = meta[n].group if n in meta else "activity"
-        body = ["// GENERATED by tools/export_headers.py - do not edit by hand. Real CMU motion capture, see nerva_motion_core.hpp for the format.", "#pragma once", '#include "nerva_motion_core.hpp"', "",
+        body = ["// GENERATED by tools/export_headers.py - do not edit by hand. See nerva_motion_core.hpp for the format.\n" + LEGAL, "#pragma once", '#include "nerva_motion_core.hpp"', "",
                 f"namespace nerva {{ namespace motion {{ namespace {ns} {{", "",
                 f"inline constexpr int16_t kFrames[{len(clips)}] = {{{', '.join(str(len(c)) for c in clips)}}};",
                 "inline constexpr const char* kSource[] = {"] + [f'    "{s}",' for s in src] + ["};", "",
@@ -155,8 +175,9 @@ def main():
                 "inline constexpr int16_t kValues[] = {", wrap_lines(np.concatenate(clips).reshape(-1)), "};", "",
                 f'inline constexpr ActionSet kSet = {{"{n}", "{group}", "{about}", {len(clips)}, {fps}, kFrames, kValues, kSource}};', "", "}}}  // namespace nerva::motion::" + ns, ""]
         write(f"nerva_motion_{n}.hpp", "\n".join(body)); sets.append(n)
-    if not a.with_clips:
-        sets = [n for n in names if n in prof.p]
+    pnames = [n for n in names if n in prof.p]                      # every action the grader knows has a profile, whether or not it has example clips
+    if not with_clips:
+        sets = pnames
     # profiles
     def fl(x):                                                      # a valid C++ float literal: "2" must become "2.0f", never "2f"
         if not np.isfinite(x):
@@ -171,13 +192,13 @@ def main():
           "inline constexpr const char* kFeatureUnits[kFeatureCount] = {" + ", ".join(f'"{mf.UNIT[x]}"' for x in mf.NAMES) + "};", "",
           "struct Profile { const char* action; int real_clips; float med[kFeatureCount]; float typ_lo[kFeatureCount]; float typ_hi[kFeatureCount]; float tol_lo[kFeatureCount]; float tol_hi[kFeatureCount]; float w[kFeatureCount]; };", "",
           "inline constexpr Profile kProfiles[] = {"]
-    for n in sets:
+    for n in pnames:
         p = prof.p[n]; arr = lambda v: "{" + ", ".join(fl(x) for x in v) + "}"
         pr.append(f'    {{"{n}", {p["n"]}, {arr(p["med"])},\n     {arr(p["typ"][:, 0])},\n     {arr(p["typ"][:, 1])},\n     {arr(p["tol"][:, 0])},\n     {arr(p["tol"][:, 1])},\n     {arr(p["w"])}}},')
-    pr += ["};", f"inline constexpr int kProfileCount = {len(sets)};", "", "}}  // namespace nerva::motion", ""]
+    pr += ["};", f"inline constexpr int kProfileCount = {len(pnames)};", "", "}}  // namespace nerva::motion", ""]
     write("nerva_motion_profiles.hpp", "\n".join(pr))
-    if a.with_clips:
-        idx = ["// GENERATED by tools/export_headers.py - do not edit by hand. LOCAL USE ONLY (contains real CMU clips: do not commit).", "// Include this header: it pulls in every example set and the grader profiles.", "//   for (const auto& s : nerva::motion::kActions) { ... s.name, s.clips ... }",
+    if with_clips:
+        idx = ["// GENERATED by tools/export_headers.py - do not edit by hand.\n" + LEGAL, "// Include this header: it pulls in every example set and the grader profiles.", "//   for (const auto& s : nerva::motion::kActions) { ... s.name, s.clips ... }",
                '//   const nerva::motion::ActionSet* sit = nerva::motion::find("sit");', "#pragma once", "#define NERVA_MOTION_HAS_CLIPS 1", '#include "nerva_motion_core.hpp"', '#include "nerva_motion_profiles.hpp"']
         idx += [f'#include "nerva_motion_{n}.hpp"' for n in sets] + ["#include <cstring>", "", "namespace nerva { namespace motion {", "",
                 f"inline constexpr int kActionCount = {len(sets)};", "inline constexpr ActionSet kActions[kActionCount] = {"] + [f"    data_{n}::kSet," for n in sets] + ["};", "",
@@ -189,7 +210,7 @@ def main():
                "namespace nerva { namespace motion {", "",
                "inline const Profile* find_profile(const char* name) { for (const auto& p : kProfiles) if (std::strcmp(p.action, name) == 0) return &p; return nullptr; }", "", "}}  // namespace nerva::motion", ""]
     write("nerva_motion.hpp", "\n".join(idx))
-    tot = sum(s for _, s in written); print(f"wrote {len(written)} headers to {a.out}  ({tot / 1e6:.2f} MB; {len(sets)} actions" + (f", {a.clips} clips each at {fps} fps, <= {a.max_secs:g} s - LOCAL USE ONLY, do not commit)" if a.with_clips else ", no motion clips)"))
+    tot = sum(s for _, s in written); print(f"wrote {len(written)} headers to {a.out}  ({tot / 1e6:.2f} MB; {len(sets)} actions with clips, {len(pnames)} profiles" + (f", {a.clips} clips each at {fps} fps, <= {a.max_secs:g} s" + (" - LOCAL USE ONLY, do not commit" if a.cmu_local else "") + ")" if with_clips else ", no motion clips)"))
     for nme, sz in written:
         print(f"  {nme:34s}{sz / 1024:9.1f} KB")
     print(f"\nuse it:   #include \"motion/nerva_motion.hpp\"   (compile with -I{os.path.dirname(a.out.rstrip('/')) or '.'})")
