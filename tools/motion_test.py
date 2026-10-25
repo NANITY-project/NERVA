@@ -85,12 +85,16 @@ def main():
     step("variation: variants of one clip pass the grader and are not copies of it or of each other", len(kept) >= 4 and all(MV.rep_dist(MV.clip_rep(k), [r0]) >= MV.MIN_DIST for k in kept), f"{len(kept)} of 30 kept")
     s1, i1 = back.serve(0, prof); s2, i2 = back.serve(0, prof)
     step("muscle memory: serve() never gives the same variant twice (and records its seeds)", s1 is not None and s2 is not None and MV.rep_dist(MV.clip_rep(s1), [MV.clip_rep(s2)]) > 0 and len(back.entries[0]["seeds"]) == 2, f"seeds {[x[0] for x in back.entries[0]['seeds']]}")
-    bd = os.path.join(tmp, "vae"); cmd = [sys.executable, os.path.join(HERE, "build_vae_dataset.py"), "--real", real, "--hours", "0.12", "--engine-clips", "40", "--no-jsonl", "--include-cmu", "--out", bd, "--memory", os.path.join(tmp, "vmem")] + ([] if a.engine else ["--no-engine"])
+    # CMU is never a training source. To test the pipeline without ACCAD/100STYLE downloads, a copy of the CMU examples stands in for a CC BY set (relabelled source "accad"; never leaves the temp folder)
+    z0, _ = G.load_real(real, cc=False); n0 = len(z0["action"]); cc_test = os.path.join(tmp, "cc_motions.npz")
+    np.savez(cc_test, actions=z0["actions"], offsets=z0["offsets"], dt=z0["dt"], angles=z0["angles"], labels=z0["labels"], action=z0["action"], performer=np.array(["accad:" + str(p) for p in z0["performer"]]),
+             description=z0["description"], kind=z0["kind"], source=np.array(["accad"] * n0), style_label=np.array([""] * n0))
+    bd = os.path.join(tmp, "vae"); cmd = [sys.executable, os.path.join(HERE, "build_vae_dataset.py"), "--real", real, "--cc", cc_test, "--hours", "0.12", "--engine-clips", "40", "--no-jsonl", "--out", bd, "--memory", os.path.join(tmp, "vmem")] + ([] if a.engine else ["--no-engine"])
     r = run(cmd); okf = r.returncode == 0 and all(os.path.exists(os.path.join(bd, f)) for f in ("train_windows.npz", "val_windows.npz", "stats.json", "report.txt", "preview.npz"))
     tw = np.load(os.path.join(bd, "train_windows.npz"), allow_pickle=True) if okf else None; vw = np.load(os.path.join(bd, "val_windows.npz"), allow_pickle=True) if okf else None
-    step("build_vae_dataset.py: one command builds windows, stats and a report; no source in both splits", okf and len(tw["windows"]) > 0 and np.isfinite(tw["windows"]).all() and not (set(tw["origin_id"].tolist()) & set(vw["origin_id"].tolist())), (r.stdout + r.stderr)[-200:] if not okf else f"{len(tw['windows'])} train windows")
+    step("build_vae_dataset.py: one command builds windows, stats and a report; no source in both splits, none from CMU", okf and len(tw["windows"]) > 0 and np.isfinite(tw["windows"]).all() and not (set(tw["origin_id"].tolist()) & set(vw["origin_id"].tolist())) and "cmu" not in set(map(str, tw["source"])), (r.stdout + r.stderr)[-200:] if not okf else f"{len(tw['windows'])} train windows; sources {sorted(set(map(str, tw['source'])))}")
     # 4 ---------------------------------------------------------------- headers
-    hdr = os.path.join(tmp, "motion"); r = run([sys.executable, os.path.join(HERE, "export_headers.py"), "--out", hdr, "--real", real, "--clips", "3" if a.quick else "6"])
+    hdr = os.path.join(tmp, "motion"); r = run([sys.executable, os.path.join(HERE, "export_headers.py"), "--out", hdr, "--real", real, "--cc", cc_test, "--clips", "3" if a.quick else "6"])
     ok = r.returncode == 0; print("      " + (r.stdout.splitlines()[0] if r.stdout else r.stderr[-300:]))
     cxx = os.environ.get("CXX") or shutil.which("g++") or shutil.which("clang++") or shutil.which("c++")
     if ok and cxx:
