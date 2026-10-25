@@ -79,6 +79,8 @@ python3 tools/train_cvqvae.py --data data/vae --out runs/cvqvae
 python3 tools/view_clip.py runs/cvqvae/gen_preview.npz --open
 ```
 
+`tools/gen_actions.py` makes engine clips of non-walking actions (stand, turn, balance, crouch, pickup, wave/point, stretch, drink, jump) from scripts of the engine's own commands; `build_vae_dataset.py --engine-skills N` keeps only the ones the engine accepts and the grader calls that action. Jump is verified live, not by replay; there is no sit, run, kick, dance or get-up.
+
 `train_cvqvae.py` trains the VAE, checks the codebook, tokenizes the data, trains the prior and samples new clips. `--stage` runs a single stage and `--vae-ckpt` reuses a VAE you already trained. `--params-only` prints the parameter counts. Generated clips are stitched into longer ones and can be graded with `--grade`. The engine does not verify them in that script; the UI shows the engine's per-frame corrections when you play one.
 
 ## Running a model against the overlay
