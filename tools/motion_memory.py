@@ -4,7 +4,7 @@ motion_memory.py - "muscle memory": a store of motions that are VALID (a body ca
 replayed the same way. It holds the whole motion collection (the CMU examples and the engine's clips), plus the motions that are not one of the grader's labelled actions
 (no "wave", "open the fridge", "scratch head" in the CMU label set).
 
-  python tools/motion_memory.py seed                                                 # fill the memory with the real CMU examples (647 clips, named by action, kind 'known')
+  python tools/motion_memory.py seed                                                 # fill the memory with the ACCAD/OSU + 100STYLE examples (data/cc_motions.npz, named by action, kind 'known'); never CMU
   python tools/motion_memory.py add data/clips.npz --clip 4 --name wave_hello        # keep clip 4 under a name (several examples may share a name)
   python tools/motion_memory.py add-segments data/seg.npz                            # keep every segment motion_roll.py called 'novel' (auto-named unlabelled_001 ...)
   python tools/motion_memory.py list                                                 # what is stored, how strong each memory is
@@ -23,7 +23,7 @@ How it behaves like a memory, not a folder
     with --engine-check, the engine accepts it. Limit: running/jumping are broadband, so their limit is loose; mild noise (~5-12 mm) on a clip whose nearest action is
     one of those can get in. Gross jitter (cm) is caught. A near-duplicate of something already stored under the same name is not stored twice: it REINFORCES the existing one.
   * KIND: `known` = a labelled example (the CMU seeds, the engine's walks); `novel` = fits no known action well (best fit over all 24 < 60); `variant:<action>` = a version of
-    a known action, kept because you named it. ORIGIN says where it came from: cmu, engine, user.
+    a known action, kept because you named it. ORIGIN says where it came from: accad, 100style, engine, user (cmu = an old memory seeded before CMU was removed from training; build_vae_dataset.py ignores those).
   * STRENGTH: new memories start at 1.0, every use adds 0.5 (max 3.0), and strength halves for every 14 days without use. Recall ranks by similarity divided by
     (0.5 + strength), so what you really use comes first, rarely used things fade to the back and, after ~5 weeks unused, become `prune` candidates. Nothing is deleted without --yes.
   * NEVER THE SAME TWICE: serve() makes a variant with tools/motion_vary.py (smooth speed / amplitude / gaze / drift / tremor / mirror changes, heavy-tailed strength, an
@@ -187,17 +187,25 @@ def memory_profiles(mem, real_F, real_action, min_n=MIN_PROMOTE):
     return G.Profiles(F, act), sorted(promo)
 
 
-def seed_from_real(mem, zr, RF, prof, per_action=0, actions=None, rng=None, log=print):
-    """Store the real CMU examples (named by their action, kind 'known', origin 'cmu'). Returns counts."""
+TRAINING_SOURCES = ("accad", "100style")        # the CC BY sets (tools/get_cc_motions.py). CMU examples are the grader's yardstick only: never stored as training motions (docs/CREDITS.md)
+
+
+def seed_from_real(mem, zr, RF, prof, per_action=0, actions=None, rng=None, log=print, sources=TRAINING_SOURCES):
+    """Store the reference examples that may be trained on (ACCAD/OSU and 100STYLE: named by their action, kind 'known', origin 'accad' / '100style'). CMU examples are never
+    stored: they carry a no-redistribution licence and are the grader's yardstick only. Returns counts."""
+    if "cmu" in sources:
+        raise ValueError("CMU motion capture is not a training source (its licence forbids redistributing it, even converted); see docs/CREDITS.md")
     A, off, dt = zr["actions"], zr["offsets"], float(zr["dt"]); act = [str(x) for x in zr["action"]]; perf = zr["performer"]; lab = zr["labels"]
-    order = list(range(len(act))); rng = rng or np.random.default_rng(0)
+    src = [str(x) for x in zr["source"]] if "source" in zr.files else ["cmu"] * len(act)
+    sty = [str(x) for x in zr["style_label"]] if "style_label" in zr.files else [""] * len(act)
+    order = [i for i in range(len(act)) if src[i] in sources]; rng = rng or np.random.default_rng(0)
     rng.shuffle(order); count = {}; res = dict(stored=0, reinforced=0, rejected=0)
     for i in order:
         if actions and act[i] not in actions:
             continue
         if per_action and count.get(act[i], 0) >= per_action:
             continue
-        st, msg, _ = mem.add(A[off[i]:off[i + 1]], dt, act[i], prof, RF, source=f"cmu:{lab[i]}", origin="cmu", kind="known", allow_dup=True, meta=dict(performer=str(perf[i]), cmu_trial=str(lab[i])))
+        st, msg, _ = mem.add(A[off[i]:off[i + 1]], dt, act[i], prof, RF, source=f"{src[i]}:{lab[i]}", origin=src[i], kind="known", allow_dup=True, meta=dict(performer=str(perf[i]), trial=str(lab[i]), style=sty[i]))
         res[st] += 1
         if st == "stored":
             count[act[i]] = count.get(act[i], 0) + 1
@@ -243,7 +251,7 @@ def main():
         by = {}
         for e in mem.entries:
             by[e["name"]] = by.get(e["name"], 0) + 1
-        print(f"seeded {r['stored']} CMU examples ({r['reinforced']} duplicates, {r['rejected']} rejected by the gates) in {time.time() - t0:.0f}s; memory now holds {len(mem.entries)} motions, {len(by)} names, {sum(len(c) for c in mem.clips) * mem.dt / 3600:.2f} h")
+        print(f"seeded {r['stored']} ACCAD/100STYLE examples ({r['reinforced']} duplicates, {r['rejected']} rejected by the gates) in {time.time() - t0:.0f}s; memory now holds {len(mem.entries)} motions, {len(by)} names, {sum(len(c) for c in mem.clips) * mem.dt / 3600:.2f} h")
     elif a.cmd in ("add", "add-segments"):
         if not a.arg:
             ap.error("pass the clips npz")
@@ -272,7 +280,7 @@ def main():
         mem.save(); print(f"\n{n_new} stored, {n_re} reinforced; memory now holds {len(mem.entries)} motions in {a.dir}")
     elif a.cmd == "list":
         if not mem.entries:
-            print("memory is empty (python tools/motion_memory.py seed fills it with the real CMU examples)"); return
+            print("memory is empty (python tools/motion_memory.py seed fills it with the ACCAD/OSU + 100STYLE examples)"); return
         now = time.time(); names = {}
         for e in mem.entries:
             names.setdefault(e["name"], []).append(e)
