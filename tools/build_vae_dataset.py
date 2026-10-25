@@ -25,7 +25,9 @@ Output fields per clip (jsonl): id, action, source (accad/100style/engine/user),
 Channel layout (30): see CHANNELS in this file and stats.json. Flags (contact / on) are 0/1: do not normalise them (stats.json lists them as `binary`); yaw channels are angles.
 
 HONEST NOTES (also in report.txt, with the numbers of this run)
-  * The engine can only generate walking so far. Everything else in the set (sit, run, jump, ...) is derived from the real ACCAD/OSU and 100STYLE clips, which the ENGINE REJECTS (the report
+  * The engine makes walking (gen_dataset.py) and a scripted set of other actions (gen_actions.py: stand, turn, balance, crouch, pickup, wave/point, stretch, drink, jump), kept only if the
+    grader also calls them that action. Jump cannot be replay-checked (engine_ok = null; the engine ran it live without falling). No sit, run, kick, dance or get-up: the engine cannot do those yet.
+    Everything else in the set (sit, run, ...) is derived from the real ACCAD/OSU and 100STYLE clips, which the ENGINE REJECTS (the report
     prints the measured share: balance lost, planted feet slide; a retargeting / contact-flag problem of bvh_to_clip.py, not of the grader). They are graded by the
     mocap-based grader, not verified by the engine. engine_ok in each record says which is which. With --no-cc the set is what the engine can vouch for, plus your stored motions: walking from the engine, other actions only if you add them.
   * Variants are the same motion performed differently. 10 h built from 1 h of sources is 1 h of information at ten times the weight. For an 80M-parameter model the report
@@ -64,6 +66,7 @@ def main():
     ap.add_argument("--hours", type=float, default=10.0, help="training motion to build, in hours (originals + variants); default 10")
     ap.add_argument("--out", default="data/vae"); ap.add_argument("--memory", default=MM.DEFAULT_DIR); ap.add_argument("--real", default=G.REAL_DEFAULT)
     ap.add_argument("--engine-clips", type=int, default=1500, help="walking clips to ask the engine for (duplicates and infeasible ones are dropped)"); ap.add_argument("--no-engine", action="store_true")
+    ap.add_argument("--engine-skills", type=int, default=150, help="clips PER SKILL to ask tools/gen_actions.py for (stand, turn, balance, crouch, pickup, wave, point, stretch, drink, jump); only clips the engine accepts AND the grader recognises as that action are kept; 0 = walking only")
     ap.add_argument("--cc", default=None, help="the ACCAD/OSU + 100STYLE set to train on and grade against (default: data/cc_motions.npz next to --real, if it exists)")
     ap.add_argument("--no-cc", action="store_true", help="do not seed the memory with the ACCAD/OSU + 100STYLE examples (tools/get_cc_motions.py): engine clips and your stored motions only")
     ap.add_argument("--include-cmu", action="store_true", help=argparse.SUPPRESS)      # removed: CMU is not a training source any more; kept only to explain why
@@ -106,10 +109,25 @@ def main():
             log(f"engine: {len(ec)} feasible clips generated, {st['stored']} stored in memory, {st['reinforced']} near-duplicates merged, {st['rejected']} rejected by the gates")
         else:
             log("engine clip generation failed: " + (r.stderr or r.stdout)[-300:])
+    if chk is not None and a.engine_skills > 0:
+        sdir = os.path.join(a.out, "engine_skills"); r = subprocess.run([sys.executable, os.path.join(HERE, "gen_actions.py"), "--n", str(a.engine_skills), "--out", sdir, "--seed", str(a.seed), "--real", a.real, "--no-grade"], capture_output=True, text=True)
+        if r.returncode == 0 and os.path.exists(os.path.join(sdir, "clips.npz")):
+            sz = np.load(sdir + "/clips.npz", allow_pickle=True); sc_ = G.split_clips(sz); st = collections.Counter(); per = collections.defaultdict(collections.Counter)
+            for k, c in enumerate(sc_):
+                act = str(sz["action"][k]); rep = str(sz["replay"][k]); g = G.grade_clip(c, float(sz["dt"]), act, prof)
+                if not (g["recognised"] and g["score"] is not None and g["score"] >= G.PASS_SCORE):       # the engine accepted it, but a real-motion grader must also call it that action
+                    st["not graded as the action"] += 1; per[act]["graded out"] += 1; continue
+                s_, _, _ = mem.add(c, float(sz["dt"]), act, prof, RF, source=f"engine_skill:{sz['skill'][k]}:{a.seed}#{k}", origin="engine", kind="known", feasible=None if rep == "live" else True, meta=dict(engine_replay=rep, skill=str(sz["skill"][k])))
+                st[s_] += 1; per[act][s_] += 1
+            log(f"engine skills: {len(sc_)} engine-accepted clips, {st['stored']} stored in memory, {st['not graded as the action']} dropped because the grader does not call them that action, {st['reinforced']} near-duplicates merged, {st['rejected']} rejected by the gates")
+            for act in sorted(per):
+                log(f"    {act:9s} stored {per[act]['stored']:4d}, graded out {per[act]['graded out']:4d}, rejected {per[act]['rejected']:3d}")
+        else:
+            log("engine skill generation failed: " + (r.stderr or r.stdout)[-300:])
     mem.save()
     keep = [i for i, e in enumerate(mem.entries) if e.get("origin") != "cmu" and not (a.no_cc and e.get("origin") in MM.TRAINING_SOURCES)]     # a memory seeded before CMU was removed may still hold origin "cmu": never trained on
     cc_keep = [i for i in keep if mem.entries[i].get("origin") in MM.TRAINING_SOURCES]                    # a mocap set can hold one motion twice under different performer ids (CMU did: 77/139, 91/105, 93/103): keep one copy,
-    dup = {cc_keep[j] for _, j in V.duplicate_pairs([mem.clips[i] for i in cc_keep])}                     # otherwise a "held-out performer" can have an identical twin in training
+    dup = {cc_keep[j] for _, j in V.duplicate_pairs([mem.clips[i] for i in cc_keep])} if len(cc_keep) > 1 else set()                     # otherwise a "held-out performer" can have an identical twin in training
     if dup:
         keep = [i for i in keep if i not in dup]; log(f"dropped {len(dup)} ACCAD/100STYLE clips that are exact duplicates of another performer's clip (the copy stays out of both splits)")
     if not keep:
@@ -160,7 +178,7 @@ def main():
     T = a.hours * 3600 / dt; orig_fr = sum(nfr[i] for i in train); records = []                                        # records: dict(clip, action, source, role, origin_id, ...)
     for i in train:
         records.append(dict(clip=mem.clips[i], action=name[i], source=origin[i], role="original", origin_id=mem.entries[i]["id"], ops=[], strength=None, uncommon=False,
-                            engine_ok=True if origin[i] == "engine" else None, fit=mem.entries[i]["best_known_fit"], group=group[i]))
+                            engine_ok=True if origin[i] == "engine" and mem.entries[i].get("engine_replay") in (None, "ok", "own_start") else None, fit=mem.entries[i]["best_known_fit"], group=group[i]))
     names = sorted(set(name[i] for i in train)); cnt = {n: sum(1 for i in train if name[i] == n) for n in names}; ofr = {n: sum(nfr[i] for i in train if name[i] == n) for n in names}
     w = {n: cnt[n] ** a.balance for n in names}; sw = sum(w.values()); tgt = {n: T * w[n] / sw for n in names}; quota = {n: max(0.0, tgt[n] - ofr[n]) for n in names}
     need = max(0.0, T - orig_fr); qs = sum(quota.values())
@@ -180,7 +198,7 @@ def main():
                 ctx[i] = mem._context(i, prof)
             act, fit0, r0 = ctx[i]; b, info = V.make_variant(mem.clips[i], dt, r_n, a.uncommon); ok, why, v, fit, d = V.check_variant(b, dt, act, prof, fit0, r0, sib[i])
             eng = None
-            if ok and origin[i] == "engine" and chk is not None:
+            if ok and origin[i] == "engine" and chk is not None and mem.entries[i].get("engine_replay") in (None, "ok"):
                 eng = bool(chk.evaluate(b, dt)["feasible"])
                 if not eng:
                     ok, why = False, "engine verdict"
@@ -197,7 +215,7 @@ def main():
 
     # 6 ------------------------------------------------------------------------------------------------------------ write
     vrecs = [dict(clip=mem.clips[i], action=name[i], source=origin[i], role="original", origin_id=mem.entries[i]["id"], ops=[], strength=None, uncommon=False,
-                  engine_ok=True if origin[i] == "engine" else None, fit=mem.entries[i]["best_known_fit"], group=group[i]) for i in vlist]
+                  engine_ok=True if origin[i] == "engine" and mem.entries[i].get("engine_replay") in (None, "ok", "own_start") else None, fit=mem.entries[i]["best_known_fit"], group=group[i]) for i in vlist]
     allnames = sorted(set(r["action"] for r in records + vrecs)); aid = {n: k for k, n in enumerate(allnames)}
     out = lambda f: os.path.join(a.out, f)
     if not a.no_jsonl:
