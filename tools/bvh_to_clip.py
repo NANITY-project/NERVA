@@ -11,12 +11,20 @@ as engine / generator clips (tools/realism.py), and, if you want, replay them in
 What it does: forward kinematics of the BVH skeleton, uniformly scaled so the leg (hip to ankle) is the engine's length (so the file's unit - cm, inch, m - does not matter),
 rotated/translated so the clip starts at the origin facing +Z, then reads off pelvis, foot soles, foot yaw, contact flags (foot low AND slow),
 wrists, neck base and a gaze point. It also saves the joint angles the engine cannot be asked for (knee, elbow, trunk lean) as `angles`.
-Skeletons: joints are found by NAME, whatever the capture system called them (CMU LeftUpLeg/LeftLeg/LeftFoot/LeftToeBase, 100STYLE LeftHip/LeftKnee/LeftAnkle/LeftToe with\nLeftShoulder = upper arm, Mixamo, Bip01 L Thigh ...; see PARTS below). A file whose up axis is not +Y (some exports are Z-up) is turned upright first. If a joint cannot be\nfound the error lists the joint names of the file: `python tools/bvh_to_clip.py --probe file.bvh` shows how each one was read.\nOutput npz keys match gen_dataset.py (actions, offsets, dt, ...) plus: angles [F,5] (kneeL kneeR elbowL elbowR trunk_lean, degrees), labels.
+Skeletons: joints are found by NAME, whatever the capture system called them (CMU LeftUpLeg/LeftLeg/LeftFoot/LeftToeBase, 100STYLE LeftHip/LeftKnee/LeftAnkle/LeftToe with
+LeftShoulder = upper arm, Mixamo, Bip01 L Thigh ...; see PARTS below). A file whose up axis is not +Y (some exports are Z-up) is turned upright first. If a joint cannot be
+found the error lists the joint names of the file: `python tools/bvh_to_clip.py --probe file.bvh` shows how each one was read.
+Output npz keys match gen_dataset.py (actions, offsets, dt, ...) plus: angles [F,5] (kneeL kneeR elbowL elbowR trunk_lean, degrees), labels.
+It also saves `torso` [F,7,4]: the ORIENTATION of the spine (3 bones), neck, head and both clavicles in every frame, read from the BVH rotations (the CMU files
+have LowerBack / Spine / Spine1 / Neck / Neck1 / Head / LeftShoulder / RightShoulder), as quaternions (w,x,y,z) in the pelvis heading frame; torso_names lists the
+bones (tools/torso_math.py). Orientations only, never positions: scaled to the engine's legs the CMU torso is about half the engine's length, so positions do not
+transfer but rotations do. Feed it to the body with Body.track_clip(actions, torso=...) so the whole body follows the capture, not just the hands and feet.
 Contact detection is a heuristic; mocap feet roll and slip a little, so real clips will not pass the engine's strict "planted feet never slide"
 verdict. That is expected: judge them with realism.py, not with the physics verdict.
 """
 import argparse, os, re, sys, warnings
 import numpy as np
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))          # torso_math lives next to this file, also when it is run as a script in isolated mode
 
 ENGINE_LEG = 0.867      # hip joint to ankle joint, metres (thigh 0.437 + shin 0.430 in the engine)
 ANKLE_H = 0.08          # ankle joint height above the sole in the engine
@@ -34,6 +42,8 @@ def load_bvh(path):
             joints.append(dict(name=toks[i + 1], parent=stack[-1] if stack else -1, off=None, ch=[])); stack.append(len(joints) - 1); i += 2; continue
         if t == "End":
             stack.append(-2); i += 2; continue                      # End Site: skip its block
+        if t == "OFFSET" and len(stack) > 1 and stack[-1] == -2 and stack[-2] >= 0:      # an End Site's offset: the rest direction of a leaf bone (the head)
+            joints[stack[-2]]["end"] = np.array([float(x) for x in toks[i + 1:i + 4]]); i += 4; continue
         if t == "OFFSET" and stack and stack[-1] >= 0:
             joints[stack[-1]]["off"] = np.array([float(x) for x in toks[i + 1:i + 4]]); i += 4; continue
         if t == "CHANNELS" and stack and stack[-1] >= 0:
@@ -178,7 +188,109 @@ def lowpass(x, fs, fc=6.0, order=4):
     return np.fft.irfft(np.fft.rfft(rp, axis=0) * h, len(rp), axis=0)[pad:pad + F] + ramp
 
 
+def resolve_torso(joints, up=None):
+    """Find the BVH joints behind the engine's torso bones BY HIERARCHY, not by name (CMU conversions differ: LowerBack/Spine/Spine1, or Spine/Spine1/Chest...).
+    Returns dict: spine (joint ids, root side first), neck (ids), head, clav (left, right), and the rest-pose bone direction of each (unit vectors, BVH axes).
+    up: the file's own 'up' axis as a vector in the file's axes (default +Y; a Z-up file passes +Z): the direction given to a zero-length bone and to a head without an End Site."""
+    names = [j["name"] for j in joints]; low = [n.lower() for n in names]
+    def find(*c):
+        for n in c:
+            if n.lower() in low:
+                return low.index(n.lower())
+        return None
+    head = find("Head")
+    if head is None:
+        raise ValueError("no Head joint")
+    chain, k = [], head
+    while k >= 0:
+        chain.append(k); k = joints[k]["parent"]
+    chain = chain[::-1]                                                    # root ... head
+    neck = [k for k in chain[1:-1] if "neck" in low[k]] or [chain[-2]]
+    spine = [k for k in chain[1:-1] if k not in neck]
+    if not spine:
+        raise ValueError("no spine joints between the root and the neck")
+    larm, rarm = find("LeftArm", "LeftUpperArm", "LeftShoulder_arm"), find("RightArm", "RightUpperArm")
+    if larm is None or rarm is None:
+        raise ValueError("no LeftArm / RightArm joint")
+    clav = []
+    for a in (larm, rarm):
+        p = joints[a]["parent"]
+        if p < 0 or p in chain:
+            raise ValueError("the arm hangs straight off the spine: no clavicle joint")
+        clav.append(p)
+    # rest direction of a bone = the unit offset of the next joint along it; the top spine joint (it carries the neck and both shoulders at the same point,
+    # a zero-length bone) continues the direction of the bone below it
+    unit = lambda v: v / np.linalg.norm(v)
+    up = np.array([0.0, 1.0, 0.0]) if up is None else np.asarray(up, np.float64)
+    rest, prev = {}, up
+    for i, k in enumerate(spine):
+        nxt = spine[i + 1] if i + 1 < len(spine) else None
+        v = joints[nxt]["off"] if nxt is not None else None
+        if v is None or np.linalg.norm(v) < 1e-6:
+            v = prev
+        rest[k] = prev = unit(v)
+    end = joints[head].get("end"); rest[head] = unit(end) if end is not None and np.linalg.norm(end) > 1e-6 else up
+    return dict(spine=spine, neck=neck, head=head, clav=clav, arm=[larm, rarm], rest=rest)
+
+
+def torso_orientations(joints, sk, yaw, fs, cutoff_hz=6.0, front=None, up=None):
+    """Orientation of the engine's seven torso bones (spine1, spine2, spine3, neck, head, clavicle L, clavicle R; tools/torso_math.py) for every frame.
+    PROPORTION-FREE: only directions and rotations are used, never joint positions: scaled to the engine's legs the CMU skeleton's torso is only about half
+    as long as the engine's (its Spine1 joint, which carries the neck and both shoulders, sits 0.24 m above the hips, the engine's neck base 0.48 m), so
+    positions cannot transfer but orientations do. Expressed in the pelvis HEADING frame (rotated by the per-frame hip-line yaw only), because the engine's
+    pelvis is upright; the real pelvis tilt stays inside the lumbar rotation, so the trunk's world orientation is preserved.
+    Returns [F,7,4] float32 quaternions (w,x,y,z), continuous in time. cutoff_hz low-passes the directions the way convert() does the hands and neck.
+    front / up: which way the bones' own local axes face at rest and which way is up, as vectors in the FILE's axes. CMU: front +Z, up +Y (the defaults); other skeletons differ
+    (convert_full reads them off the rest pose, so a 100STYLE / ACCAD / Z-up file needs nothing from you)."""
+    import torso_math as T
+    tj = resolve_torso(joints, up); names = [j["name"] for j in joints]; F = len(yaw)
+    pos = lambda k: sk[names[k]][0]; R = lambda k: sk[names[k]][1]
+    z = np.array([0.0, 0.0, 1.0]) if front is None else np.asarray(front, np.float64)
+    dirs, hints = [], []
+    sp = tj["spine"]
+    for e in range(3):                                                     # engine spine bone e <- BVH spine joint (identity for the usual three)
+        k = sp[int(round(e * (len(sp) - 1) / 2.0))]
+        dirs.append(R(k) @ tj["rest"][k]); hints.append(R(k) @ z)
+    nk = tj["neck"]
+    chord = pos(tj["head"]) - pos(nk[0])
+    dirs.append(chord); hints.append(R(nk[-1]) @ z)                        # the neck: the chord from the neck's first joint to the head joint, front from its top joint
+    # The HEAD joint's own axes are not calibrated across performers: walking, the head's mean tilt from vertical is 3-8 degrees for some CMU performers and 25-35 for
+    # others (the neck chord, which comes from joint positions, says 4-11 for all of them), so it is a per-skeleton rest-pose offset, not a posture. Fix it per file:
+    # the head's axis is the head-local direction that, on average over the clip, lies along the neck chord. The head's MOTION relative to the neck is untouched
+    # (nods, turns, tilts); only its constant offset is removed. The correction is limited to 45 degrees.
+    Rh = R(tj["head"]); cu = chord / np.linalg.norm(chord, axis=1, keepdims=True)
+    u = np.einsum("fji,fj->fi", Rh, cu).mean(0); u = u / np.linalg.norm(u)                 # mean chord direction in head-local axes
+    u0 = tj["rest"][tj["head"]]
+    if np.degrees(np.arccos(np.clip(u @ u0, -1, 1))) > 45:                                 # implausible: blend back toward the rest direction
+        w_ = u0 + (u - u0) * (np.radians(45) / max(np.arccos(np.clip(u @ u0, -1, 1)), 1e-9)); u = w_ / np.linalg.norm(w_)
+    a_ = np.cross(u0, u); sn = np.linalg.norm(a_); cs = float(u0 @ u)
+    if sn < 1e-9:
+        Qh = np.eye(3)
+    else:                                                                   # Rodrigues: the rotation taking the rest axis u0 to the calibrated axis u
+        k_ = a_ / sn; K = np.array([[0, -k_[2], k_[1]], [k_[2], 0, -k_[0]], [-k_[1], k_[0], 0]]); Qh = np.eye(3) + sn * K + (1 - cs) * (K @ K)
+    dirs.append(Rh @ u); hints.append(Rh @ (Qh @ z))
+    for c, a in zip(tj["clav"], tj["arm"]):
+        dirs.append(pos(a) - pos(c)); hints.append(R(c) @ z)               # a clavicle: from its joint to the shoulder (arm) joint
+    c, s = np.cos(yaw), np.sin(yaw)                                         # into the heading frame: x' = x c - z s, z' = x s + z c  (maps forward(yaw) to +Z)
+    def head_frame(v):
+        v = np.asarray(v, np.float64); return np.stack([v[:, 0] * c - v[:, 2] * s, v[:, 1], v[:, 0] * s + v[:, 2] * c], 1)
+    Q = np.empty((F, T.N, 4))
+    for k in range(T.N):
+        d, h = head_frame(dirs[k]), head_frame(hints[k])
+        if cutoff_hz:
+            d, h = lowpass(d, fs, cutoff_hz), lowpass(h, fs, cutoff_hz)
+        Q[:, k] = T.mat_to_quat(T.frame_matrix(d, h))
+        Q[:, k] = T.unwrap_quats(Q[:, k])
+    return Q.astype(np.float32)
+
+
 def convert(path, fps=30, hand_cutoff_hz=6.0, rows=None):
+    """BVH file -> (actions [F,30], angles [F,5], dt). See convert_full for the whole story; this keeps the original three return values."""
+    A, ang, _, dt = convert_full(path, fps, hand_cutoff_hz, rows)
+    return A, ang, dt
+
+
+def convert_full(path, fps=30, hand_cutoff_hz=6.0, rows=None):
     """BVH file -> (actions [F,30], angles [F,5], dt). hand_cutoff_hz: the CMU hand joints jitter by about 2 cm (marker noise: 0.4-1 m/s of >6 Hz velocity even
     while standing still), so hands, neck and gaze are low-passed at this cutoff at the file's native rate (120 Hz) before the clip is decimated to `fps`.
     Human voluntary motion lives well below 6 Hz; without this the 'real' reference would teach a grader that jitter is normal. None/0 turns it off.
@@ -261,29 +373,43 @@ def convert(path, fps=30, hand_cutoff_hz=6.0, rows=None):
     tr = neck - hip_c; hdir = np.stack([np.sin(yaw_c), np.zeros_like(yaw_c), np.cos(yaw_c)], 1)
     lean = np.degrees(np.arctan2((tr * hdir).sum(1), tr[:, 1]))
     ang = np.stack([kn("Left"), kn("Right"), el("Left"), el("Right"), lean], 1).astype(np.float32)
-    return A[::step], ang[::step], dt
+    try:                                                                 # the torso bones' orientations (a skeleton without a recognisable spine / clavicles just has none)
+        torso = torso_orientations(joints, sk, yaw, 1.0 / dt0, hand_cutoff_hz, front=head_fwd, up=Q.T @ np.array([0.0, 1.0, 0.0]))[::step]
+    except ValueError:
+        torso = None
+    return A[::step], ang[::step], torso, dt
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("bvh", nargs="+"); ap.add_argument("--out", default="real.npz"); ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--probe", action="store_true", help="only show how the skeleton of each file is read (joint roles, up axis, frames, rate), convert nothing")
-    a = ap.parse_args(); acts, angs, labels, dts = [], [], [], []
+    a = ap.parse_args(); acts, angs, tors, labels, dts = [], [], [], [], []
     if a.probe:
         for p in a.bvh:
             joints, data, ft = load_bvh(p); print(f"{p}: {len(joints)} joints, {len(data)} frames at {1 / ft:.1f} Hz")
             try:
                 orig = adapt_skeleton(joints); rest = forward_kinematics(joints, np.zeros((1, data.shape[1]))); Q = up_rotation(rest)
                 print("  roles read as:  " + ", ".join(f"{k} <- {v}" for k, v in orig.items()) + f"\n  up axis: {'+Y' if np.allclose(Q, np.eye(3)) else 'not +Y, turned upright'}")
+                try:
+                    tj = resolve_torso(joints, Q.T @ np.array([0.0, 1.0, 0.0])); nm = lambda ks: "/".join(joints[k]["name"] for k in ks)
+                    print(f"  torso bones:    spine {nm(tj['spine'])}" + (f" ({len(tj['spine'])} joints -> the engine's 3 spine bones pick joints {[tj['spine'][int(round(e * (len(tj['spine']) - 1) / 2.0))] for e in range(3)]})" if len(tj['spine']) != 3 else "") +
+                          f"; neck {nm(tj['neck'])}; head {joints[tj['head']]['name']}; clavicles {nm(tj['clav'])}")
+                except ValueError as e:
+                    print("  no torso orientations: " + str(e))
             except ValueError as e:
                 print("  " + str(e))
         return
     for p in a.bvh:
-        A, ang, dt = convert(p, a.fps); acts.append(A); angs.append(ang); labels.append(os.path.splitext(os.path.basename(p))[0]); dts.append(dt)
-        print(f"  {labels[-1]}: {len(A)} frames ({len(A) * dt:.1f} s)")
+        A, ang, tq, dt = convert_full(p, a.fps); acts.append(A); angs.append(ang); tors.append(tq); labels.append(os.path.splitext(os.path.basename(p))[0]); dts.append(dt)
+        print(f"  {labels[-1]}: {len(A)} frames ({len(A) * dt:.1f} s)" + ("" if tq is not None else "  (no torso orientations: unrecognised spine / clavicles)"))
     off = np.cumsum([0] + [len(x) for x in acts])
+    extra = {}
+    if all(t is not None for t in tors):                                  # torso [F,7,4]: bone orientations in the pelvis heading frame, rows aligned with `actions`
+        import torso_math
+        extra = dict(torso=np.concatenate(tors).astype(np.float32), torso_names=np.array(torso_math.NAMES))
     np.savez_compressed(a.out, actions=np.concatenate(acts), offsets=off, angles=np.concatenate(angs), labels=np.array(labels), dt=np.float32(np.mean(dts)),
-                        style=np.zeros((len(acts), 1), np.float32), style_names=np.array(["real"]))
+                        style=np.zeros((len(acts), 1), np.float32), style_names=np.array(["real"]), **extra)
     print(f"wrote {a.out}")
 
 
