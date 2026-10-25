@@ -2,7 +2,7 @@
 """
 get_cc_motions.py - build NERVA's CC BY motion set from 100STYLE and ACCAD / Ohio State University motion capture.
 
-  python tools/get_cc_motions.py                              # 100STYLE from Zenodo (large download, cached) + ACCAD from data/cc_cache/accad if you put it there -> data/cc_motions.npz
+  python tools/get_cc_motions.py                              # 100STYLE from Zenodo + ACCAD from accad.osu.edu, both downloaded and cached -> data/cc_motions.npz
   python tools/get_cc_motions.py --accad ~/Downloads/accad    # folders and/or .zip files you downloaded from the ACCAD page (below)
   python tools/get_cc_motions.py --style100 100STYLE.zip      # a 100STYLE zip (or the unpacked folder) you already have: no download
   python tools/get_cc_motions.py --list                       # show how every file would be labelled, convert nothing (check this first!)
@@ -24,8 +24,8 @@ Where the data comes from
   100STYLE   Mason, Starke, Komura. Zenodo record 8127870, CC BY 4.0. Downloaded automatically (API lookup, resumable, md5-checked) unless you pass --style100 / --no-download.
              Files are <Style>_<CONTENT>.bvh at 60 Hz; CONTENT = FW/FR forward walk/run, TW*/TR* turning, ID idle, BW/BR backward, SW/SR sidestep. Default: FW TW1 TW2 FR TR1 TR2 TR3 ID.
              Frame_Cuts.csv (if present and readable) trims every file to the part that is the style; otherwise one second is cut off both ends.
-  ACCAD/OSU  Open Motion Project, https://accad.osu.edu/research/motion-lab/system-data, CC BY 3.0. Not downloaded automatically (the page decides what the links are): download the
-             BVH zips you want, pass the folder or the zips with --accad, or direct zip links with --accad-url.
+  ACCAD/OSU  Open Motion Project, https://accad.osu.edu/research/motion-lab/system-data, CC BY 3.0. Downloaded automatically (the three BVH zips, ~300 files, into data/cc_cache/accad; --no-accad skips it). Or pass your own
+             folder / zips with --accad, or other direct zip links with --accad-url.
 Honest limits: written without being able to download either dataset in the environment it was developed in; the skeleton, naming and labelling code was tested on files derived from
 other BVH data (tools/test_cc_sources.py). Run --list and `bvh_to_clip.py --probe` on your files first; labelling by file name is a heuristic: fix it with --map.
 """
@@ -37,6 +37,8 @@ import bvh_to_clip, motion_actions as MA, motion_features as mf, get_real_motion
 
 ZENODO_RECORD = "8127870"
 OUT_DEFAULT = "data/cc_motions.npz"
+ACCAD_URLS = ["https://accad.osu.edu/sites/accad.osu.edu/files/Female1_bvh.zip", "https://accad.osu.edu/sites/accad.osu.edu/files/Male1_bvh.zip", "https://accad.osu.edu/sites/accad.osu.edu/files/Male2_bvh.zip"]   # the BVH zips on https://accad.osu.edu/research/motion-lab/mocap-system-and-data (Female 1: 81 files, Male 1: 69, Male 2: 149)
+UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) NERVA-get_cc_motions"}      # some sites refuse Python's default agent
 CREDIT = {"100style": "100STYLE (Mason, Starke, Komura; CC BY 4.0)", "accad": "ACCAD / The Ohio State University motion capture (Open Motion Project; CC BY 3.0)"}
 FLAGS = [8, 13, 17, 21, 25, 29]
 
@@ -174,7 +176,7 @@ def download(url, dst, size=None, md5=None):
         have = os.path.getsize(part) if os.path.exists(part) else 0
         if size and have >= size:
             break
-        req = urllib.request.Request(url, headers={"Range": f"bytes={have}-"} if have else {})
+        req = urllib.request.Request(url, headers=dict(UA, **({"Range": f"bytes={have}-"} if have else {})))
         try:
             with urllib.request.urlopen(req, timeout=60) as r:
                 if have and r.status != 206:
@@ -342,7 +344,7 @@ def main():
     ap.add_argument("--style100", nargs="*", help="100STYLE zip(s) or folder (default: download from Zenodo)"); ap.add_argument("--no-style100", action="store_true")
     ap.add_argument("--accad", nargs="*", default=None, help="folders / zips / .bvh files of ACCAD data (default: <cache>/accad if it exists)")
     ap.add_argument("--accad-url", nargs="*", default=[], help="direct links to ACCAD BVH zips (from the ACCAD page); downloaded into <cache>/accad")
-    ap.add_argument("--no-download", action="store_true"); ap.add_argument("--map", help="CSV of 'regex,action' labelling rules for ACCAD file names (action skip drops)")
+    ap.add_argument("--no-accad", action="store_true", help="do not download the ACCAD zips automatically (100STYLE only)"); ap.add_argument("--no-download", action="store_true"); ap.add_argument("--map", help="CSV of 'regex,action' labelling rules for ACCAD file names (action skip drops)")
     ap.add_argument("--style-contents", nargs="+", default=STYLE_DEFAULT_CONTENTS, help="100STYLE take types to use (default: " + " ".join(STYLE_DEFAULT_CONTENTS) + ")")
     ap.add_argument("--per-file", type=int, default=3, help="max windows cut from one take"); ap.add_argument("--per-style", type=int, default=6, help="max clips per 100STYLE style and action")
     ap.add_argument("--limit", type=int, help="only the first N files (smoke test)"); ap.add_argument("--list", action="store_true")
@@ -370,6 +372,9 @@ def main():
             say("indexing 100STYLE ..."); entries += style100_entries(scan(src), contents, tmp0)
     # ACCAD
     adir = os.path.join(a.cache, "accad"); os.makedirs(adir, exist_ok=True)
+    have_accad = any(f.lower().endswith((".zip", ".bvh")) for _, _, fs in os.walk(adir) for f in fs)
+    if not a.accad and not a.accad_url and not have_accad and not a.no_accad and not a.no_download:
+        a.accad_url = list(ACCAD_URLS); say("ACCAD: downloading the Female 1, Male 1 and Male 2 BVH zips from accad.osu.edu (CC BY 3.0) ...")
     for u in a.accad_url:
         try:
             download(u, os.path.join(adir, re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.basename(u.split("?")[0]) or "accad.zip")))
