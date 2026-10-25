@@ -16,7 +16,8 @@ What it judges (the old grader judged "is this a human WALK" on thousands of ran
   3. is the dataset varied? 400 near-identical clips are worth one: spread compared with the spread of the real examples, plus a duplicate count
   4. which measures are off, for the whole dataset: "pelvis_h_min 0.78 m, real 0.45-0.60 m: body never gets as low as real examples"
 The verdict (PASS / MARGINAL / FAIL) needs all of: mean score, share of clips that pass, share recognised as the action, and variety.
-Honest limits: "human-like" means "inside the range of the real CMU performers (74 people, mostly young adults, in a lab)". Hand-drawn, stylised or exaggerated
+Honest limits: "human-like" means "inside the range of the real performers": the CMU examples (74 people, mostly young adults, in a lab) plus, when data/cc_motions.npz exists (tools/get_cc_motions.py),
+the ACCAD / OSU performers (added to the same actions) and 100STYLE (one performer, 100 styles: its own style_walk / style_run / style_idle profiles). Hand-drawn, stylised or exaggerated
 motions can score low on purpose of their style: pass --allow GROUP (height trunk legs feet rhythm speed turn hands) to stop a group costing points; the jitter
 gate (motion a body cannot make) is never waived. Small actions have few real examples (see --list): the profile of "balance" rests on 8 clips, so trust it less.
 """
@@ -34,7 +35,7 @@ FIXED = {"jitter_hf": (0.0, 0.07, 0.0, 0.16), "contact_mismatch": (0.0, 0.08, 0.
 WIDEN, TOL = 0.10, 0.75         # typical range = real 10-90% widened by 10% of its width; the score reaches 0 three quarters of a width beyond that
 MATCH_FLOOR = 0.40              # a clip the classifier does not take for the requested action (or a close relative) keeps at most this share of its range score
 # actions that kinematics from pelvis, feet, hands and neck cannot tell apart reliably: confusing them within a family does not count as "not recognised"
-FAMILIES = [{"walk", "walk_styled", "limp", "sneak", "carry", "turn", "crouch"}, {"jump", "hop"}, {"drink", "gesture", "chores", "dribble", "dance", "stretch", "balance"},
+FAMILIES = [{"walk", "walk_styled", "style_walk", "limp", "sneak", "carry", "turn", "crouch"}, {"run", "style_run"}, {"stand", "style_idle"}, {"jump", "hop"}, {"drink", "gesture", "chores", "dribble", "dance", "stretch", "balance"},
             {"punch", "throw", "kick"}, {"crouch", "pickup", "sneak"}, {"sit", "get_up"}]
 LDA_SHRINK = 0.25
 ONE_SIDED = ("planted_slide",)
@@ -137,21 +138,51 @@ class Profiles:
         pr = self.lda.proba(v); return float(sum(pr.get(b, 0.0) for b in family(a)))
 
 
-def load_real(path=REAL_DEFAULT, cache_dir=None):
+CC_FILE = "cc_motions.npz"
+
+
+class RefSet(dict):
+    """The reference clips as one npz-like mapping (z["actions"], "offsets", "action" ..., and z.files): the CMU examples plus the CC BY sets."""
+    @property
+    def files(self):
+        return list(self)
+
+
+def _features_of(z):
+    if "features" in z.files and list(z["feature_names"]) == mf.NAMES:
+        return z["features"].astype(np.float64)
+    A, off, dt = z["actions"], z["offsets"], float(z["dt"])                    # features of an older file, or the feature list changed: recompute
+    return np.array([mf.extract(A[off[i]:off[i + 1]], dt) for i in range(len(off) - 1)])
+
+
+def merge_reference(z, F, zc, Fc):
+    """CMU examples (z, F) + the CC BY examples (zc, Fc: tools/get_cc_motions.py) as one reference set. `source` says which clip is from where (cmu / accad / 100style)."""
+    if abs(float(z["dt"]) - float(zc["dt"])) > 0.01 * float(z["dt"]):
+        raise ValueError(f"the CC set runs at dt {float(zc['dt']):.5f} s, the CMU set at {float(z['dt']):.5f} s: rebuild one of them with the same --fps")
+    n0, n1 = len(z["offsets"]) - 1, len(zc["offsets"]) - 1; cat = lambda k: np.concatenate([np.asarray(z[k]), np.asarray(zc[k])])
+    src = lambda zz, n, d: np.array([str(x) for x in zz["source"]]) if "source" in zz.files else np.array([d] * n)
+    out = RefSet(actions=cat("actions"), offsets=np.concatenate([z["offsets"], zc["offsets"][1:] + z["offsets"][-1]]), dt=z["dt"], angles=cat("angles"), labels=cat("labels"), action=cat("action"),
+                 performer=cat("performer"), description=cat("description"), kind=cat("kind"), features=np.concatenate([F, Fc]).astype(np.float32), feature_names=np.array(mf.NAMES),
+                 source=np.concatenate([src(z, n0, "cmu"), src(zc, n1, "cc")]), style_label=np.concatenate([np.array([""] * n0), np.asarray(zc["style_label"]) if "style_label" in zc.files else np.array([""] * n1)]),
+                 style=np.zeros((n0 + n1, 1), np.float32), style_names=np.array(["real"]))
+    out["action_names"] = np.array(sorted({str(x) for x in out["action"]})); return out, out["features"].astype(np.float64)
+
+
+def load_real(path=REAL_DEFAULT, cache_dir=None, cc=None):
+    """(reference clips, their features). cc: None = also read cc_motions.npz next to the default real_motions.npz if it exists, False = CMU examples only, a path = that file."""
     if not os.path.exists(path):
         print(f"{path} not found: downloading the real motion set first (once, about a minute) ...", flush=True)
         import get_real_motions
         argv = sys.argv; sys.argv = ["get_real_motions.py", "--out", path] + (["--cache", cache_dir] if cache_dir else []); get_real_motions.main(); sys.argv = argv
-    z = np.load(path, allow_pickle=True)
-    if "features" in z.files and list(z["feature_names"]) == mf.NAMES:
-        F = z["features"].astype(np.float64)
-    else:                                                          # features of an older file, or the feature list changed: recompute
-        A, off, dt = z["actions"], z["offsets"], float(z["dt"]); F = np.array([mf.extract(A[off[i]:off[i + 1]], dt) for i in range(len(off) - 1)])
+    z = np.load(path, allow_pickle=True); F = _features_of(z)
+    ccp = cc if isinstance(cc, str) else (os.path.join(os.path.dirname(path), CC_FILE) if (cc is None and os.path.basename(path) == os.path.basename(REAL_DEFAULT)) else None)
+    if ccp and os.path.exists(ccp):
+        zc = np.load(ccp, allow_pickle=True); z, F = merge_reference(z, F, zc, _features_of(zc))
     return z, F
 
 
-def get_profiles(path=REAL_DEFAULT):
-    z, F = load_real(path); return Profiles(F, z["action"]), z, F
+def get_profiles(path=REAL_DEFAULT, cc=None):
+    z, F = load_real(path, cc=cc); return Profiles(F, z["action"]), z, F
 
 
 # ------------------------------------------------------------------------------------------------------------------ grading
