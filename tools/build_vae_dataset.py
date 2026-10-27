@@ -178,7 +178,8 @@ def main():
     T = a.hours * 3600 / dt; orig_fr = sum(nfr[i] for i in train); records = []                                        # records: dict(clip, action, source, role, origin_id, ...)
     for i in train:
         records.append(dict(clip=mem.clips[i], action=name[i], source=origin[i], role="original", origin_id=mem.entries[i]["id"], ops=[], strength=None, uncommon=False,
-                            engine_ok=True if origin[i] == "engine" and mem.entries[i].get("engine_replay") in (None, "ok", "own_start") else None, fit=mem.entries[i]["best_known_fit"], group=group[i]))
+                            engine_ok=True if origin[i] == "engine" and mem.entries[i].get("engine_replay") in (None, "ok", "own_start") else None, fit=mem.entries[i]["best_known_fit"], group=group[i],
+                            style=str(mem.entries[i].get("style") or "")))
     names = sorted(set(name[i] for i in train)); cnt = {n: sum(1 for i in train if name[i] == n) for n in names}; ofr = {n: sum(nfr[i] for i in train if name[i] == n) for n in names}
     w = {n: cnt[n] ** a.balance for n in names}; sw = sum(w.values()); tgt = {n: T * w[n] / sw for n in names}; quota = {n: max(0.0, tgt[n] - ofr[n]) for n in names}
     need = max(0.0, T - orig_fr); qs = sum(quota.values())
@@ -208,34 +209,38 @@ def main():
             for o in info["ops"]:
                 opstat[o] += 1
             records.append(dict(clip=b, action=n, source=origin[i], role="variant", origin_id=mem.entries[i]["id"], ops=info["ops"], strength=info["strength"], uncommon=info["uncommon"],
-                                engine_ok=eng, fit=round(float(fit), 1), group=group[i]))
+                                engine_ok=eng, fit=round(float(fit), 1), group=group[i], style=str(mem.entries[i].get("style") or "")))
         if got < 0.9 * q:
             log(f"  '{n}': wanted {q * dt / 60:.0f} min of variants, made {got * dt / 60:.0f} (gave up after {tries} tries: the acceptance rate is low for this action)")
     nvar = sum(1 for r in records if r["role"] == "variant"); log(f"variants: {nvar} kept in {time.time() - tv:.0f}s; training set = {len(records)} clips, {sum(len(r['clip']) for r in records) * dt / 3600:.2f} h")
 
     # 6 ------------------------------------------------------------------------------------------------------------ write
     vrecs = [dict(clip=mem.clips[i], action=name[i], source=origin[i], role="original", origin_id=mem.entries[i]["id"], ops=[], strength=None, uncommon=False,
-                  engine_ok=True if origin[i] == "engine" and mem.entries[i].get("engine_replay") in (None, "ok", "own_start") else None, fit=mem.entries[i]["best_known_fit"], group=group[i]) for i in vlist]
+                  engine_ok=True if origin[i] == "engine" and mem.entries[i].get("engine_replay") in (None, "ok", "own_start") else None, fit=mem.entries[i]["best_known_fit"], group=group[i],
+                  style=str(mem.entries[i].get("style") or "")) for i in vlist]
     allnames = sorted(set(r["action"] for r in records + vrecs)); aid = {n: k for k, n in enumerate(allnames)}
+    stylenames = ["none"] + sorted({r["style"] for r in records + vrecs} - {""}); sid = {n: k for k, n in enumerate(stylenames)}      # the 100STYLE style of a clip (id 0 = "none": ACCAD, engine and your own clips)
     out = lambda f: os.path.join(a.out, f)
     if not a.no_jsonl:
         for fn, rs in (("train.jsonl", records), ("val.jsonl", vrecs)):
             with open(out(fn), "w") as f:
                 for k, r in enumerate(rs):
                     f.write(json.dumps(dict(id=f"{fn[:-6]}-{k}", action=r["action"], source=r["source"], role=r["role"], origin_id=r["origin_id"], ops=r["ops"], strength=r["strength"],
-                                            uncommon=r["uncommon"], engine_ok=r["engine_ok"], fit=r["fit"], dt=round(dt, 6), frames=np.round(r["clip"], 4).tolist())) + "\n")
+                                            uncommon=r["uncommon"], engine_ok=r["engine_ok"], fit=r["fit"], style=r["style"], dt=round(dt, 6), frames=np.round(r["clip"], 4).tolist())) + "\n")
         log(f"wrote {out('train.jsonl')} ({os.path.getsize(out('train.jsonl')) / 1e6:.0f} MB) and val.jsonl")
     nwin = {}
     if not a.no_windows:
         for fn, rs in (("train_windows.npz", records), ("val_windows.npz", vrecs)):
-            Ws, lab, src, rol, gid, vl = [], [], [], [], [], []; skipped = 0
+            Ws, lab, src, rol, gid, vl, sty = [], [], [], [], [], [], []; skipped = 0
             for r in rs:
                 w_ = windows(r["clip"], a.window, a.stride)
                 if w_ is None:
                     skipped += 1; continue
                 w_, v_ = w_; vl.append(v_); Ws.append(w_.astype(np.float32)); lab += [aid[r["action"]]] * len(w_); src += [r["source"]] * len(w_); rol += [r["role"]] * len(w_); gid += [r["origin_id"]] * len(w_)
+                sty += [sid.get(r["style"], 0)] * len(w_)
             X = np.concatenate(Ws) if Ws else np.zeros((0, a.window, 30), np.float32); nwin[fn] = (len(X), skipped)
-            np.savez(out(fn), windows=X, valid=(np.concatenate(vl) if vl else np.zeros(0, np.int16)), action=np.array(lab, np.int16), action_names=np.array(allnames), source=np.array(src), role=np.array(rol), origin_id=np.array(gid, np.int32), dt=np.float32(dt))
+            np.savez(out(fn), windows=X, valid=(np.concatenate(vl) if vl else np.zeros(0, np.int16)), action=np.array(lab, np.int16), action_names=np.array(allnames), source=np.array(src), role=np.array(rol), origin_id=np.array(gid, np.int32), dt=np.float32(dt),
+                     style=np.array(sty, np.int16), style_names=np.array(stylenames))
         log(f"wrote train_windows.npz ({nwin['train_windows.npz'][0]} windows of {a.window} frames, {nwin['train_windows.npz'][1]} clips shorter than half a window skipped; clips between half and one window are padded: use `valid` to mask) and val_windows.npz ({nwin['val_windows.npz'][0]})")
     allf = np.concatenate([r["clip"] for r in records]).astype(np.float64); mean, std = allf.mean(0), allf.std(0)
     json.dump(dict(channels=CHANNELS, mean=mean.tolist(), std=np.maximum(std, 1e-3).tolist(), binary=BINARY, angles=ANGLES, dt=dt, note="normalise (x-mean)/std on the continuous channels only; leave `binary` as 0/1"), open(out("stats.json"), "w"), indent=1)
@@ -282,7 +287,8 @@ def main():
                         style=np.zeros((len(pc), 1), np.float32), style_names=np.array(["none"]))
     open(out("README.txt"), "w").write(f"""Motion VAE dataset (built by tools/build_vae_dataset.py, seed {a.seed})
 train.jsonl / val.jsonl   one clip per line: id, action, source (accad/100style/engine/user), role (original/variant), origin_id (memory id of the source), ops, strength, uncommon, engine_ok, fit, dt, frames [F][30]
-train_windows.npz / val_windows.npz   windows [N,{a.window},30] float32, valid (frames that are real: shorter clips are padded with their last frame, mask the rest), action (index into action_names), source, role, origin_id, dt
+train_windows.npz / val_windows.npz   windows [N,{a.window},30] float32, valid (frames that are real: shorter clips are padded with their last frame, mask the rest), action (index into action_names), source, role, origin_id, dt,
+                                      style (index into style_names: the 100STYLE style of the window's clip, 0 = "none"), style_names (tools/train_cvqvae.py conditions the prior on it)
 stats.json   per-channel mean/std for the 30 channels, which are binary (leave as 0/1) and which are angles
 validation holds ORIGINAL clips only, from sources that have no variant in train; for ACCAD clips the performers (for 100STYLE the styles) are never in train at all (any action).
 preview.npz  24 random training clips:  python tools/view_clip.py {a.out}/preview.npz --open
