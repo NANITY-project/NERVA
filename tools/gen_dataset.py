@@ -98,7 +98,8 @@ class Lib:
                "nebula_body_command": (I, [P, S, C.c_char_p, I]), "nebula_body_update": (None, [P, F]), "nebula_body_set_param": (I, [P, S, F]),
                "nebula_body_bone_count": (I, [P]), "nebula_body_bone_name": (S, [P, I]), "nebula_body_bones": (I, [P, fp]),
                "nebula_body_get_state": (I, [P, fp]), "nebula_body_track": (I, [P, fp, F, fp]), "nebula_body_track_end": (None, [P]), "nebula_body_replay_clip": (I, [P, fp, I, F, fp, fp, fp]), "nebula_body_state_dim": (I, []), "nebula_body_action_dim": (I, []), "nebula_body_report_dim": (I, []),
-               "nebula_body_evaluate_clip": (I, [P, fp, I, F, I, fp, fp, C.c_char_p, I])}
+               "nebula_body_evaluate_clip": (I, [P, fp, I, F, I, fp, fp, C.c_char_p, I]),
+               "nebula_body_clone": (P, [P]), "nebula_body_restore": (I, [P, P])}
         for k, (res, args) in sig.items():
             try:
                 f = getattr(lib, k); f.restype = res; f.argtypes = args
@@ -147,15 +148,32 @@ class Body:
     def bones(self):
         self.L.nebula_body_bones(self.h, fptr(self._b)); return self._b
 
-    def evaluate(self, actions, dt, reports=False):
-        """Judge a clip from the standing start on a copy (nothing is committed). Returns the verdict dict (+ reports if asked)."""
+    def evaluate(self, actions, dt, reports=False, commit=False, states=False):
+        """Judge a clip from the body's CURRENT state. commit=False (default): tried on a private copy, this body is untouched; commit=True: the body advances to the
+        clip's end. Returns the verdict dict (feasible, frames, bad_frames, score, worst_frame, worst_cost, issues) + `reports` [n,12] / `states` [n,S] if asked."""
         a = np.ascontiguousarray(actions, np.float32); n = len(a)
-        buf = C.create_string_buffer(4096); rep = np.zeros(n * 12, np.float32) if reports else None
-        self.L.nebula_body_evaluate_clip(self.h, fptr(a), n, dt, 0, fptr(rep) if reports else None, None, buf, 4096)
+        buf = C.create_string_buffer(4096); rep = np.zeros(n * 12, np.float32) if reports else None; st = np.zeros(n * self.lib.S, np.float32) if states else None
+        self.L.nebula_body_evaluate_clip(self.h, fptr(a), n, dt, 1 if commit else 0, fptr(rep) if reports else None, fptr(st) if states else None, buf, 4096)
         v = json.loads(buf.value.decode() or "{}")
         if reports:
             v["reports"] = rep.reshape(n, 12)
+        if states:
+            v["states"] = st.reshape(n, self.lib.S)
         return v
+
+    def clone(self):
+        """A full snapshot of this body (pose, gait / tracking state, queued steps, params, surfaces) as a new Body. close() it when you are done with it."""
+        h = self.L.nebula_body_clone(self.h)
+        if not h:
+            raise MemoryError("nebula_body_clone failed")
+        b = Body.__new__(Body); b.lib, b.L, b.h, b.names, b.bone = self.lib, self.L, h, self.names, self.bone
+        b._b = np.zeros_like(self._b); b._s = np.zeros_like(self._s)
+        return b
+
+    def restore(self, snap):
+        """Overwrite this body with the state of a snapshot made by clone()."""
+        if not self.L.nebula_body_restore(self.h, snap.h):
+            raise ValueError("nebula_body_restore failed")
 
 
 def new_standing(lib):
