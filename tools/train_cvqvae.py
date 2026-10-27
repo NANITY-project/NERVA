@@ -17,9 +17,16 @@ STAGES (--stage all runs them in order; --vae-ckpt skips the VAE training)
   3 prior     causal transformer over  [ACTION] c1..c16 [SEP] c1..c16 [SEP] ...  (up to --prior-windows consecutive windows of one clip); the action is a prefix token,
               replaced by NULL for --prior-cond-drop of the sequences, so it also samples unconditionally. prior_best.pt = lowest validation NLL; the report compares it with
               the unigram baseline (a prior that does not beat that has learned nothing about order)
+              GOAL    every window also carries 4 numbers measured from the data itself, no labelling: heading change, displacement in the window's canonical frame (dx, dz) and
+                      path speed (GOAL_NAMES). A small MLP turns them into a vector that is added to every position of that window; a learned NULL vector replaces them for
+                      --prior-goal-drop of the sequences. (--no-prior-goal turns it off; old prior checkpoints without it still load.)
+              STYLE   if the window files carry a `style` array (tools/build_vae_dataset.py writes the 100STYLE style of every window) the style id conditions the prior the same way:
+                      an embedding added to every position, NULL for --prior-style-drop of the sequences.
+              Both nulls give classifier-free guidance: --cfg-scale s samples with  logits = uncond + s * (cond - uncond)  where uncond has the goal nulled (action and style kept).
   4 generate  samples codes (temperature / top-k / top-p), decodes every window with the VAE, chains the windows (stride = the dataset's, found automatically) and
               cross-fades the overlaps -> gen_preview.npz (tools/view_clip.py format), gen_codes.npz; with --grade also scores each clip with the CMU grader (PASS_SCORE) and
-              writes gen_passed.npz with the survivors only
+              writes gen_passed.npz with the survivors only. --gen-turn-deg / --gen-speed give every window a goal, --gen-style a style, --cfg-scale guides towards them.
+              This stage samples EVERYTHING and then plays it; tools/closed_loop.py samples window by window against the engine instead.
 
 CHAINS  build_vae_dataset.py cuts windows with a stride (default 32 of 64 frames), so consecutive windows of one clip share half their frames. The script finds those
         links by comparing the raw frames (no clip ids are stored), which gives the chains the prior is trained on and the stride used to stitch. A window that has no
@@ -38,7 +45,9 @@ VAE  ("c" = conditional on the ACTION label)
 
 HONEST NOTES  * The prior can only produce what the VAE can decode: reconstruction quality (pos_rmse_m) is the ceiling. * A prior trained on a few hours of real motion plus
 variants can memorise; compare train and val NLL and use the lowest-validation checkpoint (it is saved automatically). * Sampled clips are NOT verified by the engine; --grade
-only applies the CMU-based grader, as for the variants. * Style from a translator, and closing the loop (retraining on passers) are not part of this script.
+only applies the CMU-based grader, as for the variants (tools/closed_loop.py does ask the engine, window by window). * Style from a translator, and retraining on passers, are not part of this script.
+* The goal numbers describe what a window DID, so a prior trained on them learns "windows that turn left 30 degrees look like this"; asking for a goal the data never contains (a 180 degree
+turn in one second) is out of distribution and the samples will not reach it.
 """
 import argparse, collections, contextlib, json, math, os, sys, time
 import numpy as np
@@ -105,6 +114,24 @@ def stitch(wins, stride):
     return out.astype(np.float32)
 
 
+def merge_window(pending, w, stride, origin=(0.0, 0.0, 0.0)):
+    """ONE step of stitch(), for a loop that commits part of a window and only then decides on the next one (tools/closed_loop.py).
+    pending: the not-yet-committed tail of the clip so far, [W - stride, 30] in the world frame, or None for the first window. w: a decoded canonical window [W,30].
+    origin: (x, z, yaw) the first window is placed at (the body's pose). Returns the next W frames of the clip [W,30]: the first W - stride cross-fade `pending` with the new window
+    (flags: the nearer window wins), the rest are the new window's own. Repeating it reproduces stitch() exactly (tests/test_goal_conditioning.py checks this)."""
+    W = w.shape[0]; ov = W - stride
+    wc = canonicalize(w[None])[0].astype(np.float64)
+    if pending is None:
+        return to_world(wc, origin[0], origin[1], origin[2]).astype(np.float32)
+    p = np.asarray(pending, np.float64); assert len(p) == ov > 0, f"pending must hold W - stride = {ov} frames, got {len(p)}"
+    wc = to_world(wc, p[0, 0], p[0, 2], p[0, 3])
+    for y in YAWS:                                                                          # same 2*pi branch as the clip, so the blend does not spin
+        wc[:, y] += 2 * np.pi * np.round((p[0, y] - wc[0, y]) / (2 * np.pi))
+    al = np.linspace(0, 1, ov + 2)[1:-1][:, None]; new = wc[:ov]
+    blend = p * (1 - al) + new * al; blend[:, FLAGS] = np.where(al > 0.5, new[:, FLAGS], p[:, FLAGS])
+    return np.concatenate([blend, wc[ov:]]).astype(np.float32)
+
+
 def find_chains(X, valid, stride=0):
     """RAW windows [N,W,30] -> (chain id [N], position in chain [N], stride). Consecutive windows of one clip overlap by W - stride frames: identical values.
     stride = 0: detect it (the candidate with the most links). No links at all: every window is a chain of one."""
@@ -128,6 +155,56 @@ def load_windows(path):
     z = np.load(path, allow_pickle=False)
     names = [str(n) for n in z["action_names"]]
     return z["windows"].astype(np.float32), z["valid"].astype(np.int64), z["action"].astype(np.int64), names, float(z["dt"])
+
+
+def load_styles(path):
+    """The 100STYLE style id of every window: (ids [N] int64, names list) or (None, []) when the file has no `style` array (older datasets). names[0] is "none" (no style)."""
+    z = np.load(path, allow_pickle=False)
+    if "style" not in z.files or "style_names" not in z.files:
+        return None, []
+    return z["style"].astype(np.int64).reshape(-1), [str(n) for n in z["style_names"]]
+
+
+def remap_styles(ids, file_names, ref_names):
+    """Style ids of one file -> indices into ref_names; a style the reference does not know (a held-out 100STYLE style) becomes the NULL style len(ref_names)."""
+    mp = {n: i for i, n in enumerate(ref_names)}
+    return np.array([mp.get(file_names[s], len(ref_names)) for s in ids], np.int64)
+
+
+# ---- goal features: what a window DID, measured from the canonicalised window itself (frame 0 at the origin facing +z) -------------------------------------------------
+GOAL_NAMES = ["dyaw", "dx", "dz", "speed"]       # heading change (rad), displacement along the start-left axis (m), displacement along the start heading (m), mean pelvis path speed (m/s)
+NG = len(GOAL_NAMES)
+
+
+def goal_features(Xc, valid, dt):
+    """CANONICALISED windows [N,T,30], valid frames [N] -> [N,4] float32 (GOAL_NAMES) over the valid part of each window. No labels needed: it is read off the pelvis channels."""
+    N, T, _ = Xc.shape
+    X = Xc.astype(np.float64); last = np.clip(np.asarray(valid, np.int64) - 1, 0, T - 1); i = np.arange(N)
+    dyaw = X[i, last, 3] - X[:, 0, 3]
+    dx = X[i, last, 0] - X[:, 0, 0]; dz = X[i, last, 2] - X[:, 0, 2]
+    step = np.hypot(np.diff(X[:, :, 0], axis=1), np.diff(X[:, :, 2], axis=1)); m = np.arange(T - 1)[None, :] < last[:, None]
+    speed = (step * m).sum(1) / np.maximum(last * dt, 1e-6)
+    return np.stack([dyaw, dx, dz, speed], 1).astype(np.float32)
+
+
+def arc_goal(turn, path, seconds):
+    """The goal features of a walk along a circular arc: heading change `turn` (rad) over `path` metres of pelvis path lasting `seconds`. Arrays broadcast -> [..., 4].
+    (Chord direction is half the heading change; chord length = path * sin(turn/2) / (turn/2).)"""
+    turn = np.asarray(turn, np.float64); path = np.asarray(path, np.float64); h = turn / 2.0; chord = path * np.sinc(h / np.pi)
+    return np.stack(np.broadcast_arrays(turn, chord * np.sin(h), chord * np.cos(h), path / seconds), -1).astype(np.float32)
+
+
+def goal_stats(g):
+    """Statistics of the training windows' goal features, stored with the prior: normalisation (mean/std), how hard a window really turns (turn_max, 95th percentile of |dyaw|),
+    and how fast the moving windows travel (speed_cruise = median, speed_max = 95th percentile)."""
+    mean, std = g.mean(0).astype(np.float64), np.maximum(g.std(0), 1e-2).astype(np.float64)
+    mv = g[g[:, 3] > 0.15, 3]
+    return dict(mean=mean.tolist(), std=std.tolist(), turn_max=float(max(np.percentile(np.abs(g[:, 0]), 95), 0.3)),
+                speed_cruise=float(np.median(mv)) if len(mv) else 1.0, speed_max=float(np.percentile(mv, 95)) if len(mv) else 1.5)
+
+
+def norm_goal(g, st):
+    return ((np.asarray(g, np.float32) - np.asarray(st["mean"], np.float32)) / np.asarray(st["std"], np.float32)).astype(np.float32)
 
 
 def remap_actions(act, file_names, ref_names):
@@ -395,10 +472,12 @@ def load_ckpt(path, device):
     return model, d, {k: np.asarray(v) for k, v in d["norm"].items()}
 
 
-def write_clips_npz(path, clips, action_names, labels, desc, dt):
-    """tools/view_clip.py format."""
+def write_clips_npz(path, clips, action_names, labels, desc, dt, style_labels=None, style_ids=None):
+    """tools/view_clip.py format. style / style_names are zeros / ["none"] unless the clips were sampled with a style: then style = [[id]], style_names = ["style_id"], style_label = names."""
+    n = len(clips); extra = {} if style_labels is None else dict(style_label=np.array(style_labels))
+    style = np.zeros((n, 1), np.float32) if style_ids is None else np.array(style_ids, np.float32).reshape(n, 1)
     np.savez_compressed(path, actions=np.concatenate(clips).astype(np.float32), offsets=np.cumsum([0] + [len(c) for c in clips]), dt=np.float32(dt), action=np.array(action_names),
-                        labels=np.array(labels), description=np.array(desc), style=np.zeros((len(clips), 1), np.float32), style_names=np.array(["none"]))
+                        labels=np.array(labels), description=np.array(desc), style=style, style_names=np.array(["none" if style_ids is None else "style_id"]), **extra)
 
 
 @torch.no_grad()
@@ -518,16 +597,27 @@ class PriorBlock(nn.Module):
 
 class CodePrior(nn.Module):
     """Causal transformer. Token ids: codes 0..K-1 | SEP = K | action tokens K+1 .. K+n_actions | NULL = K+1+n_actions | PAD = K+2+n_actions.
-    A sequence is [ACTION] c*n [SEP] c*n [SEP] ... (up to `windows` consecutive windows of one clip, padded at the end). It predicts the next code or SEP."""
+    A sequence is [ACTION] c*n [SEP] c*n [SEP] ... (up to `windows` consecutive windows of one clip, padded at the end). It predicts the next code or SEP.
 
-    def __init__(self, K, n_actions, n, windows, d=256, layers=6, heads=4, dropout=0.1):
+    goal_dim > 0: every window has a goal vector (the normalised GOAL_NAMES of that window, [B, windows, goal_dim]); an MLP embeds it and the result is ADDED to the
+    input embedding of every position that predicts a code (or the SEP) of that window: input position i belongs to window i // (n + 1). A learned null vector replaces it
+    (goal=None, or drop_goal[b] True) -- the unconditional branch for classifier-free guidance.
+    n_styles > 0: a style id per sequence (0 .. n_styles-1; n_styles = NULL) embedded and added to every position the same way (drop_style[b] True -> NULL)."""
+
+    def __init__(self, K, n_actions, n, windows, d=256, layers=6, heads=4, dropout=0.1, goal_dim=0, n_styles=0):
         super().__init__()
-        self.K, self.n_actions, self.n, self.windows = K, n_actions, n, windows
+        self.K, self.n_actions, self.n, self.windows, self.goal_dim, self.n_styles = K, n_actions, n, windows, goal_dim, n_styles
         self.SEP, self.ACT0, self.NULL, self.PAD = K, K + 1, K + 1 + n_actions, K + 2 + n_actions
         self.seq_len = windows * (n + 1)                    # 1 + windows*n + (windows-1)
         self.tok = nn.Embedding(K + 3 + n_actions, d); self.pos = nn.Embedding(self.seq_len - 1, d); self.drop = nn.Dropout(dropout)
+        if goal_dim:
+            self.goal_mlp = nn.Sequential(nn.Linear(goal_dim, d), nn.GELU(), nn.Linear(d, d)); self.goal_null = nn.Parameter(torch.zeros(d))
+        if n_styles:
+            self.style_emb = nn.Embedding(n_styles + 1, d)  # last row = the NULL style
         self.blocks = nn.ModuleList([PriorBlock(d, heads, dropout) for _ in range(layers)]); self.ln = nn.LayerNorm(d); self.head = nn.Linear(d, K + 1, bias=False)
         self.apply(self._init)
+        if goal_dim:
+            nn.init.normal_(self.goal_null, std=0.02)
 
     @staticmethod
     def _init(m):
@@ -536,9 +626,25 @@ class CodePrior(nn.Module):
             if isinstance(m, nn.Linear) and m.bias is not None:
                 nn.init.zeros_(m.bias)
 
-    def forward(self, tok):                                 # tok [B,T] (T <= seq_len-1) -> logits [B,T,K+1]
-        T = tok.shape[1]
-        x = self.drop(self.tok(tok) + self.pos(torch.arange(T, device=tok.device))[None])
+    def forward(self, tok, goal=None, style=None, drop_goal=None, drop_style=None):
+        """tok [B,T] (T <= seq_len-1) -> logits [B,T,K+1].  goal [B,windows,goal_dim] (window slot j = the j-th window of the context; unused slots may hold zeros) or None = null;
+        style [B] long or None = null; drop_goal / drop_style: bool [B], True = use the null for that sequence."""
+        B, T = tok.shape; dev = tok.device
+        x = self.tok(tok) + self.pos(torch.arange(T, device=dev))[None]
+        if self.goal_dim:
+            if goal is None:
+                g = self.goal_null.expand(B, self.windows, -1)
+            else:
+                g = self.goal_mlp(goal)
+                if drop_goal is not None:
+                    g = torch.where(drop_goal.reshape(B, 1, 1), self.goal_null.to(g.dtype), g)
+            x = x + g[:, (torch.arange(T, device=dev) // (self.n + 1)).clamp(max=self.windows - 1)]
+        if self.n_styles:
+            s = style if style is not None else torch.full((B,), self.n_styles, dtype=torch.long, device=dev)
+            if drop_style is not None:
+                s = torch.where(drop_style, torch.full_like(s, self.n_styles), s)
+            x = x + self.style_emb(s)[:, None]
+        x = self.drop(x)
         for b in self.blocks:
             x = b(x)
         return self.head(self.ln(x))
@@ -556,10 +662,16 @@ def make_prior_tokens(codes, chain, act, Lw, K, n_actions):
     return tok
 
 
-def prior_loss(prior, tok, amp, dev):
+def make_prior_goals(gnorm, chain, Lw):
+    """normalised window features [N,G] + chain id [N] -> [N, Lw, G]: for the sequence that starts at window i, the features of windows i .. i+Lw-1 of the same chain (zeros after it ends)."""
+    N = len(gnorm); idx = np.arange(N)[:, None] + np.arange(Lw)[None]; nc = np.minimum(idx, N - 1); ok = (idx < N) & (chain[nc] == chain[:, None])
+    return np.where(ok[..., None], gnorm[nc], 0.0).astype(np.float32)
+
+
+def prior_loss(prior, tok, amp, dev, goal=None, style=None, drop_goal=None, drop_style=None):
     inp, tgt = tok[:, :-1], tok[:, 1:]
     with amp_ctx(dev, amp):
-        lg = prior(inp)
+        lg = prior(inp, goal, style, drop_goal, drop_style)
     lg = lg.float().reshape(-1, prior.K + 1); t = tgt.reshape(-1); valid = t != prior.PAD
     ce = F.cross_entropy(lg, torch.where(valid, t, torch.full_like(t, -100)), reduction="none", ignore_index=-100)
     code = valid & (t < prior.K)
@@ -569,21 +681,33 @@ def prior_loss(prior, tok, amp, dev):
 
 
 @torch.no_grad()
-def eval_prior(prior, T, a, dev, bs=512):
+def eval_prior(prior, T, a, dev, bs=512, goal=None, style=None, no_goal=False):
+    """Validation loss. no_goal=True nulls the goal of every sequence (the unconditional branch), to show how much the goal numbers tell the prior."""
     prior.eval(); s = np.zeros(3); nb = 0
     for i in range(0, len(T), bs):
-        l, nll, acc = prior_loss(prior, T[i:i + bs], a.amp, dev); s += [float(l), float(nll), float(acc)]; nb += 1
+        sl = slice(i, i + bs); dg = torch.ones(len(T[sl]), dtype=torch.bool, device=dev) if (no_goal and goal is not None) else None
+        l, nll, acc = prior_loss(prior, T[sl], a.amp, dev, None if goal is None else goal[sl], None if style is None else style[sl], dg)
+        s += [float(l), float(nll), float(acc)]; nb += 1
     prior.train(); s /= max(nb, 1); return dict(loss=s[0], nll=s[1], acc=s[2], ppl=math.exp(s[1]))
 
 
-def train_prior(a, dev, codes_t, codes_v, chain_t, chain_v, at, av, K, n_actions, names, stride, dt, uni_val):
+def train_prior(a, dev, codes_t, codes_v, chain_t, chain_v, at, av, K, n_actions, names, stride, dt, uni_val, gt=None, gv=None, gstats=None, st=None, sv=None, style_names=None):
+    """gt / gv: raw goal features of the train / val windows [N,4] (goal_features) or None = no goal conditioning; st / sv: style index per window (remap_styles) or None."""
     n = codes_t.shape[1]; Lw = a.prior_windows
     Tt = torch.from_numpy(make_prior_tokens(codes_t, chain_t, at, Lw, K, n_actions)).to(dev); Tv = torch.from_numpy(make_prior_tokens(codes_v, chain_v, av, Lw, K, n_actions)).to(dev)
-    cfg = dict(K=K, n_actions=n_actions, n=n, windows=Lw, d=a.prior_dim, layers=a.prior_layers, heads=a.prior_heads, dropout=a.prior_dropout)
+    use_goal = gt is not None; n_styles = len(style_names) if (st is not None and style_names and len(style_names) > 1) else 0
+    cfg = dict(K=K, n_actions=n_actions, n=n, windows=Lw, d=a.prior_dim, layers=a.prior_layers, heads=a.prior_heads, dropout=a.prior_dropout, goal_dim=NG if use_goal else 0, n_styles=n_styles)
     prior = CodePrior(**cfg).to(dev); npar = sum(p.numel() for p in prior.parameters())
+    Gt = Gv = St = Sv = None
+    if use_goal:
+        Gt = torch.from_numpy(make_prior_goals(norm_goal(gt, gstats), chain_t, Lw)).to(dev); Gv = torch.from_numpy(make_prior_goals(norm_goal(gv, gstats), chain_v, Lw)).to(dev)
+    if n_styles:
+        St = torch.from_numpy(st.astype(np.int64)).to(dev); Sv = torch.from_numpy(sv.astype(np.int64)).to(dev)
     mult = float(np.mean((Tt[:, 1:] != prior.PAD).sum(1).cpu().numpy()))
     print(f"prior: {npar / 1e6:.2f} M parameters, sequences of up to {Lw} windows x {n} codes ({Tt.shape[1]} tokens), {len(Tt)} train / {len(Tv)} val sequences "
           f"(avg {mult:.0f} real tokens); unigram baseline on val: {uni_val:.3f} nats ({math.exp(uni_val):.0f} effective choices per code)")
+    print(f"  conditioning: action prefix (null {a.prior_cond_drop:.0%})" + (f", goal {GOAL_NAMES} per window (null {a.prior_goal_drop:.0%}; turn_max {gstats['turn_max']:.2f} rad, cruise {gstats['speed_cruise']:.2f} m/s)" if use_goal else ", no goal")
+          + (f", style: {n_styles} ids incl. 'none' (null {a.prior_style_drop:.0%})" if n_styles else ", no style"))
     decay = [p for nm, p in prior.named_parameters() if p.ndim >= 2]; nod = [p for nm, p in prior.named_parameters() if p.ndim < 2]
     opt = torch.optim.AdamW([dict(params=decay, weight_decay=a.prior_wd), dict(params=nod, weight_decay=0.0)], lr=a.prior_lr, betas=(0.9, 0.95))
     spe = max(1, len(Tt) // a.prior_batch); total = a.prior_epochs * spe; warm = min(200, total // 10)
@@ -593,24 +717,29 @@ def train_prior(a, dev, codes_t, codes_v, chain_t, chain_v, at, av, K, n_actions
     for epoch in range(a.prior_epochs):
         perm = torch.randperm(len(Tt), device=dev); run = np.zeros(3); nb = 0
         for bi in range(spe):
-            tok = Tt[perm[bi * a.prior_batch:(bi + 1) * a.prior_batch]].clone()
+            ix = perm[bi * a.prior_batch:(bi + 1) * a.prior_batch]; tok = Tt[ix].clone()
             if a.prior_cond_drop > 0:
                 drop = torch.rand(len(tok), device=dev) < a.prior_cond_drop; tok[drop, 0] = prior.NULL
+            goal = Gt[ix] if use_goal else None; style = St[ix] if n_styles else None            # the three nulls are drawn independently, so (action, no goal) and (goal, no action) both occur
+            dg = torch.rand(len(tok), device=dev) < a.prior_goal_drop if use_goal else None
+            ds = torch.rand(len(tok), device=dev) < a.prior_style_drop if n_styles else None
             for g in opt.param_groups:
                 g["lr"] = lr_at(step)
-            loss, nll, acc = prior_loss(prior, tok, a.amp, dev)
+            loss, nll, acc = prior_loss(prior, tok, a.amp, dev, goal, style, dg, ds)
             opt.zero_grad(set_to_none=True); scaler.scale(loss).backward(); scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(prior.parameters(), 1.0); scaler.step(opt); scaler.update(); step += 1
             run += [float(loss), float(nll), float(acc)]; nb += 1
-        run /= max(nb, 1); ev = eval_prior(prior, Tv, a, dev); improved = ev["nll"] < best
+        run /= max(nb, 1); ev = eval_prior(prior, Tv, a, dev, goal=Gv, style=Sv); improved = ev["nll"] < best
+        evn = eval_prior(prior, Tv, a, dev, goal=Gv, style=Sv, no_goal=True) if use_goal else None
         if improved:
             best = ev["nll"]; bad = 0
-            torch.save(dict(model=prior.state_dict(), cfg=cfg, names=names, stride=stride, dt=dt, val_nll=best, unigram_val=uni_val, args=vars(a)), path)
+            torch.save(dict(model=prior.state_dict(), cfg=cfg, names=names, stride=stride, dt=dt, val_nll=best, unigram_val=uni_val, args=vars(a),
+                            goal_stats=gstats if use_goal else None, goal_names=GOAL_NAMES if use_goal else None, style_names=list(style_names) if n_styles else None), path)
         else:
             bad += 1
-        print(f"prior epoch {epoch:3d}  train nll {run[1]:.3f} acc {run[2] * 100:.1f}%  |  val nll {ev['nll']:.3f} (ppl {ev['ppl']:.0f}) acc {ev['acc'] * 100:.1f}%  |  "
-              f"{(time.time() - t0) / 60:.1f} min{'  *best*' if improved else ''}", flush=True)
-        mlog.write(json.dumps(dict(epoch=epoch, train=dict(loss=run[0], nll=run[1], acc=run[2]), val=ev)) + "\n"); mlog.flush()
+        print(f"prior epoch {epoch:3d}  train nll {run[1]:.3f} acc {run[2] * 100:.1f}%  |  val nll {ev['nll']:.3f} (ppl {ev['ppl']:.0f}) acc {ev['acc'] * 100:.1f}%"
+              + (f"  [goal nulled: {evn['nll']:.3f}]" if use_goal else "") + f"  |  {(time.time() - t0) / 60:.1f} min{'  *best*' if improved else ''}", flush=True)
+        mlog.write(json.dumps(dict(epoch=epoch, train=dict(loss=run[0], nll=run[1], acc=run[2]), val=ev, val_goal_null=evn)) + "\n"); mlog.flush()
         if a.prior_patience and bad >= a.prior_patience:
             print(f"stopping the prior: no validation improvement for {a.prior_patience} epochs"); break
     print(f"prior done. best val nll {best:.3f} nats vs unigram {uni_val:.3f}  ({'learned order: ' if best < uni_val - 0.05 else 'barely beats the unigram baseline: '}"
@@ -619,7 +748,9 @@ def train_prior(a, dev, codes_t, codes_v, chain_t, chain_v, at, av, K, n_actions
 
 
 def load_prior(path, dev):
-    d = torch.load(path, map_location=dev, weights_only=False); prior = CodePrior(**d["cfg"]).to(dev); prior.load_state_dict(d["model"]); prior.eval(); return prior, d
+    """-> (prior, checkpoint dict). prior.meta = dict(goal_stats, style_names): what the sampler needs to build goals / styles (None for a prior trained without them)."""
+    d = torch.load(path, map_location=dev, weights_only=False); prior = CodePrior(**d["cfg"]).to(dev); prior.load_state_dict(d["model"]); prior.eval()
+    prior.meta = dict(goal_stats=d.get("goal_stats"), style_names=d.get("style_names")); return prior, d
 
 
 # ============================================================================================================================ stage 4: sample, decode, chain, grade
@@ -633,20 +764,54 @@ def filter_logits(lg, top_k, top_p):
 
 
 @torch.no_grad()
-def generate_codes(prior, acts, n_windows, temperature, top_k, top_p):
+def sample_window(prior, ctx, goal, style, temperature, top_k, top_p, cfg_scale=1.0):
+    """Sample the n codes of ONE window, code by code. ctx [B,T] = the tokens so far: [ACTION] then every earlier window followed by SEP (at most prior.windows - 1 of them).
+    goal [B, windows, G] normalised, slot j = the j-th window of ctx and the window being sampled is the last used slot (unused slots: zeros), or None = null goal.
+    style [B] long or None = null style. cfg_scale s != 1 (needs a goal-conditioned prior): logits = uncond + s * (cond - uncond), uncond = the goal nulled (action and style kept).
+    Returns (codes [B,n], ctx with the codes appended)."""
+    prior.eval(); B = ctx.shape[0]; use_cfg = cfg_scale != 1.0 and prior.goal_dim > 0 and goal is not None
+    if use_cfg:
+        drop = torch.cat([torch.zeros(B, dtype=torch.bool, device=ctx.device), torch.ones(B, dtype=torch.bool, device=ctx.device)])
+    for _ in range(prior.n):
+        if use_cfg:
+            both = prior(torch.cat([ctx, ctx]), torch.cat([goal, goal]), None if style is None else torch.cat([style, style]), drop)[:, -1, :prior.K].float()
+            lg = both[B:] + cfg_scale * (both[:B] - both[B:])
+        else:
+            lg = prior(ctx, goal, style)[:, -1, :prior.K].float()
+        nxt = torch.multinomial(torch.softmax(filter_logits(lg / max(temperature, 1e-4), top_k, top_p), -1), 1); ctx = torch.cat([ctx, nxt], 1)
+    return ctx[:, -prior.n:], ctx
+
+
+def goal_context(goals, w, Lw):
+    """goals [B, n_windows, G] (normalised, one per window of the clip) -> [B, Lw, G]: the slots of the context while window w is sampled. Slot j = window lo + j, lo = max(0, w - Lw + 1)
+    (the context never holds more than Lw windows, the oldest is dropped); unused slots are zeros."""
+    lo = max(0, w - Lw + 1); g = goals[:, lo:w + 1]; out = torch.zeros(goals.shape[0], Lw, goals.shape[2], dtype=goals.dtype, device=goals.device)
+    out[:, :g.shape[1]] = g
+    return out
+
+
+@torch.no_grad()
+def generate_codes(prior, acts, n_windows, temperature, top_k, top_p, goals=None, styles=None, cfg_scale=1.0):
     """acts [B] (long, on device; prior.NULL = unconditional) -> codes [B, n_windows, n]. A window is sampled code by code; SEP is appended by force. Once the context holds
-    prior.windows windows the oldest one is dropped (the action prefix stays)."""
+    prior.windows windows the oldest one is dropped (the action prefix stays). goals [B, n_windows, G] (normalised: the plan, one goal per window) / styles [B] / cfg_scale: see
+    sample_window; goals=None samples with the null goal."""
     prior.eval(); n, Lw = prior.n, prior.windows; ctx = (prior.ACT0 + acts)[:, None]; out = []
     for w in range(n_windows):
         if w >= Lw:
             ctx = torch.cat([ctx[:, :1], ctx[:, 1 + n + 1:]], 1)
-        for _ in range(n):
-            lg = prior(ctx)[:, -1, :prior.K].float() / max(temperature, 1e-4)
-            nxt = torch.multinomial(torch.softmax(filter_logits(lg, top_k, top_p), -1), 1); ctx = torch.cat([ctx, nxt], 1)
-        out.append(ctx[:, -n:])
+        gctx = goal_context(goals, w, Lw) if (goals is not None and prior.goal_dim) else None
+        codes, ctx = sample_window(prior, ctx, gctx, styles, temperature, top_k, top_p, cfg_scale)
+        out.append(codes)
         if w < n_windows - 1:
             ctx = torch.cat([ctx, torch.full_like(ctx[:, :1], prior.SEP)], 1)
     return torch.stack(out, 1)
+
+
+def plan_goals(prior, B, nw, turn_deg, speed, dt, W, dev):
+    """The same goal for every window of every clip (an arc of `turn_deg` degrees per window at `speed` m/s; either may be None = 0 deg / the data's cruise speed) -> normalised [B,nw,G]."""
+    st = prior.meta["goal_stats"]; sec = (W - 1) * dt
+    g = arc_goal(np.deg2rad(turn_deg or 0.0), (st["speed_cruise"] if speed is None else speed) * sec, sec)
+    return torch.from_numpy(np.broadcast_to(norm_goal(g, st), (B, nw, NG)).copy()).to(dev)
 
 
 @torch.no_grad()
@@ -657,7 +822,19 @@ def generate(a, dev, vae, norm, prior, names, stride, dt):
         sys.exit(f"unknown action(s) {bad}; the model knows: {', '.join(names)}")
     act_ids = [names.index(s) for s in sel for _ in range(a.gen_per_action)] if sel else [prior.NULL - prior.ACT0] * a.gen_per_action
     acts = torch.tensor(act_ids, device=dev); B, nw = len(acts), a.gen_windows; torch.manual_seed(a.gen_seed)
-    codes = generate_codes(prior, acts, nw, a.temperature, a.top_k, a.top_p)                                   # [B,nw,n]
+    goals = styles = None; sty_name = "none"
+    if a.gen_turn_deg is not None or a.gen_speed is not None:
+        if not prior.goal_dim:
+            sys.exit("--gen-turn-deg / --gen-speed need a prior trained with goal conditioning (this one was trained without; train again without --no-prior-goal)")
+        goals = plan_goals(prior, B, nw, a.gen_turn_deg, a.gen_speed, dt, vae.window, dev)
+    if a.gen_style:
+        sn = prior.meta.get("style_names") or []
+        if a.gen_style not in sn:
+            sys.exit(f"unknown style {a.gen_style!r}; this prior knows: " + (", ".join(sn) if sn else "none (the windows had no style ids)"))
+        styles = torch.full((B,), sn.index(a.gen_style), dtype=torch.long, device=dev); sty_name = a.gen_style
+    if a.cfg_scale != 1.0 and goals is None:
+        print("note: --cfg-scale only changes the samples when a goal is given (--gen-turn-deg / --gen-speed)")
+    codes = generate_codes(prior, acts, nw, a.temperature, a.top_k, a.top_p, goals, styles, a.cfg_scale)       # [B,nw,n]
     y = vae.decode_codes(codes.reshape(B * nw, -1), acts.repeat_interleave(nw)); win = to_motion(y, norm).reshape(B, nw, -1, NCH)
     clips = [stitch(list(win[b]), stride) for b in range(B)]; an = [names[i] if i < len(names) else "null" for i in act_ids]
     scores = [None] * B
@@ -672,16 +849,19 @@ def generate(a, dev, vae, norm, prior, names, stride, dt):
             ss = [scores[b] for b in range(B) if an[b] == n_]; ok = [s for s in ss if s is not None]
             print(f"  {n_:14s} " + (f"{sum(s >= G.PASS_SCORE for s in ok)}/{len(ss)} pass, mean score {np.mean(ok):.0f}" if ok else "not a graded action"))
     sec = len(clips[0]) * dt
-    labels = [f"generated {an[b]} T={a.temperature} k={a.top_k} p={a.top_p}" + (f" score {scores[b]:.0f}" if scores[b] is not None else "") for b in range(B)]
+    gtxt = (f" goal turn {a.gen_turn_deg or 0:g} deg/window" + (f" speed {a.gen_speed:g}" if a.gen_speed is not None else "") + (f" cfg {a.cfg_scale:g}" if a.cfg_scale != 1.0 else "")) if goals is not None else ""
+    labels = [f"generated {an[b]} T={a.temperature} k={a.top_k} p={a.top_p}{gtxt}" + (f" style {sty_name}" if styles is not None else "") + (f" score {scores[b]:.0f}" if scores[b] is not None else "") for b in range(B)]
     desc = [f"{nw} windows, {sec:.1f} s" + (" PASS" if scores[b] is not None and scores[b] >= G.PASS_SCORE else (" FAIL" if scores[b] is not None else "")) for b in range(B)] if a.grade \
         else [f"{nw} windows, {sec:.1f} s"] * B
-    write_clips_npz(os.path.join(a.out, "gen_preview.npz"), clips, an, labels, desc, dt)
+    sk = dict(style_labels=[sty_name] * B, style_ids=styles.cpu().numpy()) if styles is not None else {}
+    write_clips_npz(os.path.join(a.out, "gen_preview.npz"), clips, an, labels, desc, dt, **sk)
     np.savez(os.path.join(a.out, "gen_codes.npz"), codes=codes.cpu().numpy().astype(np.int16), action=np.array(act_ids, np.int16), action_names=np.array(names))
     print(f"wrote {a.out}/gen_preview.npz: {B} clips of {nw} windows ({sec:.1f} s each, seams every {stride * dt:.2f} s)  ->  python tools/view_clip.py {a.out}/gen_preview.npz --open")
     if a.grade:
         keep = [b for b in range(B) if scores[b] is not None and scores[b] >= G.PASS_SCORE]
         if keep:
-            write_clips_npz(os.path.join(a.out, "gen_passed.npz"), [clips[b] for b in keep], [an[b] for b in keep], [labels[b] for b in keep], [desc[b] for b in keep], dt)
+            write_clips_npz(os.path.join(a.out, "gen_passed.npz"), [clips[b] for b in keep], [an[b] for b in keep], [labels[b] for b in keep], [desc[b] for b in keep], dt,
+                            **({"style_labels": [sty_name] * len(keep), "style_ids": styles.cpu().numpy()[keep]} if styles is not None else {}))
             print(f"wrote {a.out}/gen_passed.npz: {len(keep)} of {B} passed the grader (candidates for tools/motion_memory.py; keep real CMU data in the mix)")
         else:
             print("no generated clip passed the grader: lower --temperature / --top-k, or check the codebook health and the prior's val nll above")
@@ -712,10 +892,17 @@ def main():
     ap.add_argument("--prior-dropout", type=float, default=0.1); ap.add_argument("--prior-epochs", type=int, default=40); ap.add_argument("--prior-batch", type=int, default=256)
     ap.add_argument("--prior-lr", type=float, default=3e-4); ap.add_argument("--prior-wd", type=float, default=0.01); ap.add_argument("--prior-patience", type=int, default=6)
     ap.add_argument("--prior-cond-drop", type=float, default=0.1, help="share of sequences whose action prefix becomes NULL (unconditional sampling)")
+    ap.add_argument("--no-prior-goal", action="store_true", help="train the prior without the per-window goal numbers (heading change, displacement, speed)")
+    ap.add_argument("--prior-goal-drop", type=float, default=0.15, help="share of sequences whose goal numbers become the NULL goal (what classifier-free guidance contrasts against)")
+    ap.add_argument("--prior-style-drop", type=float, default=0.15, help="share of sequences whose style id becomes NULL (only if the window files have a `style` array)")
     # sampling
     ap.add_argument("--gen-per-action", type=int, default=2); ap.add_argument("--gen-windows", type=int, default=4, help="windows per clip: 64 + (n-1)*stride frames")
     ap.add_argument("--gen-actions", default="all", help="'all' or comma-separated action names"); ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--top-k", type=int, default=50); ap.add_argument("--top-p", type=float, default=0.95); ap.add_argument("--gen-seed", type=int, default=0)
+    ap.add_argument("--gen-turn-deg", type=float, default=None, help="goal for EVERY window: heading change in degrees per window (+ = left); giving this or --gen-speed switches the goal on")
+    ap.add_argument("--gen-speed", type=float, default=None, help="goal for every window: path speed in m/s (default: the cruise speed of the training data); giving this or --gen-turn-deg switches the goal on")
+    ap.add_argument("--gen-style", default="", help="a 100STYLE style name the prior knows (see the training log); default: the null style")
+    ap.add_argument("--cfg-scale", type=float, default=1.0, help="classifier-free guidance on the goal: 1 = off, 1.5-3 = follow it harder (and sample less diversely)")
     ap.add_argument("--grade", action="store_true", help="score every sample with tools/motion_grader.py (needs data/real_motions.npz, see --real)"); ap.add_argument("--real", default="data/real_motions.npz")
     ap.add_argument("--no-generate", action="store_true", help="skip stage 4")
     # runtime
@@ -743,7 +930,8 @@ def main():
         cfg = dict(n_actions=24, window=64, hidden=a.hidden, emb=a.emb, code_dim=a.code_dim, num_codes=a.num_codes, downs=a.downs, n_res=a.n_res, dropout=a.dropout,
                    ema_decay=a.ema_decay, restart_thresh=a.restart_thresh, cond_enc=not a.no_cond_enc)
         tot, parts = count_params(build_model(cfg)); print(f"VAE:   {tot / 1e6:.2f} M trainable parameters (assuming 24 actions)  {parts}")
-        pr = CodePrior(a.num_codes, 24, 64 // 2 ** a.downs, a.prior_windows, a.prior_dim, a.prior_layers, a.prior_heads); print(f"prior: {sum(p.numel() for p in pr.parameters()) / 1e6:.2f} M parameters"); return
+        pr = CodePrior(a.num_codes, 24, 64 // 2 ** a.downs, a.prior_windows, a.prior_dim, a.prior_layers, a.prior_heads, goal_dim=0 if a.no_prior_goal else NG)
+        print(f"prior: {sum(p.numel() for p in pr.parameters()) / 1e6:.2f} M parameters" + ("" if a.no_prior_goal else " (with the goal MLP; a style embedding adds 256 per style)")); return
 
     if a.eval_only and not a.vae_ckpt:
         sys.exit("--eval-only needs --vae-ckpt PATH")
@@ -812,7 +1000,16 @@ def main():
         return
 
     # ---------------------------------------------------------------------------------------------------------------- stage 3: prior
-    prior = train_prior(a, dev, codes_t, codes_v, chain_t, chain_v, at, av, K, len(names), names, stride, dt, uni_val)
+    gt = gv = gstats = st_ids = sv_ids = style_names = None
+    if not a.no_prior_goal:                                                                 # goal numbers are read off the CANONICAL windows (also when the VAE itself was trained with --no-canon)
+        gt = goal_features(Xt if canon else canonicalize(Xt_raw), vt, dt); gv = goal_features(Xv if canon else canonicalize(Xv_raw), vv, dt); gstats = goal_stats(gt)
+        print("goal features (train windows): " + ", ".join(f"{nm} mean {m:.2f} std {s:.2f}" for nm, m, s in zip(GOAL_NAMES, gstats["mean"], gstats["std"])))
+    st_raw, sn_t = load_styles(os.path.join(a.data, "train_windows.npz"))
+    if st_raw is not None and len(sn_t) > 1:
+        sv_raw, sn_v = load_styles(os.path.join(a.data, "val_windows.npz")); style_names, st_ids = sn_t, st_raw
+        sv_ids = remap_styles(sv_raw, sn_v, sn_t) if sv_raw is not None else np.full(len(Xv_raw), len(sn_t), np.int64)       # a style never seen in training -> the NULL style
+        print(f"styles: {len(sn_t) - 1} named styles in the train windows ({np.mean(st_raw > 0) * 100:.0f}% of windows carry one); validation windows of unseen styles use the null style")
+    prior = train_prior(a, dev, codes_t, codes_v, chain_t, chain_v, at, av, K, len(names), names, stride, dt, uni_val, gt, gv, gstats, st_ids, sv_ids, style_names)
 
     # ---------------------------------------------------------------------------------------------------------------- stage 4: samples
     if not a.no_generate:
