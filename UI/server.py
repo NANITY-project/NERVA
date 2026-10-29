@@ -21,7 +21,7 @@ Needs: python3, numpy, torch (only to read .pt files), gguf (the exporter), and 
 (if torch/gguf are missing when you drop a .pt, the page lists the Python environments it found - .venv, conda, ... - or makes a new .venv and installs them, then restarts itself; see torch_env.py)
 (found next to this repo, or set NEON_DIR; cloned into UI/.cache if missing, unless --no-clone). A C++ compiler for libnebula / cvqvae_cli.
 """
-import argparse, base64, ctypes, faulthandler, glob, http.server, importlib.util, json, math, os, shutil, subprocess, sys, threading, time, urllib.parse, webbrowser
+import argparse, re, base64, ctypes, faulthandler, glob, http.server, importlib.util, json, math, os, shutil, subprocess, sys, threading, time, urllib.parse, webbrowser
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -34,6 +34,7 @@ FLAGS = [8, 13, 17, 21, 25, 29]
 NEON_REPO_URL = "https://github.com/NANITY-project/NANITY-NEON.git"
 sys.path.insert(0, HERE)
 import torch_env                      # finds / creates a Python environment with torch (UI/torch_env.py)
+import lang                           # prompt -> action schedule; the language model is a slot (UI/lang.py)
 
 ARGS = None
 BOOT = time.time()                      # changes on every (re)start: the page uses it to see that the server came back
@@ -332,12 +333,34 @@ class Stitcher:
         if self.ov <= 0:
             raise RuntimeError("stride must be smaller than the window (windows must overlap)")
         self.tail, self.base, self.emitted = None, 0, 0
+        self.last = None                       # last frame emitted before begin_segment(): where the next clip starts
+
+    def begin_segment(self, ease=8):
+        """The next window belongs to a NEW clip (a different action). The prior knows nothing about the old clip, so cross-fading the new window onto the old tail would pull the
+        body back to where the overlap began (up to a metre for a walk). Instead: the old clip is emitted to its end (returned), and the next add() puts the new window at the body's
+        LAST pose and eases the pose of the first `ease` frames from that pose into the window's own. Limbs may still jump a little; the engine reports what it has to correct."""
+        rest = self.flush()
+        if self.tail is not None:
+            self.last = self.tail[-1].copy()
+        self.tail, self.base, self.ease = None, self.emitted, ease
+        return rest
 
     def add(self, win):
         tc, ov = self.tc, self.ov
         w = tc.canonicalize(np.asarray(win, np.float32)[None])[0].astype(np.float64)
         if self.tail is None:
             out = w
+            if self.last is not None:                                  # first window of a new clip: start at the pose the old clip ended in
+                last = self.last
+                out = tc.to_world(w, last[0], last[2], last[3])
+                for y in tc.YAWS:
+                    out[:, y] += 2 * np.pi * np.round((last[y] - out[0, y]) / (2 * np.pi))
+                al = np.linspace(0, 1, self.ease + 2)[1:-1][:, None]
+                e = len(al)
+                blend = last[None, :] * (1 - al) + out[:e] * al
+                blend[:, FLAGS] = np.where(al > 0.5, out[:e][:, FLAGS], last[FLAGS][None, :])
+                out = np.concatenate([blend, out[e:]])
+                self.last = None
         else:
             out = self.tail
             b = len(out) - ov
@@ -433,6 +456,8 @@ class State:
         self.env_job = torch_env.Job()
         self.env_scan = []     # last scan of environments: only these interpreters may be used by /api/env/start
         self.env_new_venv = None
+        self.lm = None         # lang.NeonLM / lang.HttpLM, or None = keyword fallback only
+        self.lm_note = ""      # why the last attempt to load a language model failed (shown in the page)
 
 
 S = State()
@@ -539,6 +564,64 @@ def load_exporter(name):
     return ex
 
 
+def classify_gguf(path):
+    """'vae' (nanity.cvqvae.* keys), 'prior' (a cvqprior export) or 'lm' (anything else: a language model). Needs the gguf package."""
+    import gguf
+    r = gguf.GGUFReader(path)
+    keys = list(r.fields)
+    if any(k.startswith("nanity.cvqvae.") for k in keys):
+        return "vae"
+    if any(k.startswith("nanity.cvqprior.") for k in keys) or any("cvqprior" in k for k in keys):
+        return "prior"
+    return "lm"
+
+
+def find_lm_bin(neon_dir):
+    """Any NEON binary can run a language model (the motion-model flag is not needed), so this is looser than find_neon_bin."""
+    cands = [ARGS.neon_bin, os.environ.get("NEON_BIN"), shutil.which("neon")]
+    if neon_dir:
+        cands += [os.path.join(neon_dir, p) for p in ("neon", "build/neon", "../neon")]
+    cands += [os.path.join(os.path.dirname(ROOT), "neon", "neon"), os.path.join(os.path.dirname(ROOT), "neon"), os.path.expanduser("~/.local/bin/neon")]
+    for c in cands:
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            return os.path.abspath(c)
+    return None
+
+
+def set_lm(spec):
+    """Install (or clear) the language model. spec: {kind: 'none'|'neon'|'http', path / base / model / key / template}. Raises with a readable reason; the old model is kept on failure."""
+    kind = spec.get("kind", "none")
+    new = None
+    if kind == "neon":
+        path = spec.get("path", "")
+        if not os.path.isfile(path):
+            raise RuntimeError("no such model file")
+        if S.neon_dir is None:
+            S.neon_dir = find_neon_dir()
+        nb = find_lm_bin(S.neon_dir)
+        if not nb:
+            raise RuntimeError("no NEON binary found: build it (g++ -std=c++20 -O2 -pthread -mavx2 -mfma NEON-3.cpp -o neon) and set NEON_BIN or --neon-bin")
+        new = lang.NeonLM(nb, path, spec.get("template", "auto"), ARGS.threads)
+        try:                                              # a real round trip, so a model that loads but cannot answer is reported now, not on the first prompt
+            new.complete("Reply with the single word: ok", [("user", "ok?")], max_tokens=4, temperature=0.0, timeout=120)
+        except Exception:
+            new.close()
+            raise
+    elif kind == "http":
+        base = spec.get("base", "").strip()
+        if not re.match(r"^https?://", base):
+            raise RuntimeError("the endpoint must start with http:// or https://, e.g. http://127.0.0.1:8080/v1")
+        new = lang.HttpLM(base, spec.get("model", ""), spec.get("key", ""))
+        new.complete("Reply with the single word: ok", [("user", "ok?")], max_tokens=4, temperature=0.0, timeout=60)
+    elif kind != "none":
+        raise RuntimeError(f"unknown language model kind {kind!r}")
+    old, S.lm = S.lm, new
+    if old:
+        old.close()
+    S.lm_note = ""
+    log("language model: " + (new.name if new else "none (keyword fallback)"))
+
+
 def handle_upload(path, fname, trust=False):
     """Classify and load one dropped file. Returns a dict for the UI."""
     with open(path, "rb") as f:
@@ -551,6 +634,19 @@ def handle_upload(path, fname, trust=False):
     if fname in S.pending:
         S.pending.remove(fname)
     if magic == b"GGUF":
+        what = classify_gguf(path)
+        if what == "lm":                                  # not one of ours: a language model for the prompt box
+            try:
+                set_lm(dict(kind="neon", path=path))
+            except Exception as e:
+                S.lm_note = f"{fname}: {e}"
+                info = lang.gguf_info(path)
+                if info.get("arch") and info["arch"] != "nanity":
+                    raise RuntimeError(lang.convert_hint(path, info))
+                raise
+            return dict(kind="lm", file=fname, note=S.lm.name)
+        if what == "prior":
+            raise RuntimeError(f"{fname} is an exported prior. Drop the prior_best.pt it came from instead: the page exports it itself.")
         cfg, names, dt = gguf_meta(path)
         set_vae(cfg, names, dt, path, fname)
         return dict(kind="vae", file=fname, note="GGUF used as is")
@@ -610,10 +706,31 @@ def status():
         vae=None if not v else dict(file=v["file"], window=v["cfg"]["window"], codes=v["cfg"]["num_codes"], downs=v["cfg"]["downs"], dt=v["dt"], backend=S.session.name if S.session else "—"),
         prior=None if not p else dict(backend="NEON" if S.native_prior else "numpy", file=S.prior_file, params=p.params, K=p.K, n=p.n, windows=p.windows, stride=p.stride, layers=len(p.L), d=p.d),
         torch=not missing_modules("torch"), python=sys.executable, boot=BOOT, pending=list(S.pending),
+        lm=dict(name=S.lm.name, kind=S.lm.kind) if S.lm else None, lm_note=S.lm_note,
         actions=names, neon_dir=S.neon_dir, engine=bool(S.engine), engine_error=S.engine_err, warnings=warn, ready=bool(v and p and not warn), log=LOG[-12:])
 
 
 # ================================================================================================================ generation (a Python generator of UI events)
+def parse_segments(q, names, stride, dt):
+    """The request's segments [(action name or 'null', windows)]. With q['schedule'] (a JSON list of {action, seconds}) one segment per step; otherwise the single action / window count of the controls."""
+    raw = q.get("schedule")
+    if not raw:
+        return [(q.get("action", "null"), int(q.get("windows", 6)))], False
+    try:
+        steps = json.loads(raw)
+        assert isinstance(steps, list) and 0 < len(steps) <= lang.MAX_STEPS
+    except Exception:
+        raise RuntimeError(f"the schedule must be a JSON list of 1 to {lang.MAX_STEPS} steps")
+    segs = []
+    for st in steps:
+        act = str(st.get("action", ""))
+        if act not in names:
+            raise RuntimeError(f"'{act}' is not an action of this VAE (known: {', '.join(names)})")
+        sec = min(lang.MAX_SECONDS, max(lang.MIN_SECONDS, float(st.get("seconds", lang.DEFAULT_SECONDS))))
+        segs.append((act, lang.to_windows(sec, stride, dt)))
+    return segs, True
+
+
 def generate(q, stop):
     v, p = S.vae, S.prior
     if not (v and p and S.session):
@@ -623,68 +740,83 @@ def generate(q, stop):
     W, n, dt = cfg["window"], p.n, v["dt"]
     stride = p.stride or W // 2
     names = v["names"] or p.names
-    act_name = q.get("action", "null")
-    a = names.index(act_name) if act_name in names else None
-    first = p.ACT0 + a if a is not None else p.NULL
     temp, top_k, top_p = float(q.get("temperature", 1.0)), int(q.get("top_k", 50)), float(q.get("top_p", 0.95))
     seed = int(q.get("seed", 0))
-    n_windows = int(q.get("windows", 6))                 # 0 = endless
-    rng = np.random.default_rng(seed)
+    segs, scheduled = parse_segments(q, names, stride, dt)
+    endless = (not scheduled) and segs[0][1] == 0                  # 0 windows = endless, only for the plain single-action mode
     eng = get_engine()
     rp = Replay(eng) if eng else None
     st = Stitcher(tc, W, stride)
     native = S.native_prior
-    act_arg = act_name if a is not None else "null"
-    if native:
-        with LOCK:
-            S.session.ask({"op": "cvq_prior_reset", "action": act_arg, "seed": seed})      # NEON keeps the KV cache / context policy itself
-    else:
-        p.reset()
-    yield dict(type="start", dt=dt, window=W, n=n, stride=stride, action=act_arg, bone_names=rp.b.names if rp else None,
-               engine=bool(rp), backend=S.session.name, prior_backend="NEON" if native else "numpy", seed=seed, windows=n_windows)
-    ctx, w, sent, t_start = [first], 0, 0, time.time()
+    first_act = segs[0][0] if segs[0][0] in names else "null"
+    yield dict(type="start", dt=dt, window=W, n=n, stride=stride, action=first_act, bone_names=rp.b.names if rp else None,
+               engine=bool(rp), backend=S.session.name, prior_backend="NEON" if native else "numpy", seed=seed,
+               windows=0 if endless else sum(k for _, k in segs), schedule=[dict(action=a, windows=k) for a, k in segs] if scheduled else None)
+    w, sent, t_start = 0, 0, time.time()                           # w = window index over the whole run (the code grid), sent = frames emitted
     try:
-        while (n_windows == 0 or w < n_windows) and not stop():
+        for si, (act_name, n_windows) in enumerate(segs):
+            a = names.index(act_name) if act_name in names else None
+            first = p.ACT0 + a if a is not None else p.NULL
+            act_arg = act_name if a is not None else "null"
+            rng = np.random.default_rng(seed + si)
+            # A new action means a new prior context: the action is the first token of it, and the prior was trained on one action per clip. The prior does not know where the
+            # body is, so the stitcher ends the old clip and starts the new one at the body's last pose (begin_segment below), instead of cross-fading two unrelated clips.
             if native:
-                t0 = time.time()
                 with LOCK:
-                    r = S.session.ask({"op": "cvq_prior_next", "temperature": temp, "top_k": top_k, "top_p": top_p, "decode": True, "normalized": False})
-                codes = [int(c) for c in r["codes"]]
-                win = np.asarray(r["frames"], np.float32)
-                t1 = t2 = time.time()
-                for i in range(n):                         # NEON returns a whole window at once: replay the codes into the grid
-                    yield dict(type="code", w=w, i=i, c=codes[i], ent=round(float(r["entropy"][i]), 3), p=round(float(r["probs"][i]), 4))
+                    S.session.ask({"op": "cvq_prior_reset", "action": act_arg, "seed": seed + si})      # NEON keeps the KV cache / context policy itself
             else:
-                if w >= p.windows:                         # same context policy as train_cvqvae.generate_codes: drop the oldest window, keep the action prefix
-                    ctx = [ctx[0]] + ctx[1 + n + 1:]
-                    p.reset()
-                t0, codes = time.time(), []
-                for i in range(n):
-                    if stop():
-                        return
-                    tok, ent, pt = p.sample(ctx, rng, temp, top_k, top_p)
-                    ctx.append(tok)
-                    codes.append(tok)
-                    yield dict(type="code", w=w, i=i, c=tok, ent=round(ent, 3), p=round(pt, 4))
-                ctx.append(p.SEP)
-                t1 = time.time()
-                with LOCK:
-                    win = S.session.decode(codes, act_name if a is not None else None)
-                t2 = time.time()
-            win[:, FLAGS] = (win[:, FLAGS] > 0.5).astype(np.float32)
-            fresh = st.add(win)
-            ev = emit_frames(fresh, sent, dt, rp)
-            sent += len(fresh)
-            t3 = time.time()
-            yield dict(type="window", w=w, fused=native, prior_ms=round((t1 - t0) * 1000), decode_ms=round((t2 - t1) * 1000), engine_ms=round((t3 - t2) * 1000), frames=len(fresh))
-            yield ev
-            w += 1
-        if not stop():
-            rest = st.flush()
-            if len(rest):
-                yield emit_frames(rest, sent, dt, rp)
-                sent += len(rest)
-            yield dict(type="done", frames=sent, seconds=round(time.time() - t_start, 2))
+                p.reset()
+            ctx, wl = [first], 0                                   # wl = windows of THIS segment (context policy)
+            if si > 0:                                             # a new clip: finish the old one, start the new one at the body's last pose (see Stitcher.begin_segment)
+                rest = st.begin_segment()
+                if len(rest):
+                    yield emit_frames(rest, sent, dt, rp)
+                    sent += len(rest)
+            if scheduled:
+                yield dict(type="segment", i=si, count=len(segs), action=act_arg, windows=n_windows, w0=w)
+            while (endless or wl < n_windows) and not stop():
+                if native:
+                    t0 = time.time()
+                    with LOCK:
+                        r = S.session.ask({"op": "cvq_prior_next", "temperature": temp, "top_k": top_k, "top_p": top_p, "decode": True, "normalized": False})
+                    codes = [int(c) for c in r["codes"]]
+                    win = np.asarray(r["frames"], np.float32)
+                    t1 = t2 = time.time()
+                    for i in range(n):                         # NEON returns a whole window at once: replay the codes into the grid
+                        yield dict(type="code", w=w, i=i, c=codes[i], ent=round(float(r["entropy"][i]), 3), p=round(float(r["probs"][i]), 4))
+                else:
+                    if wl >= p.windows:                        # same context policy as train_cvqvae.generate_codes: drop the oldest window, keep the action prefix
+                        ctx = [ctx[0]] + ctx[1 + n + 1:]
+                        p.reset()
+                    t0, codes = time.time(), []
+                    for i in range(n):
+                        if stop():
+                            return
+                        tok, ent, pt = p.sample(ctx, rng, temp, top_k, top_p)
+                        ctx.append(tok)
+                        codes.append(tok)
+                        yield dict(type="code", w=w, i=i, c=tok, ent=round(ent, 3), p=round(pt, 4))
+                    ctx.append(p.SEP)
+                    t1 = time.time()
+                    with LOCK:
+                        win = S.session.decode(codes, act_name if a is not None else None)
+                    t2 = time.time()
+                win[:, FLAGS] = (win[:, FLAGS] > 0.5).astype(np.float32)
+                fresh = st.add(win)
+                ev = emit_frames(fresh, sent, dt, rp)
+                sent += len(fresh)
+                t3 = time.time()
+                yield dict(type="window", w=w, fused=native, prior_ms=round((t1 - t0) * 1000), decode_ms=round((t2 - t1) * 1000), engine_ms=round((t3 - t2) * 1000), frames=len(fresh))
+                yield ev
+                w += 1
+                wl += 1
+            if stop():
+                return
+        rest = st.flush()
+        if len(rest):
+            yield emit_frames(rest, sent, dt, rp)
+            sent += len(rest)
+        yield dict(type="done", frames=sent, seconds=round(time.time() - t_start, 2))
     finally:
         if rp:
             rp.close()
@@ -841,6 +973,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._json(dict(ok=True))
             except Exception as e:
                 self._json(dict(ok=False, error=str(e)))
+        elif u.path in ("/api/plan", "/api/lm"):
+            if self.headers.get("X-NERVA-UI") != "1":            # same guard as /api/env/start: /api/lm can start a process or make this server call a URL
+                self.send_error(403)
+                return
+            try:
+                body = json.loads(self.rfile.read(min(int(self.headers.get("Content-Length", 0)), 1 << 16)) or b"{}")
+                if u.path == "/api/plan":
+                    v, pr = S.vae, S.prior
+                    names = (v or {}).get("names") or (pr.names if pr else [])
+                    with LOCK:
+                        res = lang.plan(str(body.get("text", ""))[:2000], names, S.lm)
+                    if res["source"] in ("keyword", "none") and S.lm is None:
+                        res["note"] = "no language model loaded: only action names written in the text were used"
+                    self._json(dict(ok=bool(res["schedule"]), **res))
+                else:
+                    with LOCK:
+                        set_lm(body)
+                    self._json(dict(ok=True, status=status()))
+            except Exception as e:
+                if u.path == "/api/lm":
+                    S.lm_note = str(e)
+                self._json(dict(ok=False, error=str(e), status=status()))
         elif u.path == "/api/stop":
             S.gen_id += 1
             self._json(dict(ok=True))
@@ -883,12 +1037,26 @@ def main():
     ap.add_argument("--numpy-prior", action="store_true", help="force the numpy prior even if NEON can run it (for comparing the two)")
     ap.add_argument("--no-engine", action="store_true", help="skip libnebula; the browser draws a preview skeleton")
     ap.add_argument("--threads", type=int, default=0, help="threads for NEON (0 = its default)")
+    ap.add_argument("--lm", default="", help="language model for the prompt box: a NEON-loadable .gguf path (NEON must be built), or an OpenAI-compatible base URL such as http://127.0.0.1:8080/v1")
+    ap.add_argument("--lm-model", default="", help="model name sent to an --lm URL (many servers ignore it)")
+    ap.add_argument("--lm-key-env", default="", help="name of an environment variable holding the API key for an --lm URL (never put the key itself on the command line)")
     ap.add_argument("--trust-pickle", action="store_true", help="torch.load(weights_only=False) as a fallback; only for files you made yourself")
     ARGS = ap.parse_args()
     os.makedirs(CACHE, exist_ok=True)
     faulthandler.enable(all_threads=True)                 # a native crash (libnebula, torch ...) prints the Python stack that was running instead of dying silently
     threading.Thread(target=lambda: (get_engine(), None), daemon=True).start()
-    threading.Thread(target=load_pending, daemon=True).start()     # build/load the engine while the page loads
+    threading.Thread(target=load_pending, daemon=True).start()
+    if ARGS.lm:
+        def _lm():
+            try:
+                spec = dict(kind="http", base=ARGS.lm, model=ARGS.lm_model, key=os.environ.get(ARGS.lm_key_env, "") if ARGS.lm_key_env else "") if ARGS.lm.startswith(("http://", "https://")) \
+                    else dict(kind="neon", path=ARGS.lm)
+                with LOCK:
+                    set_lm(spec)
+            except Exception as e:
+                S.lm_note = str(e)
+                log(f"language model not loaded: {e}")
+        threading.Thread(target=_lm, daemon=True).start()     # build/load the engine while the page loads
     srv = http.server.ThreadingHTTPServer((ARGS.host, ARGS.port), Handler)
     srv.daemon_threads = True
     url = f"http://{ARGS.host}:{ARGS.port}"
@@ -902,6 +1070,8 @@ def main():
     finally:
         if S.session:
             S.session.close()
+        if S.lm:
+            S.lm.close()
 
 
 if __name__ == "__main__":
