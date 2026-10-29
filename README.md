@@ -24,7 +24,7 @@ This repository and its code are provided "as is" without any warranty.
 
 The engine never plays canned animations. A walk is a sequence of foot coordinates, a reach is a hand coordinate, and the body supplies the physics (balance, reach limits, planted feet, falling). Whatever produces motion, a model's text actions or a generated clip, is bounded by the same engine.
 
-Not in this repo yet: a translator from intent or emotion to movement goals, and the loop that retrains the generator on clips the engine and grader pass.
+The UI has a language layer ([UI/README.md](UI/README.md#prompts-language-layer)): any model, loaded from a `.gguf` or an OpenAI-compatible endpoint, turns a prompt into a schedule of action labels. Not in this repo yet: a translator from intent or emotion to the prior's goal numbers (direction, speed, style), and the loop that retrains the generator on clips the engine and grader pass.
 
 ## Layout
 
