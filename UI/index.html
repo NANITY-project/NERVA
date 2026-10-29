@@ -275,12 +275,25 @@ kbd{font:10px var(--mono);border:1px solid var(--glass-border);border-radius:4px
   <div class="in">
     <section class="rv" style="--i:0">
       <div class="tag"><span>Models</span><i></i></div>
-      <div id="drop"><big>Drop .pt files</big><small>or click to browse</small></div>
+      <div id="drop"><big>Drop .pt files</big><small>or a language-model .gguf · click to browse</small></div>
       <input type="file" id="file" multiple accept=".pt,.pth,.gguf" hidden>
       <div id="cards"></div>
       <div id="msgs"></div>
     </section>
     <section class="rv" style="--i:1">
+      <div class="tag"><span>Prompt</span><i></i></div>
+      <textarea id="promptText" rows="2" placeholder="e.g. walk, then pick something up and wave" style="width:100%;box-sizing:border-box;resize:vertical;font:inherit;padding:8px;border-radius:8px;border:1px solid var(--line,#444);background:transparent;color:inherit"></textarea>
+      <div class="row" style="margin-top:6px;grid-template-columns:auto 1fr"><button class="btn sm main" id="planBtn" type="button" disabled>Plan</button><span id="planNote" style="opacity:.7;font-size:12px;padding-left:8px"></span></div>
+      <div id="sched" style="margin-top:6px"></div>
+      <details id="lmBox" style="margin-top:8px"><summary id="lmSum">Language model: none</summary>
+        <p style="font-size:12px;opacity:.75;margin:6px 0">Drop any <b>.gguf</b> NEON can load (architecture <code>nanity</code>), or point at an OpenAI-compatible endpoint (llama.cpp server, Ollama, hosted API). Nothing is tied to one model. Without one, only action names written in the prompt are used.</p>
+        <label class="row">URL<input type="text" id="lmBase" placeholder="http://127.0.0.1:8080/v1" style="width:100%"><span></span></label>
+        <label class="row">Model<input type="text" id="lmModel" placeholder="(optional)" style="width:100%"><span></span></label>
+        <label class="row">Key<input type="password" id="lmKey" placeholder="(optional, kept in memory)" autocomplete="off" style="width:100%"><span></span></label>
+        <div class="row" style="grid-template-columns:auto auto 1fr"><button class="btn sm" id="lmUse" type="button">Use endpoint</button><button class="btn sm quiet" id="lmOff" type="button">Remove</button><span id="lmNote" style="font-size:12px;opacity:.75;padding-left:8px"></span></div>
+      </details>
+    </section>
+    <section class="rv" style="--i:2">
       <div class="tag"><span>Sampling</span><i></i></div>
       <label class="row">Action<select id="action"><option value="null">unconditional</option></select><span></span></label>
       <label class="row">Temp<input type="range" id="temp" min="0.3" max="1.6" step="0.05" value="1"><output id="tempO">1.00</output></label>
@@ -455,6 +468,7 @@ function render(){
   const sel = $('action'), cur = sel.value;
   sel.innerHTML = '<option value="null">unconditional</option>' + (s.actions || []).map(a => `<option>${a}</option>`).join('');
   if ([...sel.options].some(o => o.value === cur)) sel.value = cur;
+  renderLM();
   $('go').disabled = !s.ready || !!es;
   if (s.prior && !$('wins').dataset.touched) $('wins').value = Math.max(4, s.prior.windows * 2);
   setEmpty();
@@ -464,6 +478,63 @@ function card(tag, title, short, full, hint){
   if (!title){ d.className = 'card empty'; d.textContent = tag + ' · ' + hint; return d; }
   d.className = 'card'; d.title = full || '';
   d.innerHTML = `<div class="t">${tag.toUpperCase()}</div><div>${title}</div><div class="d">${short}</div>`; return d;
+}
+
+
+// ------------------------------------------------------------------ prompt -> schedule, language model slot
+let SCHED = [];                                   // [{action, seconds}] ; empty = the single action in "Sampling"
+const API = (path, body) => fetch(path, {method: 'POST', headers: {'Content-Type': 'application/json', 'X-NERVA-UI': '1'}, body: JSON.stringify(body)}).then(r => r.json());
+function drawSched(){
+  const box = $('sched'); box.innerHTML = '';
+  const names = (ST && ST.actions) || [];
+  SCHED.forEach((st, i) => {
+    const r = document.createElement('div'); r.className = 'row'; r.style.cssText = 'grid-template-columns:1fr 64px auto;gap:6px;margin:3px 0';
+    const sel = document.createElement('select'); names.forEach(n => { const o = document.createElement('option'); o.textContent = n; if (n === st.action) o.selected = true; sel.append(o); });
+    sel.onchange = () => st.action = sel.value;
+    const sec = document.createElement('input'); sec.type = 'number'; sec.min = 0.5; sec.max = 30; sec.step = 0.5; sec.value = st.seconds; sec.title = 'seconds';
+    sec.oninput = () => st.seconds = Math.min(30, Math.max(0.5, +sec.value || 3));
+    const x = document.createElement('button'); x.className = 'btn sm quiet'; x.type = 'button'; x.textContent = '×'; x.title = 'remove step';
+    x.onclick = () => { SCHED.splice(i, 1); drawSched(); };
+    r.append(sel, sec, x); box.append(r);
+  });
+  if (SCHED.length){
+    const add = document.createElement('button'); add.className = 'btn sm quiet'; add.type = 'button'; add.textContent = '+ step';
+    add.onclick = () => { SCHED.push({action: names[0] || 'null', seconds: 3}); drawSched(); };
+    const clr = document.createElement('button'); clr.className = 'btn sm quiet'; clr.type = 'button'; clr.textContent = 'clear'; clr.style.marginLeft = '6px';
+    clr.onclick = () => { SCHED = []; drawSched(); };
+    box.append(add, clr);
+  }
+  $('action').disabled = SCHED.length > 0;
+}
+async function doPlan(){
+  const text = $('promptText').value.trim(); if (!text) return;
+  $('planBtn').disabled = true; $('planNote').textContent = 'planning…';
+  try{
+    const j = await API('/api/plan', {text});
+    if (j.schedule && j.schedule.length){
+      SCHED = j.schedule.map(s => ({action: s.action, seconds: s.seconds}));
+      const how = {model: 'by ' + (j.model || 'the model'), retry: 'by ' + (j.model || 'the model') + ' (second try)', keyword: 'FALLBACK: action names found in the text' + (j.error ? ' (' + j.error + ')' : '')}[j.source] || j.source;
+      $('planNote').textContent = how;
+      log(`plan ${j.source}: ` + SCHED.map(s => `${s.action} ${s.seconds}s`).join(' → ') + (j.raw ? `   | model said: ${JSON.stringify(j.raw.slice(0, 160))}` : ''));
+    } else { SCHED = []; $('planNote').textContent = j.error || 'nothing could be planned'; log('✗ plan: ' + (j.error || 'empty')); }
+  }catch(e){ $('planNote').textContent = 'failed: ' + e; }
+  $('planBtn').disabled = !(ST && ST.vae); drawSched();
+}
+$('planBtn').onclick = doPlan;
+$('promptText').addEventListener('keydown', e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)){ e.preventDefault(); doPlan(); } });
+async function setLM(spec){
+  $('lmNote').textContent = 'loading…';
+  try{ const j = await API('/api/lm', spec); if (j.status) ST = j.status; $('lmNote').textContent = j.ok ? '' : j.error; if (j.ok) log('language model: ' + (ST.lm ? ST.lm.name : 'none')); else log('✗ language model: ' + j.error); render(); }
+  catch(e){ $('lmNote').textContent = String(e); }
+}
+$('lmUse').onclick = () => setLM({kind: 'http', base: $('lmBase').value, model: $('lmModel').value, key: $('lmKey').value});
+$('lmOff').onclick = () => setLM({kind: 'none'});
+function renderLM(){
+  $('lmSum').textContent = 'Language model: ' + (ST && ST.lm ? ST.lm.name : 'none (keyword fallback)');
+  if (ST && ST.lm_note && !ST.lm) $('lmNote').textContent = ST.lm_note;
+  $('planBtn').disabled = !(ST && ST.vae);
+  if (ST && SCHED.length){ const ok = new Set(ST.actions || []); SCHED = SCHED.filter(s => ok.has(s.action)); }
+  drawSched();
 }
 
 // ------------------------------------------------------------------ upload (drag & drop anywhere)
@@ -603,13 +674,14 @@ function startGen(){
   $('grid').innerHTML = ''; ents.length = 0; drawEnt(); $('winCount').textContent = '';
   const q = new URLSearchParams({action: $('action').value, temperature: $('temp').value, top_k: $('topk').value, top_p: $('topp').value,
     seed: $('seed').value, windows: $('endless').checked ? 0 : $('wins').value});
+  if (SCHED.length) q.set('schedule', JSON.stringify(SCHED));
   G = {dt: 1/30, names: null, engine: false, chunks: [], total: 0, first: 0, t0: performance.now(), rows: {}, action: $('action').value, fps: 30};
   playhead = 0; playing = true; $('play').textContent = 'pause'; $('play').onclick = togglePlay; setEmpty();
   es = new EventSource('/api/generate?' + q);
   $('go').disabled = true; setRunning(true);
   es.onmessage = m => onEvent(JSON.parse(m.data));
   es.onerror = () => { if (es && es.readyState === EventSource.CLOSED) endGen(); };
-  log(`generate: action=${$('action').value} T=${$('temp').value} k=${$('topk').value} p=${$('topp').value} seed=${$('seed').value}`);
+  log(SCHED.length ? `generate: schedule ${SCHED.map(x => x.action + ' ' + x.seconds + 's').join(' → ')} T=${$('temp').value} seed=${$('seed').value}` : `generate: action=${$('action').value} T=${$('temp').value} k=${$('topk').value} p=${$('topp').value} seed=${$('seed').value}`);
 }
 function stopGen(silent){
   fetch('/api/stop', {method: 'POST'}).catch(() => {});
@@ -635,6 +707,8 @@ function onEvent(e){
     row.ms.title = `prior ${e.prior_ms} · NEON ${e.decode_ms}${G.engine ? ' · engine ' + e.engine_ms : ''} ms`;
     const winSec = e.frames * G.dt, workSec = (e.prior_ms + e.decode_ms + e.engine_ms) / 1000;
     G.rt = winSec / Math.max(workSec, 1e-6);
+  } else if (e.type === 'segment'){
+    log(`step ${e.i + 1}/${e.count}: ${e.action}, ${e.windows} window${e.windows === 1 ? '' : 's'} (from w${e.w0})`);
   } else if (e.type === 'frames'){
     addChunk(e);
   } else if (e.type === 'done'){
