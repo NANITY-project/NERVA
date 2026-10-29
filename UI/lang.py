@@ -116,13 +116,44 @@ def parse_schedule(text, actions, default_seconds=DEFAULT_SECONDS):
     return steps
 
 
-def keyword_schedule(user_text, actions, default_seconds=DEFAULT_SECONDS):
-    """No model: the action names (and exact near-spellings) that appear in the text, in order of appearance."""
-    steps = []
-    for w in re.findall(r"[A-Za-z_][A-Za-z0-9_\-]*", user_text):
-        a = match_action(w, actions) if len(w) >= 3 else None
-        if a and (not steps or steps[-1]["action"] != a):
-            steps.append(dict(action=a, seconds=default_seconds))
+# everyday words -> the action they mean; used only when the target action exists in THIS VAE's list (nothing is hard-coded as available)
+SYNONYMS = {"wave": "gesture", "greet": "gesture", "hello": "gesture", "point": "gesture", "grab": "pickup", "lift": "pickup", "carry": "pickup",
+            "hop": "jump", "leap": "jump", "jog": "run", "sprint": "run", "strut": "walk", "stroll": "walk", "crouch": "sit", "kneel": "sit",
+            "idle": "stand", "rest": "stand"}
+
+
+def _vocab(actions, synonyms=False):
+    """word -> action, longest words first, for substring scanning of text that has no spaces."""
+    have = {a.lower(): a for a in actions}
+    v = {k: a for k, a in have.items() if len(k) >= 3}
+    for w, tgt in (SYNONYMS.items() if synonyms else ()):
+        if tgt in have and w not in v:
+            v[w] = have[tgt]
+    return sorted(v.items(), key=lambda kv: -len(kv[0]))
+
+
+def keyword_schedule(user_text, actions, default_seconds=DEFAULT_SECONDS, synonyms=False):
+    """No model: the action names (plus synonyms of existing ones when synonyms=True; off by default: an unknown word is never guessed into an action) found in the text, in order of appearance.
+    Works on run-together text ("walkthenwaveurhand"): every alphabetic run is scanned for vocabulary words, longest first, left to right."""
+    vocab, steps = _vocab(actions, synonyms), []
+    for run in re.findall(r"[A-Za-z_][A-Za-z0-9_\-]*", user_text):
+        low, i = run.lower(), 0
+        whole = match_action(run, actions) if len(run) >= 3 else None
+        hits = []
+        if whole and whole.lower() == re.sub(r"[^a-z0-9_]+", "_", low).strip("_"):      # the run IS an action name (e.g. "walk", "pick_up")
+            hits = [whole]
+        else:
+            while i < len(low):
+                m = next(((w, a) for w, a in vocab if low.startswith(w, i)), None)
+                if m:
+                    hits.append(m[1]); i += len(m[0])
+                else:
+                    i += 1
+            if not hits and whole:                                                          # a near-spelling ("walkin") of an action
+                hits = [whole]
+        for a in hits:
+            if not steps or steps[-1]["action"] != a:
+                steps.append(dict(action=a, seconds=default_seconds))
     return steps[:MAX_STEPS]
 
 
