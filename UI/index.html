@@ -660,7 +660,7 @@ $('seek').oninput = () => { playhead = +$('seek').value; playing = false; $('pla
 $('grid').addEventListener('wheel', e => { if (Math.abs(e.deltaY) > Math.abs(e.deltaX)){ $('grid').scrollLeft += e.deltaY; e.preventDefault(); } }, {passive: false});
 addEventListener('keydown', e => {
   if (e.key === 'Escape'){ if ($('trust').classList.contains('open')){ $('trustNo').click(); return; } setGuide(false); setCtl(false); return; }
-  if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT' || e.target.tagName === 'BUTTON' || e.metaKey || e.ctrlKey || e.altKey) return;
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT' || e.target.tagName === 'BUTTON' || e.target.isContentEditable || e.metaKey || e.ctrlKey || e.altKey) return;
   if (e.code === 'Space'){ $('play').onclick(); e.preventDefault(); }
   else if (e.key === 'c' || e.key === 'C') $('ctlBtn').click();
   else if (e.key === 'g' || e.key === 'G') $('codesBtn').click();
