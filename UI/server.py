@@ -35,6 +35,7 @@ NEON_REPO_URL = "https://github.com/NANITY-project/NANITY-NEON.git"
 sys.path.insert(0, HERE)
 import torch_env                      # finds / creates a Python environment with torch (UI/torch_env.py)
 import lang                           # prompt -> action schedule; the language model is a slot (UI/lang.py)
+import goal_plan                      # text -> per-window goal rows: the Goal Translator (UI/goal_plan.py, tools/goal_translator)
 
 ARGS = None
 BOOT = time.time()                      # changes on every (re)start: the page uses it to see that the server came back
@@ -547,6 +548,9 @@ class State:
         self.env_new_venv = None
         self.lm = None         # lang.NeonLM / lang.HttpLM, or None = keyword fallback only
         self.lm_note = ""      # why the last attempt to load a language model failed (shown in the page)
+        self.gt = None         # goal_plan.GoalPlanner (stage C, or a trained translator GGUF); built on first use
+        self.gt_file = None    # --goal-translator FILE
+        self.gt_note = ""
 
 
 S = State()
@@ -798,6 +802,7 @@ def status():
                                       goal=goal_status(p)),
         torch=not missing_modules("torch"), python=sys.executable, boot=BOOT, pending=list(S.pending),
         lm=dict(name=S.lm.name, kind=S.lm.kind) if S.lm else None, lm_note=S.lm_note,
+        goal_translator=dict(source="model" if S.gt_file else "stage_c", file=os.path.basename(S.gt_file) if S.gt_file else None, note=S.gt_note),
         actions=names, neon_dir=S.neon_dir, engine=bool(S.engine), engine_error=S.engine_err, warnings=warn, ready=bool(v and p and not warn), log=LOG[-12:])
 
 
@@ -835,6 +840,9 @@ def parse_timeline(q, tc, p, W, dt):
     cruise = float((p.goal_stats or {}).get("speed_cruise") or 1.0)
     out = []
     for i, r in enumerate(rows):
+        if r.get("unspecified"):                                   # the text says nothing about this window: no goal for it (the null goal), no asked-vs-got
+            out.append(dict(turn=None, speed=None, distance=None, goal=None))
+            continue
         try:
             turn = float(r.get("turn") or 0.0)
             speed = float(r["speed"]) if r.get("speed") is not None else (float(r["distance"]) / sec if r.get("distance") is not None else cruise)
@@ -940,6 +948,8 @@ def generate(q, stop):
                     rq = {"op": "cvq_prior_next", "temperature": temp, "top_k": top_k, "top_p": top_p, "decode": True, "normalized": False}
                     if gw is not None:
                         rq["goal"] = gw                            # RAW numbers: NEON normalises them with the prior's own statistics
+                    elif row is not None:
+                        rq["goal"] = None                          # an unspecified window: explicitly NO goal (null), never the previous one
                     with LOCK:
                         r = S.session.ask(rq)
                     codes = [int(c) for c in r["codes"]]
@@ -972,13 +982,13 @@ def generate(q, stop):
                         win = S.session.decode(codes, act_name if a is not None else None)
                     t2 = time.time()
                 win[:, FLAGS] = (win[:, FLAGS] > 0.5).astype(np.float32)
-                got = tc.goal_features(tc.canonicalize(win[None]), np.array([len(win)]), dt)[0] if row else None     # what the window really does, measured on the decoded motion itself
+                got = tc.goal_features(tc.canonicalize(win[None]), np.array([len(win)]), dt)[0] if (row and row["goal"] is not None) else None     # what the window really does, measured on the decoded motion itself
                 fresh = st.add(win)
                 ev = emit_frames(fresh, sent, dt, rp)
                 sent += len(fresh)
                 t3 = time.time()
                 yield dict(type="window", w=w, fused=native, prior_ms=round((t1 - t0) * 1000), decode_ms=round((t2 - t1) * 1000), engine_ms=round((t3 - t2) * 1000), frames=len(fresh))
-                if row:                                            # asked vs got, per window: turn (degrees, + left), speed (m/s) and the distance walked in the window (m)
+                if got is not None:                                # asked vs got, per window: turn (degrees, + left), speed (m/s) and the distance walked in the window (m)
                     yield dict(type="goal", w=w, want=dict(turn=round(row["turn"], 1), speed=round(row["speed"], 3), distance=round(row["distance"], 3)),
                                got=dict(turn=round(math.degrees(float(got[0])), 1), speed=round(float(got[3]), 3), distance=round(float(got[3]) * sec, 3)))
                 yield ev
@@ -1169,6 +1179,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if u.path == "/api/lm":
                     S.lm_note = str(e)
                 self._json(dict(ok=False, error=str(e), status=status()))
+        elif u.path == "/api/goal_plan":                             # text -> per-window goal rows (Goal Translator); errors are shown to the user, never hidden behind a keyword fallback
+            if self.headers.get("X-NERVA-UI") != "1":
+                self.send_error(403)
+                return
+            try:
+                body = json.loads(self.rfile.read(min(int(self.headers.get("Content-Length", 0)), 1 << 16)) or b"{}")
+                v, pr = S.vae, S.prior
+                if not (v and pr and goal_status(pr)):
+                    raise goal_plan.GoalPlanError("drop a VAE and a prior trained with goal numbers first")
+                with LOCK:
+                    if S.gt is None:
+                        S.gt = goal_plan.GoalPlanner(S.gt_file)
+                    W = v["cfg"]["window"]
+                    res = S.gt.plan(str(body.get("text", "")), pr.goal_stats, W, pr.stride or W // 2, v["dt"])
+                self._json(dict(ok=True, **res))
+            except goal_plan.GoalPlanError as e:
+                S.gt_note = str(e) if "translator" in str(e) else S.gt_note
+                self._json(dict(ok=False, error=str(e)))
+            except Exception as e:
+                self._json(dict(ok=False, error=f"goal translator: {e}"))
         elif u.path == "/api/stop":
             S.gen_id += 1
             self._json(dict(ok=True))
@@ -1214,8 +1244,14 @@ def main():
     ap.add_argument("--lm", default="", help="language model for the prompt box: a NEON-loadable .gguf path (NEON must be built), or an OpenAI-compatible base URL such as http://127.0.0.1:8080/v1")
     ap.add_argument("--lm-model", default="", help="model name sent to an --lm URL (many servers ignore it)")
     ap.add_argument("--lm-key-env", default="", help="name of an environment variable holding the API key for an --lm URL (never put the key itself on the command line)")
+    ap.add_argument("--goal-translator", default="", help="a trained Goal Translator .gguf (tools/goal_translator/export_goal_translator.py) for the Steering box's text field; "
+                    "without it the deterministic stage-C bootstrap translates (and the page says so)")
     ap.add_argument("--trust-pickle", action="store_true", help="torch.load(weights_only=False) as a fallback; only for files you made yourself")
     ARGS = ap.parse_args()
+    if ARGS.goal_translator:
+        if not os.path.isfile(ARGS.goal_translator):
+            sys.exit(f"--goal-translator: {ARGS.goal_translator} is not a file")
+        S.gt_file = os.path.abspath(ARGS.goal_translator)
     os.makedirs(CACHE, exist_ok=True)
     faulthandler.enable(all_threads=True)                 # a native crash (libnebula, torch ...) prints the Python stack that was running instead of dying silently
     threading.Thread(target=lambda: (get_engine(), None), daemon=True).start()
