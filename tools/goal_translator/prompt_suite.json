@@ -1,0 +1,156 @@
+{
+ "about": "Fixed prompt suite for the Goal Translator (spec section 9). expect = collapsed window classes in order: L left-turning, R right-turning, S straight and moving, X standing, U unspecified. forbid = classes that must not appear. The first case is the prompt that motivated the module: the wave is not expressible and must not become a made-up turn. tier easy = plain phrasings a keyword-level parser should get; tier hard = typos, direction lists with no separators, abbreviations, reordering: the learned model should beat stage C here.",
+ "prompts": [
+  {
+   "text": "Walkrightandthenleftthenwaveurhandandidkmovearound?",
+   "expect": "R L U",
+   "tier": "easy"
+  },
+  {
+   "text": "walk left",
+   "expect": "L",
+   "tier": "easy"
+  },
+  {
+   "text": "walk right",
+   "expect": "R",
+   "tier": "easy"
+  },
+  {
+   "text": "turn right 90 degrees",
+   "expect": "R",
+   "tier": "easy"
+  },
+  {
+   "text": "turn left 90 degrees then walk straight for 5 seconds",
+   "expect": "L S",
+   "tier": "easy"
+  },
+  {
+   "text": "walk straight for 5 seconds",
+   "expect": "S",
+   "tier": "easy"
+  },
+  {
+   "text": "stand still",
+   "expect": "X",
+   "tier": "easy"
+  },
+  {
+   "text": "go left then right then left",
+   "expect": "L R L",
+   "tier": "easy"
+  },
+  {
+   "text": "run forward then stop",
+   "expect": "S X",
+   "tier": "easy"
+  },
+  {
+   "text": "walk slightly left, then straight",
+   "expect": "L S",
+   "tier": "easy"
+  },
+  {
+   "text": "idk just move around",
+   "expect": "U",
+   "tier": "easy"
+  },
+  {
+   "text": "WALKLEFTTHENRIGHT",
+   "expect": "L R",
+   "tier": "easy"
+  },
+  {
+   "text": "head right slowly then idk",
+   "expect": "R U",
+   "tier": "easy"
+  },
+  {
+   "text": "walk left for 3 seconds then stand still",
+   "expect": "L X",
+   "tier": "easy"
+  },
+  {
+   "text": "sprint right",
+   "expect": "R",
+   "tier": "easy"
+  },
+  {
+   "text": "wave your hand",
+   "forbid": "LR",
+   "tier": "easy"
+  },
+  {
+   "text": "sit down and dance",
+   "forbid": "LR",
+   "tier": "easy"
+  },
+  {
+   "text": "wave ur hand then walk straight",
+   "expect": "S",
+   "forbid": "LR",
+   "tier": "easy"
+  },
+  {
+   "text": "walk to the left and then to the right and then to the left again",
+   "expect": "L R L",
+   "tier": "easy"
+  },
+  {
+   "text": "stroll forward a bit then turn left",
+   "expect": "S L",
+   "tier": "easy"
+  },
+  {
+   "text": "lfet then right",
+   "expect": "L R",
+   "tier": "hard"
+  },
+  {
+   "text": "go leftt then rigth",
+   "expect": "L R",
+   "tier": "hard"
+  },
+  {
+   "text": "zig zag left right left right",
+   "expect": "L R L R",
+   "tier": "hard"
+  },
+  {
+   "text": "walk l then r",
+   "expect": "L R",
+   "tier": "hard"
+  },
+  {
+   "text": "first go right but before that walk forward",
+   "expect": "S R",
+   "tier": "hard"
+  },
+  {
+   "text": "make a right then a left",
+   "expect": "R L",
+   "tier": "hard"
+  },
+  {
+   "text": "hang a left, then bear right",
+   "expect": "L R",
+   "tier": "hard"
+  },
+  {
+   "text": "go left right left",
+   "expect": "L R L",
+   "tier": "hard"
+  },
+  {
+   "text": "veer off to the right a little then back to the left",
+   "expect": "R L",
+   "tier": "hard"
+  },
+  {
+   "text": "make a u turn",
+   "expect": "U",
+   "tier": "hard"
+  }
+ ]
+}
