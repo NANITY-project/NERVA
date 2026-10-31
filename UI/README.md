@@ -47,9 +47,26 @@ The prior is conditioned on an **action label**, not on text, so a prompt is tur
 
 A model that answers badly gets one retry at temperature 0, then the keyword fallback; the page shows which of the three produced the plan. Names that are not in the VAE's action list are dropped, never guessed.
 
-Limits worth knowing: only the ~24 action labels exist (there is no sit, run, kick, dance or get-up unless your data has them), steering by direction or target (the prior's goal numbers) is not exposed here yet, and the prior does not know where the body is, so the first moments of a new step can show the limbs jumping before the engine corrects them (the red frame border).
+Limits worth knowing: only the ~24 action labels exist (there is no sit, run, kick, dance or get-up unless your data has them), steering by direction is done with numbers, not words (see **Steering by numbers**), and the prior does not know where the body is, so the first moments of a new step can show the limbs jumping before the engine corrects them (the red frame border).
 
-Tests: `python3 tests/test_lang.py` and `python3 tests/test_ui_schedule.py` (numpy only, no torch / model / NEON needed).
+Tests: `python3 tests/test_lang.py`, `python3 tests/test_ui_schedule.py` and `python3 tests/test_ui_goals.py` (numpy only, no torch / model / NEON needed).
+
+## Steering by numbers (no language)
+
+If the prior was trained with goal numbers (`train_cvqvae.py` without `--no-prior-goal`; `/api/status` then has `prior.goal`), the **Steering** section appears. One row per window of motion (about 2.1 s):
+
+| Column | Meaning |
+|---|---|
+| turn ° | heading change over the window, **+ left, - right** (the trainer's convention: `arc_goal`) |
+| speed m/s, dist m | the same thing two ways, `dist = speed x window seconds`; neither = the data's cruise speed |
+
+The action label stays **NULL** (no label) unless you pick one in Sampling, so the movement is described by the numbers alone. The last row repeats if the run is longer than the list (Endless). **Right, then left** fills a gentle turn right for half the windows and left for the other half (60 % of the prior's own `turn_max`). **Guidance** is classifier-free guidance (1 = off); it only acts on windows that have a goal.
+
+After each window the server measures what the decoded motion really did (`train_cvqvae.goal_features`) and the page lists asked vs got, with a check mark when the window turned the asked way. That is the test for "right, then left" before any text parsing exists. A prior without goals refuses a timeline instead of silently ignoring it.
+
+The numpy prior takes the same goals, style and guidance as NEON's (`Prior.add_window_goal`, `set_cfg_scale`), and `cvq_prior_reset` / `cvq_prior_next` on NEON accept `goal` / `goals`. A NEON build that does not report goal numbers in `info` would ignore them, so a steered run then uses the numpy prior (NEON only decodes).
+
+Tests: `python3 tests/test_ui_goals.py` (numpy only).
 
 ## Notes
 
