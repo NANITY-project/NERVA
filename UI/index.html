@@ -293,9 +293,24 @@ kbd{font:10px var(--mono);border:1px solid var(--glass-border);border-radius:4px
         <div class="row" style="grid-template-columns:auto auto 1fr"><button class="btn sm" id="lmUse" type="button">Use endpoint</button><button class="btn sm quiet" id="lmOff" type="button">Remove</button><span id="lmNote" style="font-size:12px;opacity:.75;padding-left:8px"></span></div>
       </details>
     </section>
-    <section class="rv" style="--i:2">
+    <section class="rv" id="steerSec" style="--i:2;display:none">
+      <div class="tag"><span>Steering</span><i></i></div>
+      <p id="steerNote" style="font-size:11px;opacity:.7;margin:0 0 6px">Numbers only, one row per window: heading change in degrees (+ left, − right) and speed or distance. No rows = no steering.</p>
+      <div class="row" style="display:flex;gap:6px;flex-wrap:wrap;margin:6px 0">
+        <button class="btn sm main" id="tlRL" type="button" title="a gentle turn to the right for half the windows, then to the left">Right, then left</button>
+        <button class="btn sm quiet" id="tlStr" type="button">Straight</button>
+        <button class="btn sm quiet" id="tlAdd" type="button" title="add a window (copies the last)">+ window</button>
+        <button class="btn sm quiet" id="tlDel" type="button" title="remove the last window">− window</button>
+        <button class="btn sm quiet" id="tlClr" type="button">Clear</button>
+      </div>
+      <div id="tl"></div>
+      <label class="row" style="margin-top:8px">Guidance<input type="range" id="cfg" min="1" max="4" step="0.1" value="1"><output id="cfgO">1.0</output></label>
+      <div id="tlSum" style="font-size:11px;margin-top:6px"></div>
+      <div id="tlRes" style="font:10.5px/1.5 monospace;max-height:150px;overflow:auto;margin-top:4px;opacity:.9"></div>
+    </section>
+    <section class="rv" style="--i:3">
       <div class="tag"><span>Sampling</span><i></i></div>
-      <label class="row">Action<select id="action"><option value="null">unconditional</option></select><span></span></label>
+      <label class="row">Action<select id="action"><option value="null">NULL (no label)</option></select><span></span></label>
       <label class="row">Temp<input type="range" id="temp" min="0.3" max="1.6" step="0.05" value="1"><output id="tempO">1.00</output></label>
       <label class="row">Top-k<input type="range" id="topk" min="0" max="200" step="1" value="50"><output id="topkO">50</output></label>
       <label class="row">Top-p<input type="range" id="topp" min="0.5" max="1" step="0.01" value="0.95"><output id="toppO">0.95</output></label>
@@ -466,9 +481,10 @@ function render(){
   (s.warnings || []).forEach(w => note('warnbox', w));
   if (s.engine_error && !s.engine){ note('warnbox', 'Body engine not loaded. Showing a preview skeleton.'); $('msgs').lastChild.title = s.engine_error.slice(0, 200); }
   const sel = $('action'), cur = sel.value;
-  sel.innerHTML = '<option value="null">unconditional</option>' + (s.actions || []).map(a => `<option>${a}</option>`).join('');
+  sel.innerHTML = '<option value="null">NULL (no label)</option>' + (s.actions || []).map(a => `<option>${a}</option>`).join('');
   if ([...sel.options].some(o => o.value === cur)) sel.value = cur;
   renderLM();
+  renderSteer();
   $('go').disabled = !s.ready || !!es;
   if (s.prior && !$('wins').dataset.touched) $('wins').value = Math.max(4, s.prior.windows * 2);
   setEmpty();
@@ -480,6 +496,61 @@ function card(tag, title, short, full, hint){
   d.innerHTML = `<div class="t">${tag.toUpperCase()}</div><div>${title}</div><div class="d">${short}</div>`; return d;
 }
 
+
+// ------------------------------------------------------------------ steering by numbers (no language): a goal per window
+let TL = [];                                       // [{turn (deg, + left), speed (m/s)}] one per window; the last row repeats. distance = speed * window seconds
+const WSEC = () => (ST && ST.vae) ? (ST.vae.window - 1) * ST.vae.dt : 2.1;
+const TURN_OK = 5;                                  // degrees: "turned the asked way" needs the sign to agree once |asked| >= this; below it the window is a straight one and |got| < 2*this passes
+const r1 = x => Math.round(x * 10) / 10, r2 = x => Math.round(x * 100) / 100;
+function renderSteer(){
+  const g = ST && ST.prior && ST.prior.goal;
+  $('steerSec').style.display = g ? '' : 'none';
+  if (!g){ TL = []; return; }
+  $('steerNote').textContent = 'Numbers only, one row per window: heading change in degrees (+ left, − right) and speed or distance. The action label stays NULL unless you pick one. No rows = no steering.'
+    + (g.backend === 'numpy' ? ' (Prior runs in numpy.)' : '');
+  drawTL();
+}
+function drawTL(){
+  const box = $('tl'); box.innerHTML = '';
+  const head = document.createElement('div'); head.style.cssText = 'display:grid;grid-template-columns:26px 1fr 1fr 1fr;gap:6px;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;opacity:.55;margin:2px 0';
+  head.innerHTML = '<span></span><span>turn °</span><span>speed m/s</span><span>dist m</span>'; if (TL.length) box.append(head);
+  const num = (v, step, min, max, title) => { const i = document.createElement('input'); i.type = 'number'; i.step = step; i.min = min; i.max = max; i.value = v; i.title = title; return i; };
+  TL.forEach((r, i) => {
+    const row = document.createElement('div'); row.style.cssText = 'display:grid;grid-template-columns:26px 1fr 1fr 1fr;gap:6px;align-items:center;margin:3px 0';
+    const lab = document.createElement('span'); lab.textContent = 'w' + (i + 1); lab.style.cssText = 'font-size:10px;opacity:.6';
+    const t = num(r.turn, 5, -180, 180, 'degrees the heading changes over this window; + turns left, − right');
+    const sp = num(r2(r.speed), 0.1, 0, 6, 'metres per second');
+    const di = num(r2(r.speed * WSEC()), 0.1, 0, 6 * WSEC(), 'metres walked in this window (speed × ' + r2(WSEC()) + ' s)');
+    t.oninput = () => { r.turn = Math.max(-180, Math.min(180, +t.value || 0)); };
+    sp.oninput = () => { r.speed = Math.max(0, Math.min(6, +sp.value || 0)); di.value = r2(r.speed * WSEC()); };
+    di.oninput = () => { r.speed = Math.max(0, Math.min(6, (+di.value || 0) / WSEC())); sp.value = r2(r.speed); };
+    row.append(lab, t, sp, di); box.append(row);
+  });
+  const free = TL.length > 0 && !$('endless').checked;
+  $('wins').disabled = free; if (free) $('wins').value = TL.length;
+  $('cfg').parentElement.style.opacity = TL.length ? 1 : .4;
+}
+function cruise(){ return (ST && ST.prior && ST.prior.goal && ST.prior.goal.speed_cruise) || 1.1; }
+function gentleTurn(){ const tm = (ST && ST.prior && ST.prior.goal && ST.prior.goal.turn_max) || 0.5; return Math.max(5, Math.round(0.6 * tm * 180 / Math.PI / 5) * 5); }
+$('tlRL').onclick = () => { const n = Math.max(4, TL.length + (TL.length % 2)), d = gentleTurn(); TL = Array.from({length: n}, (_, i) => ({turn: i < n / 2 ? -d : d, speed: cruise()})); drawTL(); };
+$('tlStr').onclick = () => { const n = Math.max(4, TL.length); TL = Array.from({length: n}, () => ({turn: 0, speed: cruise()})); drawTL(); };
+$('tlAdd').onclick = () => { TL.push(TL.length ? {...TL[TL.length - 1]} : {turn: 0, speed: cruise()}); drawTL(); };
+$('tlDel').onclick = () => { TL.pop(); drawTL(); };
+$('tlClr').onclick = () => { TL = []; drawTL(); };
+$('endless').addEventListener('change', drawTL);
+$('cfg').oninput = () => $('cfgO').textContent = (+$('cfg').value).toFixed(1);
+// asked vs got, per window: the "got" numbers are measured by the server on the decoded motion itself (train_cvqvae.goal_features), not read back from the prior
+let TLN = 0, TLOK = 0;
+function tlReset(){ TLN = TLOK = 0; $('tlRes').innerHTML = ''; $('tlSum').textContent = ''; }
+function tlWindow(e){
+  const w = e.want, g = e.got;
+  const ok = Math.abs(w.turn) >= TURN_OK ? (Math.sign(g.turn) === Math.sign(w.turn)) : Math.abs(g.turn) < 2 * TURN_OK;
+  TLN++; if (ok) TLOK++;
+  const d = document.createElement('div'); d.style.color = ok ? 'var(--ok,#5fd68a)' : 'var(--warn,#ffb454)';
+  d.textContent = `w${e.w + 1}  asked ${w.turn >= 0 ? '+' : ''}${w.turn}° ${w.speed} m/s ${w.distance} m  →  got ${g.turn >= 0 ? '+' : ''}${g.turn}° ${g.speed} m/s ${g.distance} m  ${ok ? '✓' : '✗'}`;
+  const box = $('tlRes'); box.append(d); while (box.childElementCount > 80) box.firstChild.remove(); box.scrollTop = box.scrollHeight;
+  $('tlSum').textContent = `turned the asked way in ${TLOK} of ${TLN} windows (✓ = same direction, or straight when ~0°)`;
+}
 
 // ------------------------------------------------------------------ prompt -> schedule, language model slot
 let SCHED = [];                                   // [{action, seconds}] ; empty = the single action in "Sampling"
@@ -675,6 +746,8 @@ function startGen(){
   const q = new URLSearchParams({action: $('action').value, temperature: $('temp').value, top_k: $('topk').value, top_p: $('topp').value,
     seed: $('seed').value, windows: $('endless').checked ? 0 : $('wins').value});
   if (SCHED.length) q.set('schedule', JSON.stringify(SCHED));
+  tlReset();
+  if (TL.length){ q.set('timeline', JSON.stringify(TL.map(r => ({turn: r.turn, speed: r2(r.speed)})))); q.set('cfg', $('cfg').value); }
   G = {dt: 1/30, names: null, engine: false, chunks: [], total: 0, first: 0, t0: performance.now(), rows: {}, action: $('action').value, fps: 30};
   playhead = 0; playing = true; $('play').textContent = 'pause'; $('play').onclick = togglePlay; setEmpty();
   es = new EventSource('/api/generate?' + q);
@@ -694,7 +767,7 @@ function endGen(){
 function onEvent(e){
   if (e.type === 'start'){
     G.dt = e.dt; G.names = e.bone_names; G.engine = e.engine; G.n = e.n; G.window = e.window;
-    log(`stream: ${e.backend}; body: ${e.engine ? 'libnebula' : 'preview skeleton'}; ${e.n} codes per ${e.window}-frame window, stride ${e.stride}`);
+    log(`stream: ${e.backend}; prior on ${e.prior_backend}; body: ${e.engine ? 'libnebula' : 'preview skeleton'}; ${e.n} codes per ${e.window}-frame window, stride ${e.stride}` + (e.goals ? `; steered by ${e.goals} window goal${e.goals === 1 ? '' : 's'}${e.cfg !== 1 ? ', guidance ' + e.cfg : ''}` : ''));
   } else if (e.type === 'code'){
     const row = ensureRow(e.w); const cell = row.cells[e.i];
     cell.textContent = e.c; cell.style.background = codeColor(e.c, e.p); cell.title = `code ${e.c} · p=${e.p} · entropy ${e.ent}`; cell.classList.add('live');
@@ -707,6 +780,8 @@ function onEvent(e){
     row.ms.title = `prior ${e.prior_ms} · NEON ${e.decode_ms}${G.engine ? ' · engine ' + e.engine_ms : ''} ms`;
     const winSec = e.frames * G.dt, workSec = (e.prior_ms + e.decode_ms + e.engine_ms) / 1000;
     G.rt = winSec / Math.max(workSec, 1e-6);
+  } else if (e.type === 'goal'){
+    tlWindow(e);
   } else if (e.type === 'segment'){
     log(`step ${e.i + 1}/${e.count}: ${e.action}, ${e.windows} window${e.windows === 1 ? '' : 's'} (from w${e.w0})`);
   } else if (e.type === 'frames'){
