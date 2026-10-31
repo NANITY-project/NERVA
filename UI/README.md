@@ -74,3 +74,7 @@ Tests: `python3 tests/test_ui_goals.py` (numpy only).
 - `.pt` files are read with `torch.load(weights_only=True)`. If yours needs full unpickling and you made it yourself, add `--trust-pickle`.
 - Generated motion is not graded or verified by the engine's grader here; the red border only reflects the engine's per-frame correction report.
 - Uploaded files and exported GGUFs live in `UI/.cache/` (git-ignored).
+
+## Steering from text (Goal Translator)
+
+The Steering box has a text field: the sentence becomes one goal row per window (turn in degrees, speed in m/s), and anything the text leaves open becomes an **unspecified** window (no goal; the prior gets `"goal": null`). `--goal-translator FILE.gguf` uses a trained translator (`tools/goal_translator`, see its README); without it the deterministic stage-C bootstrap runs and the page says which one spoke. Errors are shown, never replaced by keywords. Text the goals cannot express (e.g. a wave) is listed as ignored.
