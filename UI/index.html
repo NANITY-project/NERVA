@@ -296,6 +296,11 @@ kbd{font:10px var(--mono);border:1px solid var(--glass-border);border-radius:4px
     <section class="rv" id="steerSec" style="--i:2;display:none">
       <div class="tag"><span>Steering</span><i></i></div>
       <p id="steerNote" style="font-size:11px;opacity:.7;margin:0 0 6px">Numbers only, one row per window: heading change in degrees (+ left, − right) and speed or distance. No rows = no steering.</p>
+      <div class="row" style="display:flex;gap:6px;margin:6px 0">
+        <input id="gtText" type="text" maxlength="256" placeholder="or describe it in words (any wording, typos fine)" style="flex:1;min-width:0">
+        <button class="btn sm main" id="gtBtn" type="button" title="Goal Translator: text → one goal per window. Anything the text leaves open becomes an unspecified window (no goal).">Translate</button>
+      </div>
+      <div id="gtNote" style="font-size:11px;opacity:.8;margin:0 0 6px"></div>
       <div class="row" style="display:flex;gap:6px;flex-wrap:wrap;margin:6px 0">
         <button class="btn sm main" id="tlRL" type="button" title="a gentle turn to the right for half the windows, then to the left">Right, then left</button>
         <button class="btn sm quiet" id="tlStr" type="button">Straight</button>
@@ -516,6 +521,14 @@ function drawTL(){
   head.innerHTML = '<span></span><span>turn °</span><span>speed m/s</span><span>dist m</span>'; if (TL.length) box.append(head);
   const num = (v, step, min, max, title) => { const i = document.createElement('input'); i.type = 'number'; i.step = step; i.min = min; i.max = max; i.value = v; i.title = title; return i; };
   TL.forEach((r, i) => {
+    if (r.unspecified){
+      const u = document.createElement('div'); u.style.cssText = 'display:grid;grid-template-columns:26px 1fr auto;gap:6px;align-items:center;margin:3px 0;opacity:.75';
+      const lab = document.createElement('span'); lab.textContent = 'w' + (i + 1); lab.style.cssText = 'font-size:10px;opacity:.6';
+      const txt = document.createElement('span'); txt.textContent = 'unspecified: no goal for this window'; txt.style.cssText = 'font-size:11px;font-style:italic';
+      const b = document.createElement('button'); b.className = 'btn sm quiet'; b.type = 'button'; b.textContent = 'set'; b.title = 'give it numbers: straight at the cruise speed';
+      b.onclick = () => { TL[i] = {turn: 0, speed: cruise()}; drawTL(); };
+      u.append(lab, txt, b); box.append(u); return;
+    }
     const row = document.createElement('div'); row.style.cssText = 'display:grid;grid-template-columns:26px 1fr 1fr 1fr;gap:6px;align-items:center;margin:3px 0';
     const lab = document.createElement('span'); lab.textContent = 'w' + (i + 1); lab.style.cssText = 'font-size:10px;opacity:.6';
     const t = num(r.turn, 5, -180, 180, 'degrees the heading changes over this window; + turns left, − right');
@@ -538,6 +551,25 @@ $('tlAdd').onclick = () => { TL.push(TL.length ? {...TL[TL.length - 1]} : {turn:
 $('tlDel').onclick = () => { TL.pop(); drawTL(); };
 $('tlClr').onclick = () => { TL = []; drawTL(); };
 $('endless').addEventListener('change', drawTL);
+// text -> goal rows (Goal Translator). The answer says WHICH translator spoke (the trained model or the stage-C bootstrap) and what it could not express; errors are shown, never replaced by a guess.
+async function doGoalPlan(){
+  const text = $('gtText').value; if (!text.trim()) return;
+  $('gtBtn').disabled = true; $('gtNote').textContent = 'translating…';
+  try{
+    const j = await API('/api/goal_plan', {text});
+    if (j.ok){
+      TL = j.rows.map(r => r.unspecified ? {unspecified: true} : {turn: r.turn, speed: r.speed});
+      const src = j.source === 'model' ? 'by the trained translator' : 'by the stage-C bootstrap (no trained translator loaded)';
+      const spec = TL.filter(r => !r.unspecified).length;
+      $('gtNote').textContent = `${j.windows} windows (${spec} with goals, ${j.windows - spec} unspecified) ${src}` + (j.ignored.length ? ` · not expressible by the goals, ignored: ${j.ignored.join('; ')}` : '') + (j.notes.length ? ' · ' + j.notes.join(' · ') : '');
+      log(`goal plan ${j.source}: ` + TL.map(r => r.unspecified ? '—' : (r.turn > 0 ? 'L' : r.turn < 0 ? 'R' : 'S')).join(' '));
+      drawTL();
+    } else { $('gtNote').textContent = '✗ ' + j.error; log('✗ goal plan: ' + j.error); }
+  }catch(e){ $('gtNote').textContent = 'failed: ' + e; }
+  $('gtBtn').disabled = false;
+}
+$('gtBtn').onclick = doGoalPlan;
+$('gtText').addEventListener('keydown', e => { if (e.key === 'Enter'){ e.preventDefault(); doGoalPlan(); } });
 $('cfg').oninput = () => $('cfgO').textContent = (+$('cfg').value).toFixed(1);
 // asked vs got, per window: the "got" numbers are measured by the server on the decoded motion itself (train_cvqvae.goal_features), not read back from the prior
 let TLN = 0, TLOK = 0;
@@ -747,7 +779,7 @@ function startGen(){
     seed: $('seed').value, windows: $('endless').checked ? 0 : $('wins').value});
   if (SCHED.length) q.set('schedule', JSON.stringify(SCHED));
   tlReset();
-  if (TL.length){ q.set('timeline', JSON.stringify(TL.map(r => ({turn: r.turn, speed: r2(r.speed)})))); q.set('cfg', $('cfg').value); }
+  if (TL.length){ q.set('timeline', JSON.stringify(TL.map(r => r.unspecified ? {unspecified: true} : {turn: r.turn, speed: r2(r.speed)}))); q.set('cfg', $('cfg').value); }
   G = {dt: 1/30, names: null, engine: false, chunks: [], total: 0, first: 0, t0: performance.now(), rows: {}, action: $('action').value, fps: 30};
   playhead = 0; playing = true; $('play').textContent = 'pause'; $('play').onclick = togglePlay; setEmpty();
   es = new EventSource('/api/generate?' + q);
