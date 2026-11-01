@@ -40,13 +40,18 @@ class GoalPlanner:
         self.file, self.model = gguf, None
         if gguf:
             try:
-                import gt_numpy
-                self.model = gt_numpy.NumpyTranslator.from_gguf(gguf)
+                if str(gguf).lower().endswith(".npz"):                 # the E5 translator (tools/goal_translator/export_e5_translator.py): numpy only, no torch
+                    import e5_numpy
+                    self.model = e5_numpy.E5NumpyTranslator.from_npz(gguf)
+                else:                                                  # the byte-level NANITY-architecture translator (.gguf)
+                    import gt_numpy
+                    self.model = gt_numpy.NumpyTranslator.from_gguf(gguf)
             except Exception as e:
                 raise GoalPlanError(f"could not load the translator {os.path.basename(gguf)}: {e}")
 
     def info(self):
-        return dict(source="model" if self.model else "stage_c", file=os.path.basename(self.file) if self.file else None)
+        return dict(source="model" if self.model else "stage_c", file=os.path.basename(self.file) if self.file else None,
+                    backend=("e5" if str(self.file).lower().endswith(".npz") else "nanity-bytes") if self.model else "stage_c")
 
     def plan(self, text, prior_stats, W, stride, dt):
         """-> dict(rows, source, ignored, notes, windows). prior_stats: the prior's goal_stats (turn_max, speed_cruise, speed_max); W, stride, dt: the prior / VAE timing.
