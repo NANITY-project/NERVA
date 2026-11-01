@@ -1,0 +1,242 @@
+{
+  "about": "Prompts written to sit OUTSIDE the stage C word lists (the fixed prompt_suite.json was written with that parser in mind). Same format as prompt_suite.json: expect = collapsed window classes in order (L left-turning, R right-turning, S straight and moving, X standing, U unspecified); forbid = classes that must not appear. IMPORTANT, learned the hard way: a parser that simply IGNORES unknown words already passes most prompts whose only unknown words are verbs, because it only needs the direction words. So the tiers that tell a word list from a model are meaning and directions: there the unknown words (or a known word used in another sense) carry the answer. Tiers: meaning = negation, contrast, stop synonyms, 'right' that is not a direction (the gate tier); directions = clockwise / port / starboard (the gate tier, hard); verbs and phrasing = unknown verbs and other sentence shapes with known direction words (a no-regression tier); distractor = text with no motion in it: the right answer is no plan or all-unspecified, any L / R / S / X window is an invented motion. Add your own: the more this set looks like how people really type, the better the comparison. NOTE: a dataset whose phrasings were all filtered by the stage C parser contains no negation or contrast, so a model trained on it may fail the meaning tier too: that failure is information about the data, not about the encoder.",
+  "prompts": [
+    {
+      "text": "don't turn left, turn right",
+      "expect": "R",
+      "tier": "meaning"
+    },
+    {
+      "text": "go left instead of right",
+      "expect": "L",
+      "tier": "meaning"
+    },
+    {
+      "text": "avoid going left, go right",
+      "expect": "R",
+      "tier": "meaning"
+    },
+    {
+      "text": "right is the wrong way, go left",
+      "expect": "L",
+      "tier": "meaning"
+    },
+    {
+      "text": "right now, go left",
+      "expect": "L",
+      "tier": "meaning"
+    },
+    {
+      "text": "plant yourself right there",
+      "expect": "X",
+      "tier": "meaning"
+    },
+    {
+      "text": "hold still",
+      "expect": "X",
+      "tier": "meaning"
+    },
+    {
+      "text": "remain motionless",
+      "expect": "X",
+      "tier": "meaning"
+    },
+    {
+      "text": "cease all movement",
+      "expect": "X",
+      "tier": "meaning"
+    },
+    {
+      "text": "do not move",
+      "expect": "X",
+      "tier": "meaning"
+    },
+    {
+      "text": "go forward, not left",
+      "expect": "S",
+      "tier": "meaning"
+    },
+    {
+      "text": "saunter left then amble right",
+      "expect": "L R",
+      "tier": "verbs"
+    },
+    {
+      "text": "tiptoe to the right",
+      "expect": "R",
+      "tier": "verbs"
+    },
+    {
+      "text": "trudge off to the left",
+      "expect": "L",
+      "tier": "verbs"
+    },
+    {
+      "text": "mosey right and then left",
+      "expect": "R L",
+      "tier": "verbs"
+    },
+    {
+      "text": "trot left",
+      "expect": "L",
+      "tier": "verbs"
+    },
+    {
+      "text": "creep forward then dart left",
+      "expect": "S L",
+      "tier": "verbs"
+    },
+    {
+      "text": "lope to the right then slow down and go left",
+      "expect": "R L",
+      "tier": "verbs"
+    },
+    {
+      "text": "shuffle left, shuffle right",
+      "expect": "L R",
+      "tier": "verbs"
+    },
+    {
+      "text": "plod straight ahead then go right",
+      "expect": "S R",
+      "tier": "verbs"
+    },
+    {
+      "text": "sashay to your right",
+      "expect": "R",
+      "tier": "verbs"
+    },
+    {
+      "text": "stomp left then stomp right then stomp left",
+      "expect": "L R L",
+      "tier": "verbs"
+    },
+    {
+      "text": "take a left and then a right",
+      "expect": "L R",
+      "tier": "phrasing"
+    },
+    {
+      "text": "cut left, then swing right",
+      "expect": "L R",
+      "tier": "phrasing"
+    },
+    {
+      "text": "i want you to head right for a while and then come back around to the left",
+      "expect": "R L",
+      "tier": "phrasing"
+    },
+    {
+      "text": "first bear right, afterwards drift left",
+      "expect": "R L",
+      "tier": "phrasing"
+    },
+    {
+      "text": "start off straight, then hook left",
+      "expect": "S L",
+      "tier": "phrasing"
+    },
+    {
+      "text": "after you go right, go left",
+      "expect": "R L",
+      "tier": "phrasing"
+    },
+    {
+      "text": "go right. now go left.",
+      "expect": "R L",
+      "tier": "phrasing"
+    },
+    {
+      "text": "swing wide to the right",
+      "expect": "R",
+      "tier": "phrasing"
+    },
+    {
+      "text": "hang a hard right at the corner",
+      "expect": "R",
+      "tier": "phrasing"
+    },
+    {
+      "text": "keep going forward and then veer off toward the left side",
+      "expect": "S L",
+      "tier": "phrasing"
+    },
+    {
+      "text": "walk to the right a little, then a lot to the left",
+      "expect": "R L",
+      "tier": "phrasing"
+    },
+    {
+      "text": "turn clockwise",
+      "expect": "R",
+      "tier": "directions"
+    },
+    {
+      "text": "turn counterclockwise",
+      "expect": "L",
+      "tier": "directions"
+    },
+    {
+      "text": "go anticlockwise then clockwise",
+      "expect": "L R",
+      "tier": "directions"
+    },
+    {
+      "text": "bank to port then starboard",
+      "expect": "L R",
+      "tier": "directions"
+    },
+    {
+      "text": "veer to starboard",
+      "expect": "R",
+      "tier": "directions"
+    },
+    {
+      "text": "head to port",
+      "expect": "L",
+      "tier": "directions"
+    },
+    {
+      "text": "what is the weather like today",
+      "expect": "U",
+      "forbid": "LRSX",
+      "tier": "distractor",
+      "refuse_ok": true
+    },
+    {
+      "text": "tell me a joke",
+      "expect": "U",
+      "forbid": "LRSX",
+      "tier": "distractor",
+      "refuse_ok": true
+    },
+    {
+      "text": "make me a sandwich please",
+      "expect": "U",
+      "forbid": "LRSX",
+      "tier": "distractor",
+      "refuse_ok": true
+    },
+    {
+      "text": "how are you doing",
+      "expect": "U",
+      "forbid": "LRSX",
+      "tier": "distractor",
+      "refuse_ok": true
+    },
+    {
+      "text": "my favourite colour is blue",
+      "expect": "U",
+      "forbid": "LRSX",
+      "tier": "distractor",
+      "refuse_ok": true
+    },
+    {
+      "text": "asdf qwerty zxcv",
+      "expect": "U",
+      "forbid": "LRSX",
+      "tier": "distractor",
+      "refuse_ok": true
+    }
+  ]
+}
