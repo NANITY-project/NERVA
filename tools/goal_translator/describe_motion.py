@@ -4,8 +4,10 @@ describe_motion.py - give every motion clip free-form English captions, with NO 
 
   python tools/goal_translator/describe_motion.py --stage inspect  --clips data/clips.npz            # look at the segments + measured facts of a few clips
   python tools/goal_translator/describe_motion.py --stage requests --clips data/clips.npz --out data/captions
-  python tools/goal_translator/describe_motion.py --stage run      --out data/captions --model <model>   # optional: calls the Anthropic API (needs ANTHROPIC_API_KEY)
-  python tools/goal_translator/describe_motion.py --stage apply    --clips data/clips.npz --out data/captions   # parse responses, filter, write captions.jsonl
+  python tools/goal_translator/describe_motion.py --stage setup                                      # installs ollama if missing, starts it, pulls the model, smoke-tests it
+  python tools/goal_translator/describe_motion.py --stage run      --out data/captions               # captions every request with the local model (does the setup itself; resumable)
+  python tools/goal_translator/describe_motion.py --stage apply    --out data/captions               # parse, left/right word check -> captions.jsonl
+  python tools/goal_translator/describe_motion.py --stage verify   --out data/captions               # back-translate to numbers, compare turn sign + speed -> captions_verified.jsonl
 
 The idea
   clip -> SEGMENTS (data-driven: a new segment starts where the measured numbers change, no thresholds named after motions)
@@ -23,7 +25,7 @@ Honest limits
   * The LM brings its own language habits; ask for variety (the prompt does) and look at the output before training on it (--stage inspect, then a few responses).
   * The left/right filter is a sanity check, not a verifier. Speed words ("brisk"), amounts and hand semantics are not checked.
 """
-import argparse, concurrent.futures as cf, hashlib, json, math, os, random, re, sys, time, urllib.request
+import argparse, concurrent.futures as cf, hashlib, json, math, os, platform, random, re, shutil, subprocess, sys, time, urllib.request
 import numpy as np
 
 # The examples are about content NOT in the data (a door handle), so they show the register without handing the LM any motion words.
@@ -34,7 +36,8 @@ REGISTERS = {
     "casual": 'informal, as typed quickly by a person: lowercase, abbreviations, now and then a typo or a missing word: "grab teh handle n pull"',
 }
 UNIT_S = 0.5            # segmentation looks at the clip in half-second units
-MIN_SEG_S = 1.0         # a segment shorter than this is merged into its neighbour
+MIN_SEG_S = 1.6         # a segment shorter than this is merged into its neighbour. Set from --timing: ONE goal per prior stride (48 frames = 1.6 s), anything shorter cannot be controlled
+DEFAULT_MODEL = "phi4-mini:3.8b-q4_K_M"      # the official ollama tags are latest / 3.8b / 3.8b-q4_K_M / 3.8b-q8_0 / 3.8b-fp16 - there is NO q4_0 (latest == q4_K_M, 2.5 GB)
 FLOORS = dict(speed=0.20, yawrate=6.0, hand=0.06, gaze=6.0, pelvis=0.03)     # smallest change worth a new segment (m/s, deg/s, m, deg, m)
 
 
@@ -142,6 +145,27 @@ def facts(clip, a, b, ref):
     return out
 
 
+LOCOMOTION_KEYS = ("seconds", "path_m", "forward_m", "leftward_m", "heading_change_deg", "mean_speed_mps", "steps_per_min", "speed_rank_pct", "turn_rate_rank_pct")
+
+
+def add_ranks(all_facts):
+    """Dataset-relative scale, so the LM does not have to guess what 0.74 m/s means here: rank = % of ALL segments of this dataset that are slower / turn less sharply /
+    move the arms less. 50 = typical for this data, 95 = among the most. Data-driven; no motion names, no thresholds."""
+    flat = [f for fs in all_facts for f in fs]
+    sp = np.array([f["mean_speed_mps"] for f in flat]); tr = np.array([abs(f["heading_change_deg"]) / max(f["seconds"], 0.1) for f in flat])
+    arm = np.array([max(f["left_hand"]["movement_range_cm"], f["right_hand"]["movement_range_cm"]) for f in flat])
+    rk = lambda arr, x: int(round(100 * float((arr < x).mean())))
+    for f in flat:
+        f["speed_rank_pct"] = rk(sp, f["mean_speed_mps"]); f["turn_rate_rank_pct"] = rk(tr, abs(f["heading_change_deg"]) / max(f["seconds"], 0.1))
+        f["arm_movement_rank_pct"] = rk(arm, max(f["left_hand"]["movement_range_cm"], f["right_hand"]["movement_range_cm"]))
+
+
+def prune(f, mode):
+    """mode 'locomotion': only what the CURRENT prior can be conditioned on (heading change, displacement, speed, duration). mode 'all': also hands, gaze, posture - use it once the
+    prior is retrained with those inputs (plan tokens), otherwise the captions talk about things the translator cannot turn into anything."""
+    return {k: f[k] for k in LOCOMOTION_KEYS} if mode == "locomotion" else f
+
+
 def reference(clips, all_facts):
     P = np.concatenate([c.P[:, 1] for c in clips]); neck = np.concatenate([c.neck[:, 1] for c in clips])
     mv = np.array([f["mean_speed_mps"] for fs in all_facts for f in fs if f["mean_speed_mps"] > 0.15]); hr = np.array([abs(f["heading_change_deg"]) / max(f["seconds"], 0.1) for fs in all_facts for f in fs])
@@ -151,19 +175,18 @@ def reference(clips, all_facts):
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------------------------- prompts
-def make_prompt(segs, ref, n_per, registers):
-    r = {k: v for k, v in ref.items() if k != "pelvis_y"}
-    lines = "\n".join(f"{i + 1}. " + json.dumps(s, separators=(",", ":")) for i, s in enumerate(segs))
+def make_prompt(segs, ref, n_per, registers, mode="all"):
+    lines = "\n".join(f"{i + 1}. " + json.dumps(x, separators=(",", ":")) for i, x in enumerate(segs))
     reg = "\n".join(f'  "{k}": {REGISTERS[k]}' for k in registers)
+    body = ("hand and gaze numbers are relative to the pelvis (0 cm = pelvis height; the neck is about %d cm above it); upward_deg is positive looking up; rhythm_hz = how often a repeating hand movement cycles (null = none). " % ref["neck_above_pelvis_cm"]) if mode == "all" else ""
     return (f"A character moved. Below are measurements of consecutive parts of its motion, in time order. Write how different people would describe or ask for this motion.\n\n"
-            f"MEASUREMENTS (character's own frame). heading_change_deg, leftward_m and toward_left_deg are POSITIVE towards the character's own LEFT and negative towards its RIGHT; upward_deg is positive when looking up, negative when looking down. "
-            f"forward_m is along where it faced at the start of the part. Hand numbers are relative to the pelvis (so 0 cm = hand at pelvis height; the neck is about {ref['neck_above_pelvis_cm']} cm above the pelvis). "
-            f"rhythm_hz is how often a repeating hand movement cycles (null = no repeating movement). steps_per_min counts footfalls.\n{lines}\n\n"
-            f"REFERENCE for judging amounts (whole dataset): {json.dumps(r, separators=(',', ':'))}\n\n"
-            f"RULES\n- Describe only what the numbers support. Left and right are ALWAYS the character's own (say 'my left' / 'to the left'; never mirror them). Positive = left.\n"
-            f"- You choose every motion word yourself (walk, stroll, wave, crouch, ...) if and only if the numbers justify it; otherwise describe plainly. Do not invent anything the numbers do not show.\n"
-            f"- Keep the parts in order and join them naturally (then, after that, while...). Skip unremarkable details (tiny hand movement, slight lean). Mention a duration or amount only sometimes, rounded the way a person would.\n"
-            f"- Never mention the measurement names, numbers with units like 'm/s', 'part 2', or 'segment'.\n- Vary wording a lot between lines.\n\n"
+            f"MEASUREMENTS (character's own frame). heading_change_deg and leftward_m are POSITIVE towards the character's own LEFT, negative towards its RIGHT. forward_m is along its starting direction. "
+            f"{body}The *_rank_pct numbers say how this part compares with ALL parts in this dataset: 50 = typical, 90 = faster/sharper/more vigorous than 90% of them, 5 = nearly the slowest. "
+            f"Use the ranks, not the raw units, to choose how fast/slow/sharp/gentle your words are.\n{lines}\n\n"
+            f"RULES\n- Describe only what the numbers support. Left and right are ALWAYS the character's own. Positive = left, negative = right.\n"
+            f"- Choose every motion word yourself, and only if the numbers justify it; otherwise describe plainly. Invent nothing.\n"
+            f"- Keep the parts in time order and join them naturally. Skip unremarkable details. Mention a duration only sometimes, rounded like a person would.\n"
+            f"- Never repeat measurement names or raw numbers with units. Vary wording a lot.\n\n"
             f"Return ONLY a JSON object with these keys, each a list of {n_per} different strings:\n{reg}\n")
 
 
@@ -174,13 +197,19 @@ def split_of(clip_id, seed=0):
 
 
 def analyse(a):
+    global MIN_SEG_S
+    W, stride, dt_ = (float(x) for x in a.timing.split(","))
+    MIN_SEG_S = a.min_seg_s or stride * dt_
     A, off, dt, names = load(a.clips)
     clips = [Clip(A[off[k]:off[k + 1]], names, dt) for k in range(len(off) - 1)]
     scale = corpus_scale(clips, a.tol)
     segs = [segment(c, scale) for c in clips]
     ref0 = dict(pelvis_y=float(np.percentile(np.concatenate([c.P[:, 1] for c in clips]), 95)))
     fs = [[facts(c, s0, s1, ref0) for s0, s1 in sg] for c, sg in zip(clips, segs)]
-    return clips, segs, fs, reference(clips, fs) | ref0
+    add_ranks(fs)
+    ref = reference(clips, fs) | ref0
+    fs = [[prune(f, a.facts) for f in x] for x in fs]
+    return clips, segs, fs, ref
 
 
 def stage_inspect(a):
@@ -193,7 +222,17 @@ def stage_inspect(a):
             print(f"  [{s0:4d}:{s1:4d}] {json.dumps(f, separators=(',', ':'))}")
 
 
+def sign_gate(a):
+    """A mirrored dataset would make every caption consistently wrong and the left/right filter would pass them all, so the one-time sign check runs first."""
+    r = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "check_sign.py"), "--clips", a.clips], capture_output=True, text=True)
+    print(r.stdout.strip().splitlines()[-1] if r.stdout.strip() else r.stderr.strip()[-300:])
+    if r.returncode != 0:
+        sys.exit("[describe_motion] check_sign.py failed: the clips look MIRRORED (or channels swapped). Fix the data or gt_conventions.TURN_POSITIVE_IS_LEFT first, or pass --skip-sign-check.")
+
+
 def stage_requests(a):
+    if not a.skip_sign_check:
+        sign_gate(a)
     clips, segs, fs, ref = analyse(a)
     rng = random.Random(a.seed); os.makedirs(a.out, exist_ok=True); regs = a.registers.split(","); rows = []
     for k, sg in enumerate(segs):
@@ -202,7 +241,7 @@ def stage_requests(a):
             s0 = rng.randrange(n); spans.add((s0, min(n, s0 + rng.randint(1, min(a.max_segs, 4)))))
         for s0, s1 in sorted(spans):
             rows.append(dict(id=f"clip{k:05d}:{s0}-{s1}", clip=f"clip{k:05d}", frames=[sg[s0][0], sg[s1 - 1][1]], n_segments=s1 - s0, facts=fs[k][s0:s1],
-                             prompt=make_prompt(fs[k][s0:s1], ref, a.per_register, regs), registers=regs))
+                             prompt=make_prompt(fs[k][s0:s1], ref, a.per_register, regs, a.facts), registers=regs))
     with open(os.path.join(a.out, "requests.jsonl"), "w") as f:
         for r in rows:
             f.write(json.dumps(r) + "\n")
@@ -210,24 +249,165 @@ def stage_requests(a):
     print(f"wrote {len(rows)} requests for {len(clips)} clips -> {a.out}/requests.jsonl  (feed each `prompt` to any LM; save {{\"id\":..., \"response\":...}} lines to responses.jsonl)")
 
 
-def stage_run(a):
-    key = os.environ.get("ANTHROPIC_API_KEY") or sys.exit("set ANTHROPIC_API_KEY (or run the prompts yourself and write responses.jsonl)")
-    req = [json.loads(l) for l in open(os.path.join(a.out, "requests.jsonl"))]; path = os.path.join(a.out, "responses.jsonl")
-    done = {json.loads(l)["id"] for l in open(path)} if os.path.exists(path) else set(); todo = [r for r in req if r["id"] not in done]
-    def call(r):
-        body = json.dumps(dict(model=a.model, max_tokens=1500, temperature=1.0, messages=[dict(role="user", content=r["prompt"])])).encode()
-        for t in range(4):
-            try:
-                rq = urllib.request.Request("https://api.anthropic.com/v1/messages", body, {"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"})
-                d = json.load(urllib.request.urlopen(rq, timeout=120)); return dict(id=r["id"], response="".join(b.get("text", "") for b in d["content"]))
-            except Exception as e:
-                err = str(e); time.sleep(2 ** t)
-        return dict(id=r["id"], error=err)
+# ---------------------------------------------------------------------------------------------------------------------------------------------------- local LM (ollama)
+def http(host, path, body=None, timeout=600):
+    rq = urllib.request.Request(host.rstrip("/") + path, data=None if body is None else json.dumps(body).encode(), headers={"content-type": "application/json"})
+    return json.load(urllib.request.urlopen(rq, timeout=timeout))
+
+
+def server_up(host):
+    try:
+        http(host, "/api/tags", timeout=3); return True
+    except Exception:
+        return False
+
+
+def have_model(host, model):
+    names = {m["name"] for m in http(host, "/api/tags", timeout=10).get("models", [])}
+    return model in names or (":" not in model and model + ":latest" in names)
+
+
+def ensure_ollama(a):
+    """Everything needed to talk to a local model, done automatically and idempotently: install ollama if missing, start the server, pull the model."""
+    if not server_up(a.host):
+        exe = shutil.which("ollama")
+        if not exe:
+            if a.no_install:
+                sys.exit("[describe_motion] ollama is not installed (and --no-install was given). Install it from https://ollama.com/download and run again.")
+            system = platform.system()
+            if system == "Linux":
+                print("[describe_motion] installing ollama with the official script: curl -fsSL https://ollama.com/install.sh | sh   (may ask for sudo)", flush=True)
+                if subprocess.run("curl -fsSL https://ollama.com/install.sh | sh", shell=True).returncode != 0:
+                    sys.exit("[describe_motion] the ollama install failed; install it by hand from https://ollama.com/download")
+            elif system == "Darwin" and shutil.which("brew"):
+                print("[describe_motion] brew install ollama", flush=True)
+                if subprocess.run(["brew", "install", "ollama"]).returncode != 0:
+                    sys.exit("[describe_motion] brew install ollama failed")
+            else:
+                sys.exit(f"[describe_motion] cannot install ollama automatically on {system}: download it from https://ollama.com/download, then run again.")
+            exe = shutil.which("ollama") or sys.exit("[describe_motion] ollama still not on PATH after install")
+        if a.host.rstrip("/").endswith(("localhost:11434", "127.0.0.1:11434")):
+            print("[describe_motion] starting `ollama serve` in the background", flush=True)
+            subprocess.Popen([exe, "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        for _ in range(60):
+            if server_up(a.host):
+                break
+            time.sleep(0.5)
+        else:
+            sys.exit(f"[describe_motion] no ollama server answering at {a.host}")
+    if not have_model(a.host, a.model):
+        print(f"[describe_motion] pulling {a.model} (first time only)", flush=True)
+        rq = urllib.request.Request(a.host.rstrip("/") + "/api/pull", json.dumps({"model": a.model, "stream": True}).encode(), {"content-type": "application/json"}); last = 0
+        try:
+            with urllib.request.urlopen(rq, timeout=3600) as r:
+                for line in r:
+                    d = json.loads(line)
+                    if "error" in d:
+                        raise RuntimeError(d["error"])
+                    if d.get("total") and time.time() - last > 5:
+                        print(f"   {d.get('status', '')} {100 * d.get('completed', 0) / d['total']:.0f}%", flush=True); last = time.time()
+        except Exception as e:
+            sys.exit(f"[describe_motion] could not pull {a.model}: {e}\n  (official phi4-mini tags: phi4-mini, phi4-mini:3.8b-q4_K_M, 3.8b-q8_0, 3.8b-fp16 - there is no q4_0)")
+        if not have_model(a.host, a.model):
+            sys.exit(f"[describe_motion] {a.model} is not available after the pull")
+    print(f"[describe_motion] local LM ready: {a.model} @ {a.host}")
+
+
+def chat(a, prompt, schema):
+    body = dict(model=a.model, messages=[dict(role="user", content=prompt)], stream=False, format=schema,
+                options=dict(temperature=a.temperature, num_ctx=a.num_ctx, num_predict=a.num_predict, seed=a.seed))
+    err = ""
+    for t in range(3):
+        try:
+            return http(a.host, "/api/chat", body, timeout=a.timeout)["message"]["content"]
+        except Exception as e:
+            err = str(e); time.sleep(2 ** t)
+    raise RuntimeError(err)
+
+
+def stage_setup(a):
+    ensure_ollama(a)
+    t0 = time.time(); out = chat(a, 'Reply with the JSON {"ok": true}', {"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]})
+    print(f"[describe_motion] smoke test ok in {time.time() - t0:.1f}s: {out.strip()[:60]}")
+
+
+def caption_schema(regs):
+    return {"type": "object", "properties": {k: {"type": "array", "items": {"type": "string"}} for k in regs}, "required": list(regs)}
+
+
+def run_parallel(a, jobs, fn, path):
+    """jobs: [(id, payload)] -> appends {"id", "response"|"error"} lines to `path`, resumable. One worker by default: ollama serves requests one at a time unless OLLAMA_NUM_PARALLEL is set."""
+    done = {json.loads(l)["id"] for l in open(path) if l.strip()} if os.path.exists(path) else set()
+    todo = [j for j in jobs if j[0] not in done]; print(f"[describe_motion] {len(todo)} to do ({len(done)} already done) -> {path}", flush=True)
+    def one(j):
+        try:
+            return dict(id=j[0], response=fn(j[1]))
+        except Exception as e:
+            return dict(id=j[0], error=str(e)[:300])
+    t0 = time.time()
     with cf.ThreadPoolExecutor(a.workers) as ex, open(path, "a") as f:
-        for i, out in enumerate(ex.map(call, todo)):
+        for i, out in enumerate(ex.map(one, todo), 1):
             f.write(json.dumps(out) + "\n"); f.flush()
-            if i % 50 == 0:
-                print(f"  {i}/{len(todo)}", flush=True)
+            if i % 10 == 0 or i == len(todo):
+                print(f"   {i}/{len(todo)}  {(time.time() - t0) / i:.1f}s each", flush=True)
+
+
+def stage_run(a):
+    ensure_ollama(a)
+    req = [json.loads(l) for l in open(os.path.join(a.out, "requests.jsonl"))]
+    run_parallel(a, [(r["id"], r) for r in req], lambda r: chat(a, r["prompt"], caption_schema(r["registers"])), os.path.join(a.out, "responses.jsonl"))
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------------------------- numeric back-translation check
+def estimate_prompt(texts, ref):
+    sp = ref["moving_speed_mps"]
+    lst = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(texts))
+    return (f"ESTIMATE. A character is told each instruction below. For each one estimate what the character ends up doing over the whole instruction:\n"
+            f"- turn_deg: net heading change in degrees; POSITIVE = towards the character's own left, NEGATIVE = right, 0 = keeps its direction.\n"
+            f"- speed_mps: average speed in metres per second; 0 = stands still. In this world slow is about {sp['slow_p10']}, typical {sp['typical_p50']}, fast {sp['fast_p90']}.\n\n"
+            f"{lst}\n\nReturn ONLY JSON: {{\"estimates\": [{{\"turn_deg\": number, \"speed_mps\": number}}, ...]}} with exactly {len(texts)} entries, in the same order.")
+
+
+ESTIMATE_SCHEMA = {"type": "object", "required": ["estimates"], "properties": {"estimates": {"type": "array", "items": {"type": "object", "required": ["turn_deg", "speed_mps"],
+                   "properties": {"turn_deg": {"type": "number"}, "speed_mps": {"type": "number"}}}}}}
+
+
+def stage_verify(a):
+    """Second, lexicon-free check: an LM that has NOT seen the measurements turns each caption back into numbers (turn, speed); captions whose numbers disagree with the
+    measured ones (opposite turn sign, or speed off by more than --speed-ratio) are dropped. Covers speed, which the left/right word check cannot. Tolerances are hyperparameters."""
+    ensure_ollama(a)
+    req = {r["id"]: r for r in (json.loads(l) for l in open(os.path.join(a.out, "requests.jsonl")))}
+    meta = json.load(open(os.path.join(a.out, "meta.json"))); caps = [json.loads(l) for l in open(os.path.join(a.out, "captions.jsonl"))]
+    by = {}
+    for c in caps:
+        by.setdefault(c["id"], []).append(c)
+    path = os.path.join(a.out, "verify_raw.jsonl"); texts = {i: [c["text"] for c in cs] for i, cs in by.items()}
+    run_parallel(a, [(i, t) for i, t in texts.items()], lambda t: chat(a, estimate_prompt(t, meta["reference"]), ESTIMATE_SCHEMA), path)
+    raw = {}
+    for l in open(path):
+        r = json.loads(l)
+        if "response" in r:
+            raw[r["id"]] = r["response"]
+    st = dict(captions=len(caps), unverified=0, turn_sign=0, speed_ratio=0, kept=0); out = []
+    for i, cs in by.items():
+        try:
+            est = json.loads(raw[i])["estimates"]; assert len(est) == len(cs)
+        except Exception:
+            st["unverified"] += len(cs); continue
+        fl = req[i]["facts"]; sec = sum(f["seconds"] for f in fl); turn = sum(f["heading_change_deg"] for f in fl); spd = sum(f["path_m"] for f in fl) / max(sec, 1e-6)
+        for c, e in zip(cs, est):
+            et, es = float(e["turn_deg"]), max(0.0, float(e["speed_mps"]))
+            if abs(turn) >= a.turn_min and abs(et) >= a.turn_min and (turn > 0) != (et > 0):
+                st["turn_sign"] += 1; continue
+            if not (spd < 0.2 and es < 0.2) and max(spd, es) / max(min(spd, es), 0.05) > a.speed_ratio:
+                st["speed_ratio"] += 1; continue
+            st["kept"] += 1; out.append(dict(c, est_turn_deg=round(et), est_speed_mps=round(es, 2)))
+    with open(os.path.join(a.out, "captions_verified.jsonl"), "w") as f:
+        for r in out:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    json.dump(st, open(os.path.join(a.out, "verify_report.json"), "w"), indent=1); print(json.dumps(st))
+    if st["captions"] and st["kept"] < 0.4 * st["captions"]:
+        print("[describe_motion] WARNING: more than 60% dropped. A 3.8B model is a noisy estimator: loosen --speed-ratio / --turn-min, or use a larger --model for this stage.")
 
 
 BODY_SIDE = re.compile(r"\b(left|right)\s+(hand|arm|foot|feet|leg|shoulder|eye|side|knee|elbow|wrist|palm|fist|ear|heel|toe)s?\b|\b(hand|arm|foot|leg|shoulder|eye|knee|elbow)s?\s+(on|to)\s+(my|the)\s+(left|right)\b", re.I)
@@ -286,15 +466,22 @@ def stage_apply(a):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
-    ap.add_argument("--stage", choices=["inspect", "requests", "run", "apply"], default="inspect")
+    ap.add_argument("--stage", choices=["inspect", "requests", "setup", "run", "apply", "verify"], default="inspect")
     ap.add_argument("--clips", default="data/clips.npz"); ap.add_argument("--out", default="data/captions")
     ap.add_argument("--tol", type=float, default=0.5, help="segment tolerance in corpus std units (bigger = fewer, longer segments)")
     ap.add_argument("--spans-per-clip", type=int, default=3); ap.add_argument("--max-segs", type=int, default=6)
     ap.add_argument("--registers", default="narration,command,terse,casual"); ap.add_argument("--per-register", type=int, default=2)
     ap.add_argument("--show", type=int, default=4); ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--model", default="claude-haiku-5-5"); ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--facts", choices=["all", "locomotion"], default="all", help="locomotion = only what the current prior accepts (heading, displacement, speed); all = also hands, gaze, posture (needs a retrained prior)")
+    ap.add_argument("--timing", default="64,48,0.0333333", help="the prior's W,stride,dt: the minimum segment is one stride (1.6 s)"); ap.add_argument("--min-seg-s", type=float, default=0.0)
+    ap.add_argument("--skip-sign-check", action="store_true")
+    ap.add_argument("--model", default=DEFAULT_MODEL); ap.add_argument("--host", default="http://localhost:11434"); ap.add_argument("--no-install", action="store_true", help="never install/start ollama")
+    ap.add_argument("--workers", type=int, default=1); ap.add_argument("--temperature", type=float, default=0.9); ap.add_argument("--num-ctx", type=int, default=4096)
+    ap.add_argument("--num-predict", type=int, default=600); ap.add_argument("--timeout", type=int, default=600)
+    ap.add_argument("--turn-min", type=float, default=15, help="verify: both turns must be at least this many degrees before their signs are compared")
+    ap.add_argument("--speed-ratio", type=float, default=2.0, help="verify: drop a caption whose estimated speed differs from the measured one by more than this factor")
     a = ap.parse_args()
-    dict(inspect=stage_inspect, requests=stage_requests, run=stage_run, apply=stage_apply)[a.stage](a)
+    dict(inspect=stage_inspect, requests=stage_requests, setup=stage_setup, run=stage_run, apply=stage_apply, verify=stage_verify)[a.stage](a)
 
 
 if __name__ == "__main__":
