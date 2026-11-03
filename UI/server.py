@@ -821,6 +821,14 @@ MAX_TURN_DEG = 180.0         # degrees of heading change in ONE window (the data
 MAX_SPEED = 6.0              # m/s
 
 
+def layout_mod():
+    """tools/goal_layout.py (numpy only): the prior's goal layout. A prior with channel groups takes longer goal vectors than the 4 path numbers a timeline row makes."""
+    if TOOLS not in sys.path:
+        sys.path.insert(0, TOOLS)
+    import goal_layout
+    return goal_layout
+
+
 def parse_timeline(q, tc, p, W, dt):
     """The per-window goals of the request, numbers only (no label, no language): q['timeline'] = a JSON list with one row per window,
          {turn: degrees the heading changes over that window (+ left, - right), speed: m/s  OR  distance: metres of path walked in it}
@@ -851,7 +859,7 @@ def parse_timeline(q, tc, p, W, dt):
         if not (math.isfinite(turn) and math.isfinite(speed)) or abs(turn) > MAX_TURN_DEG or not 0.0 <= speed <= MAX_SPEED:
             raise RuntimeError(f"timeline window {i + 1}: turn must be within +-{MAX_TURN_DEG:g} degrees and speed within 0 to {MAX_SPEED:g} m/s (distance 0 to {MAX_SPEED * sec:.1f} m) per window")
         path = speed * sec
-        out.append(dict(turn=turn, speed=speed, distance=path, goal=[float(x) for x in tc.arc_goal(math.radians(turn), path, sec)]))
+        out.append(dict(turn=turn, speed=speed, distance=path, goal=[float(x) for x in layout_mod().expand_path(tc.arc_goal(math.radians(turn), path, sec), p.goal_stats)]))
     return out
 
 
