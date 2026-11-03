@@ -29,7 +29,7 @@ Where the data comes from
 Honest limits: written without being able to download either dataset in the environment it was developed in; the skeleton, naming and labelling code was tested on files derived from
 other BVH data (tools/test_cc_sources.py). Run --list and `bvh_to_clip.py --probe` on your files first; labelling by file name is a heuristic: fix it with --map.
 """
-import argparse, csv, hashlib, io, json, os, re, shutil, sys, tempfile, time, urllib.request, zipfile
+import argparse, csv, hashlib, io, json, os, re, shutil, sys, tempfile, threading, time, urllib.request, zipfile
 from dataclasses import dataclass
 import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
@@ -169,9 +169,22 @@ def style100_entries(members, contents, tmp):
     return out
 
 
-def download(url, dst, size=None, md5=None):
-    """Resumable download (HTTP Range) with a progress line and an optional md5 check."""
-    os.makedirs(os.path.dirname(dst), exist_ok=True); part = dst + ".part"
+CONNECTIONS = 8                      # parallel HTTP connections for big downloads (--connections); 1 = the old single stream
+CHUNK = 32 << 20                     # a parallel download is cut into pieces of this size; every connection takes the next unfinished piece
+
+
+def _probe_ranges(url):
+    """True if the server answers a Range request with 206 (needed for parallel pieces)."""
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=dict(UA, Range="bytes=0-0")), timeout=60) as r:
+            return r.status == 206
+    except Exception:
+        return False
+
+
+def _download_seq(url, dst, size):
+    """Single-stream resumable download (HTTP Range) with a progress line."""
+    part = dst + ".part"
     for attempt in range(5):
         have = os.path.getsize(part) if os.path.exists(part) else 0
         if size and have >= size:
@@ -191,9 +204,105 @@ def download(url, dst, size=None, md5=None):
                         print(f"\r  {os.path.basename(dst)}: {(have + got) / 1e6:8.0f} MB" + (f" of {size / 1e6:.0f}" if size else "") + f"  {got / 1e6 / max(1e-3, time.time() - t0):5.1f} MB/s", end="", flush=True)
             print(); break
         except Exception as e:
-            print(f"\n  download interrupted ({type(e).__name__}: {e}); retrying ({attempt + 1}/5) ..."); time.sleep(3 * (attempt + 1))
+            print(f"\n  download interrupted ({type(e).__name__}: {e}); retrying ({attempt + 1}/5) ...")
+            time.sleep(3 * (attempt + 1))
     else:
         raise IOError(f"could not download {url}")
+
+
+def _download_parallel(url, dst, size, n):
+    """Parallel resumable download: the file is cut into CHUNK-sized pieces, n connections each fetch the next unfinished piece with its own Range request and write it at its
+    offset into one preallocated .part file. Progress per piece is kept in .part.json, so an interrupted run resumes where it stopped. A .part left by the single-stream
+    downloader (no .part.json) counts as the first `size on disk` bytes already done, so nothing already downloaded is fetched again."""
+    part = dst + ".part"; meta = part + ".json"
+    nseg = (size + CHUNK - 1) // CHUNK; starts = [i * CHUNK for i in range(nseg)]; ends = [min(size, s + CHUNK) for s in starts]; pos = None
+    if os.path.exists(meta):
+        try:
+            m = json.load(open(meta))
+            if m.get("size") == size and m.get("chunk") == CHUNK and len(m.get("pos", [])) == nseg:
+                pos = [int(v) for v in m["pos"]]
+        except Exception:
+            pos = None
+    if pos is None:
+        have = os.path.getsize(part) if os.path.exists(part) else 0
+        pos = [min(max(have, st), en) for st, en in zip(starts, ends)]
+    lock = threading.Lock(); stop = threading.Event(); errs = []; nxt = [0]; got = [0]
+
+    def save():
+        with lock:
+            snap = list(pos)
+        json.dump(dict(size=size, chunk=CHUNK, pos=snap), open(meta + ".tmp", "w")); os.replace(meta + ".tmp", meta)
+    save()
+    with open(part, "r+b" if os.path.exists(part) else "wb") as f:
+        f.truncate(size)
+
+    def take():
+        with lock:
+            while nxt[0] < nseg:
+                i = nxt[0]; nxt[0] += 1
+                if pos[i] < ends[i]:
+                    return i
+        return None
+
+    def work():
+        with open(part, "r+b") as f:
+            while not stop.is_set():
+                i = take()
+                if i is None:
+                    return
+                tries = 0
+                while pos[i] < ends[i] and not stop.is_set():
+                    try:
+                        req = urllib.request.Request(url, headers=dict(UA, Range=f"bytes={pos[i]}-{ends[i] - 1}"))
+                        with urllib.request.urlopen(req, timeout=60) as r:
+                            if r.status != 206:
+                                raise IOError("the server ignored the Range request")
+                            while pos[i] < ends[i] and not stop.is_set():
+                                b = r.read(min(1 << 20, ends[i] - pos[i]))
+                                if not b:
+                                    raise IOError("connection closed early")
+                                f.seek(pos[i]); f.write(b); f.flush()
+                                with lock:
+                                    pos[i] += len(b); got[0] += len(b)
+                        tries = 0
+                    except Exception as e:
+                        tries += 1
+                        if tries >= 8:
+                            errs.append(e); stop.set(); return
+                        time.sleep(2 * tries)
+
+    threads = [threading.Thread(target=work, daemon=True) for _ in range(n)]
+    for t in threads:
+        t.start()
+    t0 = time.time(); last = t0
+    try:
+        while any(t.is_alive() for t in threads):
+            time.sleep(0.5)
+            with lock:
+                tot = sum(p - st for p, st in zip(pos, starts)); g = got[0]
+            print(f"\r  {os.path.basename(dst)}: {tot / 1e6:8.0f} MB of {size / 1e6:.0f}  {g / 1e6 / max(1e-3, time.time() - t0):5.1f} MB/s ({n} connections)", end="", flush=True)
+            if time.time() - last > 5:
+                save(); last = time.time()
+    except KeyboardInterrupt:
+        stop.set(); save(); print("\n  interrupted: run again to resume"); raise
+    finally:
+        save()
+    print()
+    if errs:
+        raise IOError(f"parallel download of {url} failed: {type(errs[0]).__name__}: {errs[0]} (run again to resume)")
+    if any(p < e for p, e in zip(pos, ends)):
+        raise IOError("parallel download incomplete (run again to resume)")
+    os.remove(meta)
+
+
+def download(url, dst, size=None, md5=None, connections=None):
+    """Resumable download with a progress line and an optional md5 check. A file of known size is fetched over several parallel connections (CONNECTIONS, --connections;
+    the server must support HTTP Range, else one stream is used). Resumes a .part left by either mode."""
+    os.makedirs(os.path.dirname(dst), exist_ok=True); part = dst + ".part"; n = CONNECTIONS if connections is None else connections
+    if size and n > 1 and size >= 2 * CHUNK and _probe_ranges(url):
+        _download_parallel(url, dst, size, n)
+    else:
+        _download_seq(url, dst, size)
     if md5:
         h = hashlib.md5()
         with open(part, "rb") as f:
@@ -344,11 +453,12 @@ def main():
     ap.add_argument("--style100", nargs="*", help="100STYLE zip(s) or folder (default: download from Zenodo)"); ap.add_argument("--no-style100", action="store_true")
     ap.add_argument("--accad", nargs="*", default=None, help="folders / zips / .bvh files of ACCAD data (default: <cache>/accad if it exists)")
     ap.add_argument("--accad-url", nargs="*", default=[], help="direct links to ACCAD BVH zips (from the ACCAD page); downloaded into <cache>/accad")
+    ap.add_argument("--connections", type=int, default=CONNECTIONS, help="parallel connections for the big 100STYLE download (1 = single stream; resumes a partial download of either kind)")
     ap.add_argument("--no-accad", action="store_true", help="do not download the ACCAD zips automatically (100STYLE only)"); ap.add_argument("--no-download", action="store_true"); ap.add_argument("--map", help="CSV of 'regex,action' labelling rules for ACCAD file names (action skip drops)")
     ap.add_argument("--style-contents", nargs="+", default=STYLE_DEFAULT_CONTENTS, help="100STYLE take types to use (default: " + " ".join(STYLE_DEFAULT_CONTENTS) + ")")
     ap.add_argument("--per-file", type=int, default=3, help="max windows cut from one take"); ap.add_argument("--per-style", type=int, default=6, help="max clips per 100STYLE style and action")
     ap.add_argument("--limit", type=int, help="only the first N files (smoke test)"); ap.add_argument("--list", action="store_true")
-    a = ap.parse_args(); os.makedirs(a.cache, exist_ok=True); entries = []; tmp0 = tempfile.mkdtemp(prefix="nerva_cc_idx_")
+    a = ap.parse_args(); globals()["CONNECTIONS"] = max(1, a.connections); os.makedirs(a.cache, exist_ok=True); entries = []; tmp0 = tempfile.mkdtemp(prefix="nerva_cc_idx_")
     bad = [c for c in a.style_contents if c.upper() not in STYLE_CONTENT]
     if bad:
         sys.exit("unknown 100STYLE take type(s): " + ", ".join(bad) + "; known: " + " ".join(STYLE_CONTENT))
