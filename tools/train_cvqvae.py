@@ -560,6 +560,8 @@ def tokenize(model, ds, a, bs=512):
     model.eval(); out = []
     for i in range(0, ds.n, bs):
         x, v, act = ds.batch(torch.arange(i, min(i + bs, ds.n)))
+        if a.cond_drop >= 1.0:                              # label-free VAE: it only ever saw the NULL label, so the encoder must tokenise with NULL too (the real labels' embeddings were never trained)
+            act = torch.full_like(act, model.null)
         with amp_ctx(x.device, a.amp):
             out.append(model.tokens(x, act).cpu())
     return torch.cat(out).numpy().astype(np.int64)
