@@ -54,6 +54,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import goal_layout as GL          # the prior's conditioning layout: path goals + engine-channel targets with known flags (tools/goal_layout.py)
 
 # action-vector layout (30): pelvis xyz yaw | footL xyz yaw contact | footR xyz yaw contact | handL xyz on | handR xyz on | look xyz on | torso xyz on
 NCH = 30
@@ -696,7 +697,7 @@ def train_prior(a, dev, codes_t, codes_v, chain_t, chain_v, at, av, K, n_actions
     n = codes_t.shape[1]; Lw = a.prior_windows
     Tt = torch.from_numpy(make_prior_tokens(codes_t, chain_t, at, Lw, K, n_actions)).to(dev); Tv = torch.from_numpy(make_prior_tokens(codes_v, chain_v, av, Lw, K, n_actions)).to(dev)
     use_goal = gt is not None; n_styles = len(style_names) if (st is not None and style_names and len(style_names) > 1) else 0
-    cfg = dict(K=K, n_actions=n_actions, n=n, windows=Lw, d=a.prior_dim, layers=a.prior_layers, heads=a.prior_heads, dropout=a.prior_dropout, goal_dim=NG if use_goal else 0, n_styles=n_styles)
+    cfg = dict(K=K, n_actions=n_actions, n=n, windows=Lw, d=a.prior_dim, layers=a.prior_layers, heads=a.prior_heads, dropout=a.prior_dropout, goal_dim=(gt.shape[1] if use_goal else 0), n_styles=n_styles)
     prior = CodePrior(**cfg).to(dev); npar = sum(p.numel() for p in prior.parameters())
     Gt = Gv = St = Sv = None
     if use_goal:
@@ -706,7 +707,7 @@ def train_prior(a, dev, codes_t, codes_v, chain_t, chain_v, at, av, K, n_actions
     mult = float(np.mean((Tt[:, 1:] != prior.PAD).sum(1).cpu().numpy()))
     print(f"prior: {npar / 1e6:.2f} M parameters, sequences of up to {Lw} windows x {n} codes ({Tt.shape[1]} tokens), {len(Tt)} train / {len(Tv)} val sequences "
           f"(avg {mult:.0f} real tokens); unigram baseline on val: {uni_val:.3f} nats ({math.exp(uni_val):.0f} effective choices per code)")
-    print(f"  conditioning: action prefix (null {a.prior_cond_drop:.0%})" + (f", goal {GOAL_NAMES} per window (null {a.prior_goal_drop:.0%}; turn_max {gstats['turn_max']:.2f} rad, cruise {gstats['speed_cruise']:.2f} m/s)" if use_goal else ", no goal")
+    print(f"  conditioning: action prefix (null {a.prior_cond_drop:.0%})" + (f", goal {GL.names_for_stats(gstats)} per window (null {a.prior_goal_drop:.0%}; turn_max {gstats['turn_max']:.2f} rad, cruise {gstats['speed_cruise']:.2f} m/s)" if use_goal else ", no goal")
           + (f", style: {n_styles} ids incl. 'none' (null {a.prior_style_drop:.0%})" if n_styles else ", no style"))
     decay = [p for nm, p in prior.named_parameters() if p.ndim >= 2]; nod = [p for nm, p in prior.named_parameters() if p.ndim < 2]
     opt = torch.optim.AdamW([dict(params=decay, weight_decay=a.prior_wd), dict(params=nod, weight_decay=0.0)], lr=a.prior_lr, betas=(0.9, 0.95))
@@ -721,6 +722,8 @@ def train_prior(a, dev, codes_t, codes_v, chain_t, chain_v, at, av, K, n_actions
             if a.prior_cond_drop > 0:
                 drop = torch.rand(len(tok), device=dev) < a.prior_cond_drop; tok[drop, 0] = prior.NULL
             goal = Gt[ix] if use_goal else None; style = St[ix] if n_styles else None            # the three nulls are drawn independently, so (action, no goal) and (goal, no action) both occur
+            if use_goal and gstats.get("layout") == "full" and (a.prior_group_mask_win > 0 or a.prior_group_mask_seq > 0):
+                goal = GL.mask_groups_torch(goal, a.prior_group_mask_win, a.prior_group_mask_seq)        # partial control: any group may be unspecified, the engine's own layer fills it in
             dg = torch.rand(len(tok), device=dev) < a.prior_goal_drop if use_goal else None
             ds = torch.rand(len(tok), device=dev) < a.prior_style_drop if n_styles else None
             for g in opt.param_groups:
@@ -734,7 +737,7 @@ def train_prior(a, dev, codes_t, codes_v, chain_t, chain_v, at, av, K, n_actions
         if improved:
             best = ev["nll"]; bad = 0
             torch.save(dict(model=prior.state_dict(), cfg=cfg, names=names, stride=stride, dt=dt, val_nll=best, unigram_val=uni_val, args=vars(a),
-                            goal_stats=gstats if use_goal else None, goal_names=GOAL_NAMES if use_goal else None, style_names=list(style_names) if n_styles else None), path)
+                            goal_stats=gstats if use_goal else None, goal_names=GL.names_for_stats(gstats) if use_goal else None, style_names=list(style_names) if n_styles else None), path)
         else:
             bad += 1
         print(f"prior epoch {epoch:3d}  train nll {run[1]:.3f} acc {run[2] * 100:.1f}%  |  val nll {ev['nll']:.3f} (ppl {ev['ppl']:.0f}) acc {ev['acc'] * 100:.1f}%"
@@ -810,8 +813,8 @@ def generate_codes(prior, acts, n_windows, temperature, top_k, top_p, goals=None
 def plan_goals(prior, B, nw, turn_deg, speed, dt, W, dev):
     """The same goal for every window of every clip (an arc of `turn_deg` degrees per window at `speed` m/s; either may be None = 0 deg / the data's cruise speed) -> normalised [B,nw,G]."""
     st = prior.meta["goal_stats"]; sec = (W - 1) * dt
-    g = arc_goal(np.deg2rad(turn_deg or 0.0), (st["speed_cruise"] if speed is None else speed) * sec, sec)
-    return torch.from_numpy(np.broadcast_to(norm_goal(g, st), (B, nw, NG)).copy()).to(dev)
+    g = GL.expand_path(arc_goal(np.deg2rad(turn_deg or 0.0), (st["speed_cruise"] if speed is None else speed) * sec, sec), st)      # a prior with channel groups: those stay unspecified
+    return torch.from_numpy(np.broadcast_to(norm_goal(g, st), (B, nw, len(st["mean"]))).copy()).to(dev)
 
 
 @torch.no_grad()
@@ -894,6 +897,11 @@ def main():
     ap.add_argument("--prior-cond-drop", type=float, default=0.1, help="share of sequences whose action prefix becomes NULL (unconditional sampling)")
     ap.add_argument("--no-prior-goal", action="store_true", help="train the prior without the per-window goal numbers (heading change, displacement, speed)")
     ap.add_argument("--prior-goal-drop", type=float, default=0.15, help="share of sequences whose goal numbers become the NULL goal (what classifier-free guidance contrasts against)")
+    ap.add_argument("--prior-goal-layout", choices=["path", "full"], default="path",
+                    help="path: the 4 path numbers per window (as before). full: + for every engine channel (handL, handR, look, torso) a known flag, the on flag and the target point, so a target can be "
+                         "given or left unspecified (tools/goal_layout.py). Needs windows whose *_on channels are real: if no window has a channel on, the groups teach nothing")
+    ap.add_argument("--prior-group-mask-win", type=float, default=0.25, help="full layout: chance that ONE group of ONE window is hidden (unspecified) in a training sequence")
+    ap.add_argument("--prior-group-mask-seq", type=float, default=0.15, help="full layout: chance that a group is hidden in EVERY window of a training sequence (the app never says anything about it)")
     ap.add_argument("--prior-style-drop", type=float, default=0.15, help="share of sequences whose style id becomes NULL (only if the window files have a `style` array)")
     # sampling
     ap.add_argument("--gen-per-action", type=int, default=2); ap.add_argument("--gen-windows", type=int, default=4, help="windows per clip: 64 + (n-1)*stride frames")
@@ -1002,8 +1010,13 @@ def main():
     # ---------------------------------------------------------------------------------------------------------------- stage 3: prior
     gt = gv = gstats = st_ids = sv_ids = style_names = None
     if not a.no_prior_goal:                                                                 # goal numbers are read off the CANONICAL windows (also when the VAE itself was trained with --no-canon)
-        gt = goal_features(Xt if canon else canonicalize(Xt_raw), vt, dt); gv = goal_features(Xv if canon else canonicalize(Xv_raw), vv, dt); gstats = goal_stats(gt)
-        print("goal features (train windows): " + ", ".join(f"{nm} mean {m:.2f} std {s:.2f}" for nm, m, s in zip(GOAL_NAMES, gstats["mean"], gstats["std"])))
+        Ct = Xt if canon else canonicalize(Xt_raw); Cv = Xv if canon else canonicalize(Xv_raw)
+        gt = goal_features(Ct, vt, dt); gv = goal_features(Cv, vv, dt); gstats = goal_stats(gt)
+        if a.prior_goal_layout == "full":                                                    # + per engine channel: known flag, on flag, target point (tools/goal_layout.py)
+            gt = GL.goal_features_full(gt, Ct, vt); gv = GL.goal_features_full(gv, Cv, vv); gstats = GL.goal_stats_full(gt, gstats)
+            print("channel targets: share of train windows with the channel ON: " + ", ".join(f"{k} {v:.1%}" for k, v in gstats["on_share"].items())
+                  + ("   (all 0: the data has no targets, so the prior can only learn 'no target' and the channel groups teach it nothing)" if not any(gstats["on_share"].values()) else ""))
+        print("goal features (train windows): " + ", ".join(f"{nm} mean {m:.2f} std {s:.2f}" for nm, m, s in zip(GL.names_for_stats(gstats), gstats["mean"], gstats["std"])))
     st_raw, sn_t = load_styles(os.path.join(a.data, "train_windows.npz"))
     if st_raw is not None and len(sn_t) > 1:
         sv_raw, sn_v = load_styles(os.path.join(a.data, "val_windows.npz")); style_names, st_ids = sn_t, st_raw
