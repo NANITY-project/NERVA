@@ -43,6 +43,7 @@ HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
 import torch
 import gen_dataset as g
 import train_cvqvae as T
+import goal_layout as GL
 
 A = g.A                                   # 30 action channels
 ST_X, ST_Y, ST_Z, ST_YAW, ST_MARGIN, ST_FALLEN = 0, 1, 2, 3, 9, 10
@@ -206,10 +207,10 @@ class ClosedLoop:
             self._sign = 1.0 if info["remaining_turn"] > 0 else -1.0
         goal_t = None
         if self.prior.goal_dim:
-            slots = np.zeros((self.Lw, T.NG), np.float32); m = len(hist_goals)
+            slots = np.zeros((self.Lw, len(self.gstats["mean"])), np.float32); m = len(hist_goals)
             for j, gv in enumerate(hist_goals):
                 slots[j] = gv
-            slots[m] = T.norm_goal(feat, self.gstats)
+            slots[m] = T.norm_goal(GL.expand_path(feat, self.gstats), self.gstats)
             goal_t = torch.from_numpy(slots)[None].repeat(self.k, 1, 1).to(self.dev)
         style_t = None if self.style_id is None else torch.full((self.k,), self.style_id, dtype=torch.long, device=self.dev)
         ctx = build_ctx(self.prior, self.act_id, hist_codes, self.k, self.dev)
@@ -291,7 +292,7 @@ class ClosedLoop:
                 n_stand += self._stand(chunks, rows, w, body.state().copy(), "unstable"); pending = None; hist_codes.clear(); hist_goals.clear(); positions.clear(); dists.clear(); w += 1; continue
             snap.close(); rows.append(row); chunks.append(act.copy())
             pending = cand["merged"][best][stride:]; hist_codes.append(cand["codes"][best])
-            hist_goals.append(T.norm_goal(T.goal_features(T.canonicalize(cand["canon"][best][None]), np.array([self.W]), dt)[0], self.gstats))   # what the window DID, as in training
+            hist_goals.append(T.norm_goal(GL.measured(T, T.canonicalize(cand["canon"][best][None]), np.array([self.W]), dt, self.gstats), self.gstats))   # what the window DID, as in training
             attempt = 0; w += 1
             self.log(f"window {w - 1:3d}  goal turn {math.degrees(cand['info']['turn']):6.1f} deg{' (clipped)' if cand['info']['turn_clipped'] else ''}  "
                      + (f"remaining {math.degrees(cand['info']['remaining_turn']):7.1f} deg  dist {dist:5.2f} m  " if dist is not None else "") + f"chose {best}/{self.k} score {v['score']:.4f}  margin {marg:.3f} m")
