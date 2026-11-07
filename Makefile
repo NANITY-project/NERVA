@@ -107,3 +107,6 @@ vae-data-quick:
 
 gen-actions:
 	python3 tools/gen_actions.py --n 40 --out data/eng_actions
+
+motion-corpus-test:
+	python3 tests/test_motion_corpus.py
