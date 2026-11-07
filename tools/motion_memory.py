@@ -37,7 +37,7 @@ Storage: DIR/index.json (names, strengths, history) + DIR/clips.npz (frames, off
 import argparse, json, os, sys, time
 import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import motion_features as mf, motion_grader as G, motion_vary as V
+import motion_features as mf, motion_grader as G, motion_sources as MS, motion_vary as V
 
 DEFAULT_DIR = "data/memory"
 HALF_LIFE_DAYS, USE_GAIN, MAX_STRENGTH, FORGET_BELOW = 14.0, 0.5, 3.0, 0.15
@@ -187,7 +187,8 @@ def memory_profiles(mem, real_F, real_action, min_n=MIN_PROMOTE):
     return G.Profiles(F, act), sorted(promo)
 
 
-TRAINING_SOURCES = ("accad", "100style")        # the CC BY sets (tools/get_cc_motions.py). CMU examples are the grader's yardstick only: never stored as training motions (docs/CREDITS.md)
+TRAINING_SOURCES = MS.TRAINING_SOURCES        # open / share-alike sets with a reader: accad, 100style (tools/get_cc_motions.py), hdm05 (tools/build_motion_corpus.py). The table is tools/motion_sources.py.
+                                                # CMU examples are the grader's yardstick only: never stored as training motions (docs/CREDITS.md)
 
 
 def seed_from_real(mem, zr, RF, prof, per_action=0, actions=None, rng=None, log=print, sources=TRAINING_SOURCES):
