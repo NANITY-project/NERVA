@@ -30,6 +30,8 @@ DEFAULT_WINDOWS = {"veer": 2, "straight": 3, "stop": 1, "vague": 2, "turn": 1}
 LONG_WINDOWS = 4
 SPEED_FRAC = {"slow": 0.5, "walk": 1.0, "fast": 1.4, "run": None}       # of speed_cruise; run = speed_max
 TURN_IN_PLACE_SPEED = 0.5                                       # "turn left" with no walking verb: a slow turning gait, as a fraction of speed_cruise
+SYMMETRIC_TURN_DEG = 170.0                                      # a stated turn this big ("turn around", "u turn", "180 degrees") is the same motion either way round
+SIDELESS_TURN_SIGN = +1                                         # side used for such a turn when the text names none: +1 = the character's LEFT, None = never place it (the old rule). The plan's note says so every time
 
 # ---------------------------------------------------------------------------------------------------------------------------------------------- word lists
 # Roughly frequency-ordered general English (most common first). Rank -> cost in the splitter. Not exhaustive on purpose: unknown strings are allowed at a high per-character cost.
@@ -188,6 +190,48 @@ class Parsed:
     ignored: List[str]
 
 
+CARRIERS = {"keep", "keeps", "continue", "continuing", "go", "going", "goes", "head", "heading", "move", "moving", "moves", "step", "stepping", "proceed", "advance", "travel", "travelling"}
+STOP_VERBS = V_STOP - {"still", "stay"}                           # "stand still", "stay still", "keep still": the second word is not a new event
+AMOUNT_WORDS = {"around", "u", "uturn", "half", "quarter"}
+
+
+def _cls(t: str) -> Optional[str]:
+    return "stop" if t in STOP_VERBS else "turn" if t in V_TURN else "move" if (t in V_WALK or t in V_RUN) else None
+
+
+def _complete(ch: List[str]) -> bool:
+    """The chunk already says one whole thing: a stop, a turn with a side / amount, or a move with a direction."""
+    side = any(t in LEFT or t in RIGHT for t in ch)
+    if any(t in STOP_VERBS for t in ch):
+        return True
+    if any(t in V_TURN for t in ch) and (side or any(t in AMOUNT_WORDS or t[:1].isdigit() for t in ch)):
+        return True
+    return any(_cls(t) == "move" for t in ch) and (side or any(t in STRAIGHT for t in ch))
+
+
+def _split_verbs(ch: List[str]) -> List[List[str]]:
+    """Raw text has no commas: \"run stop turn around walk slowly\" is cut at the verb that starts a NEW event. A verb starts one when the chunk so far is already a whole event,
+    when it is a stop after a move / turn, or when a run follows a walk (or the other way round). \"keep running\", \"walk veering left\", \"stand still\", \"stop walking\" stay together."""
+    out, cur = [], []
+    for t in ch:
+        c = _cls(t)
+        if cur and c:
+            prev = cur[-1]
+            glue = (_cls(prev) == "stop" and c == "move")                      # \"stop walking\": one stop
+            has_verb = any(_cls(x) in ("move", "turn") for x in cur)
+            new_stop = c == "stop" and has_verb
+            new_after_whole = c in ("turn", "move") and _complete(cur) and not glue
+            speeds = {("run" if x in V_RUN else "walk") for x in cur if x in V_RUN or (x in V_WALK and x not in CARRIERS)}
+            flip = c == "move" and t not in CARRIERS and speeds and ("run" if t in V_RUN else "walk") not in speeds and not (prev in CARRIERS)
+            if new_stop or new_after_whole or flip:
+                out.append(cur)
+                cur = []
+        cur.append(t)
+    if cur:
+        out.append(cur)
+    return out
+
+
 def _chunks(tokens: List[str]) -> List[List[str]]:
     out, cur = [], []
     for t in tokens:
@@ -202,7 +246,7 @@ def _chunks(tokens: List[str]) -> List[List[str]]:
             cur.append(t)
     if cur:
         out.append(cur)
-    return out
+    return [piece for ch in out for piece in _split_verbs(ch)]
 
 
 def parse_events(text: str) -> Parsed:
@@ -245,7 +289,10 @@ def parse_events(text: str) -> Parsed:
         if has_back:
             ignored.append(" ".join(ch) + " (moving backwards is not expressible)")
             continue
-        if vague:
+        stop_walking = any(ch[i] in STOP_VERBS and ch[i + 1] in (V_WALK | V_RUN) for i in range(len(ch) - 1)) and not sign      # "stop walking", "stop running"
+        if stop_walking:
+            events.append(Event("stop", 0, None, seconds, None, "walk", " ".join(ch)))
+        elif vague:
             events.append(Event("vague", raw=" ".join(ch)))
         elif sign:
             events.append(Event("turn" if has_turn and not has_move else "move", sign, deg, seconds, size, speed, " ".join(ch)))
@@ -296,7 +343,11 @@ def windows_for(ev: Event, st: C.Stats, timing: C.Timing, notes: List[str]) -> L
         return [C.spec_win(0.0, 0.0, st)] * _count(ev, DEFAULT_WINDOWS["stop"], timing)
     if ev.sign == 0 and ev.deg is None:
         return [C.spec_win(0.0, speed, st)] * _count(ev, DEFAULT_WINDOWS["straight"], timing)
-    if ev.sign == 0:
+    sign = ev.sign
+    if sign == 0 and SIDELESS_TURN_SIGN and ev.deg is not None and ev.deg >= SYMMETRIC_TURN_DEG:
+        sign = SIDELESS_TURN_SIGN                                                           # \"turn around\": either way round is the same motion, so one side is used, and said
+        notes.append(f"'{ev.raw}': no side given, turned to the character's {'left' if sign > 0 else 'right'}")
+    if sign == 0:
         notes.append(f"'{ev.raw}': a turn with no side (left / right) is not placed; the character's own left or right is never guessed")
         return [C.UNSPEC_WIN] * DEFAULT_WINDOWS["vague"]                                    # an amount with no side: do not guess a direction
     tmax = st.turn_max
@@ -310,7 +361,7 @@ def windows_for(ev: Event, st: C.Stats, timing: C.Timing, notes: List[str]) -> L
         if per > tmax + 1e-9:
             notes.append(f"'{ev.raw}': {deg:.0f} deg in {n} window(s) is more than the prior's turn_max ({math.degrees(tmax):.0f} deg/window): clamped")
             per = tmax
-        return [C.spec_win(ev.sign * per, speed, st)] * n
+        return [C.spec_win(sign * per, speed, st)] * n
     frac = SIZE_FRAC[ev.size or "default"]
     return [C.spec_win(ev.sign * frac * tmax, speed, st)] * _count(ev, DEFAULT_WINDOWS["veer"], timing)
 
