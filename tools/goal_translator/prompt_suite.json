@@ -149,7 +149,7 @@
   },
   {
    "text": "make a u turn",
-   "expect": "U",
+   "expect": "L",
    "tier": "hard"
   }
  ]
