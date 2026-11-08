@@ -559,6 +559,7 @@ async function doGoalPlan(){
     const j = await API('/api/goal_plan', {text});
     if (j.ok){
       TL = j.rows.map(r => r.unspecified ? {unspecified: true} : {turn: r.turn, speed: r.speed});
+      if (!$('endless').checked) $('wins').value = TL.length;      // the run follows the plan: Windows would otherwise cut it short (default 8)
       const src = j.source === 'model' ? 'by the trained translator' : 'by the stage-C bootstrap (no trained translator loaded)';
       const spec = TL.filter(r => !r.unspecified).length;
       $('gtNote').textContent = `${j.windows} windows (${spec} with goals, ${j.windows - spec} unspecified) ${src}` + (j.ignored.length ? ` · not expressible by the goals, ignored: ${j.ignored.join('; ')}` : '') + (j.notes.length ? ' · ' + j.notes.join(' · ') : '');
@@ -782,6 +783,7 @@ function startGen(){
   if (TL.length){ q.set('timeline', JSON.stringify(TL.map(r => r.unspecified ? {unspecified: true} : {turn: r.turn, speed: r2(r.speed)}))); q.set('cfg', $('cfg').value); }
   G = {dt: 1/30, names: null, engine: false, chunks: [], total: 0, first: 0, t0: performance.now(), rows: {}, action: $('action').value, fps: 30};
   playhead = 0; playing = true; $('play').textContent = 'pause'; $('play').onclick = togglePlay; setEmpty();
+  if (TL.length && !$('endless').checked && +$('wins').value < TL.length) log(`note: the plan has ${TL.length} windows but Windows is ${$('wins').value}, so the last ${TL.length - $('wins').value} will not play`);
   es = new EventSource('/api/generate?' + q);
   $('go').disabled = true; setRunning(true);
   es.onmessage = m => onEvent(JSON.parse(m.data));
