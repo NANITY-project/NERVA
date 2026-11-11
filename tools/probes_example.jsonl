@@ -1,0 +1,31 @@
+# One JSON per line: the text you would type, what the motion should do, and a group name of your choice (the report is per group).
+# turn: left | right | straight (the character's own left / right).  speed: [lo, hi) m/s of the decoded window (a person walks about 1.2-1.5, jogs 2-3, runs 3+).
+# I wrote these by hand as a sample. Write your own, and put words you never put in the captions into their own group: that is the test of an unseen word.
+{"text": "walk forward", "turn": "straight", "speed": [0.8, 1.9], "group": "plain"}
+{"text": "walk slowly", "turn": "straight", "speed": [0.15, 1.15], "group": "plain"}
+{"text": "stand still", "turn": "straight", "speed": [0.0, 0.35], "group": "plain"}
+{"text": "run", "turn": "straight", "speed": [2.0, 99.0], "group": "plain"}
+{"text": "walk fast", "turn": "straight", "speed": [1.3, 3.0], "group": "plain"}
+{"text": "turn left", "turn": "left", "speed": [0.15, 2.5], "group": "plain"}
+{"text": "turn right", "turn": "right", "speed": [0.15, 2.5], "group": "plain"}
+{"text": "walk and turn left", "turn": "left", "speed": [0.8, 1.9], "group": "plain"}
+{"text": "walk and turn right", "turn": "right", "speed": [0.8, 1.9], "group": "plain"}
+{"text": "run to the left", "turn": "left", "speed": [2.0, 99.0], "group": "plain"}
+{"text": "run to the right", "turn": "right", "speed": [2.0, 99.0], "group": "plain"}
+{"text": "walkforward", "turn": "straight", "speed": [0.8, 1.9], "group": "raw"}
+{"text": "walkleftslowly", "turn": "left", "speed": [0.15, 1.15], "group": "raw"}
+{"text": "Walk right??", "turn": "right", "speed": [0.8, 1.9], "group": "raw"}
+{"text": "pls stop", "turn": "straight", "speed": [0.0, 0.35], "group": "raw"}
+{"text": "wlak slwoly", "turn": "straight", "speed": [0.15, 1.15], "group": "raw"}
+{"text": "RUN!!!", "turn": "straight", "speed": [2.0, 99.0], "group": "raw"}
+{"text": "turn lef", "turn": "left", "speed": [0.15, 2.5], "group": "raw"}
+{"text": "go go go right", "turn": "right", "speed": [0.8, 3.0], "group": "raw"}
+{"text": "stroll along", "turn": "straight", "speed": [0.15, 1.15], "group": "unseen_words"}
+{"text": "sprint", "turn": "straight", "speed": [2.0, 99.0], "group": "unseen_words"}
+{"text": "freeze", "turn": "straight", "speed": [0.0, 0.35], "group": "unseen_words"}
+{"text": "hang a left", "turn": "left", "speed": [0.15, 2.5], "group": "unseen_words"}
+{"text": "swing right", "turn": "right", "speed": [0.15, 2.5], "group": "unseen_words"}
+{"text": "turn anticlockwise", "turn": "left", "speed": [0.15, 2.5], "group": "unseen_words"}
+{"text": "rotate clockwise while walking", "turn": "right", "speed": [0.8, 1.9], "group": "unseen_words"}
+{"text": "dash off to the left", "turn": "left", "speed": [2.0, 99.0], "group": "unseen_words"}
+{"text": "amble ahead", "turn": "straight", "speed": [0.15, 1.15], "group": "unseen_words"}
