@@ -1,30 +1,29 @@
 #!/usr/bin/env python3
 """
-text_prior_pilot.py - does a prior conditioned on TEXT work at all?   (a pilot: it imports CodePrior & co. from train_cvqvae.py and changes nothing there)
+text_prior_pilot.py - does a prior conditioned on FREE TEXT work at all?   (a pilot: it imports CodePrior & co. from train_cvqvae.py and changes nothing there)
 
-The prior's numeric goal is a per-window vector (goal_mlp output) ADDED to the input embedding of every position of that window. Here that vector comes from a text encoder
-instead: the phrase of each window -> encoder -> d numbers -> same place, same learned NULL vector (text dropout = classifier-free guidance). No extra tokens, so the context stays
-[NULL] + windows x (n codes + SEP).
+Text -> motion codes, trained together, no goal numbers, no label ids, no word lists in this repo. The prior's numeric goal is a per-window vector (goal_mlp output) ADDED to the
+input embedding of every position of that window. Here that vector comes from a text encoder instead (same place, same learned NULL vector; text dropout = classifier-free guidance).
+No extra tokens, so the context stays [NULL] + windows x (n codes + SEP).
 
   --encoder byte   a small byte-level encoder (2 transformer layers, masked mean pool) trained jointly with the prior: your own, no pretrained weights
-  --encoder e5     a FROZEN pretrained sentence encoder (needs `pip install transformers`) + a trained 2-layer projection. Knows synonyms it was never trained on.
-  --encoder goal   the baseline: the normal numeric-goal prior (train_cvqvae.train_prior) on the same windows. Upper bound for steering.
+  --encoder e5     a FROZEN pretrained sentence encoder (pip install transformers) + a trained 2-layer projection. Knows synonyms it was never trained on.
+  --encoder goal   the baseline: the normal numeric-goal prior (train_cvqvae.train_prior) on the same windows. The upper bound for steering.
 
-Needs, once (the codes of your VAE):
-  python tools/train_cvqvae.py --data DATA --out OUT --vae-ckpt OUT/best.pt --stage prior --export-codes --eval-only        # writes OUT/codes_train.npz, codes_val.npz
-Then:
-  python tools/text_prior_pilot.py --data DATA --codes OUT --vae-ckpt OUT/best.pt --out OUT/pilot --encoder byte
-  python tools/text_prior_pilot.py --data DATA --codes OUT --vae-ckpt OUT/best.pt --out OUT/pilot --encoder e5
-  python tools/text_prior_pilot.py --data DATA --codes OUT --vae-ckpt OUT/best.pt --out OUT/pilot --encoder goal
-  (--ckpt OUT/pilot/text_prior_byte.pt skips training and only runs the tests; --max-windows 20000 --epochs 2 is a quick smoke run)
+Where the text comes from (the part that decides everything): tools/goal_translator/describe_motion.py. It measures what each clip did in the character's own frame (heading, speed, hands,
+gaze, torso), has a language model write several phrasings (narration, command, terse, casual) and never reads a label name: the words are the model's. tools/windows_to_clips.py turns every
+window into a tiny clip first, because the prior trains on windows and describe_motion captions clips; the captions then join back to windows exactly. Windows without a caption get the NULL vector.
+Where the test phrases come from: --probes, a JSONL you write (tools/probes_example.jsonl): {"text", "turn": left|right|straight, "speed": [lo, hi] m/s, "group": any name}.
 
-Captions (text_pilot_captions.py): each window's measured (turn, speed) -> a phrase from a TRAIN vocabulary, half of them corrupted (no spaces / commas, typos, "??").
-The four tests:
-  1 text is used   val NLL with the true phrase vs a phrase of another sequence vs the null vector. true << shuffled ~ null  = the encoder is used.
-  2 steering       generate from phrases of the train vocabulary, decode, measure each window (turn, speed): how often it did what the phrase asked.
-  3 raw text       the same intents typed raw: no spaces / commas, "??", typos.
-  4 unseen words   synonyms that never appear in training ("sprint", "stroll", "hang a left", "anticlockwise").
-Tests 1-3 only show that the mechanism learns the templates. Test 4 is the real question; expect the byte encoder to fail it unless the captions are far more varied.
+  # once: the codes of your VAE
+  python tools/train_cvqvae.py --data nerva-motion-data/vae --out OUT --vae-ckpt OUT/best.pt --stage prior --export-codes --eval-only        # OUT/codes_train.npz, codes_val.npz
+  python tools/windows_to_clips.py --data nerva-motion-data/vae --out OUT/wc --every 6
+  python tools/goal_translator/describe_motion.py --stage requests --clips OUT/wc/window_clips.npz --out OUT/wc/captions --spans-per-clip 1     # then --stage run, --stage apply
+  python tools/text_prior_pilot.py --data nerva-motion-data/vae --codes OUT --vae-ckpt OUT/best.pt --out OUT/pilot --captions OUT/wc/captions/captions.jsonl --clip-map OUT/wc/window_map.npz --probes tools/probes_example.jsonl --encoder byte
+  (same with --encoder e5;  --encoder goal needs only --probes;  --ckpt X.pt skips training;  --max-windows 20000 --epochs 2 is a quick smoke run)
+
+Tests: 1 text is used (val NLL with the true text vs the text of another sequence vs no text);  2 steering: generate from each probe phrase, decode, measure every window (turn, speed) and
+report how often it did what the phrase asked, per probe group. Put plain, raw (no spaces / commas, "??", typos) and unseen-word phrases in different groups to see which breaks.
 """
 import argparse, json, math, os, sys, time
 import numpy as np
@@ -33,8 +32,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "goal_translator"))
 import train_cvqvae as T
-import text_pilot_captions as TC
 
 MAXB = 64                                                       # bytes of one phrase
 
@@ -211,47 +210,118 @@ def measure(vae, norm, canon, codes, n_null, dt, dev):
     return np.degrees(g[:, 0]).reshape(B, nw), g[:, 3].reshape(B, nw)
 
 
-@torch.no_grad()
-def run_probes(a, dev, prior, vae, norm, canon, dt, n_null, tab_fn, include_run):
-    res = {}; ps = TC.probes(a.seed, include_run)
-    for kind, items in ps.items():
+# ============================================================================================================================ captions and probes (read from files: no vocabulary here)
+def load_captions(path, map_path, lens_t, lens_v, min_cover, corrupt, seed):
+    """describe_motion.py captions.jsonl {clip, text, frames, ...} + windows_to_clips.py's window_map.npz -> (strings, (sid_t, has_t), (sid_v, has_v), skipped).
+    clip k of the converted file is window ids[k] (ids >= n_train are validation windows). A caption that covers less than `min_cover` of its window is skipped."""
+    import random
+    rng = random.Random(seed); z = np.load(map_path); ids, n_train = z["ids"].astype(np.int64), int(z["n_train"])
+    by_t = [[] for _ in range(len(lens_t))]; by_v = [[] for _ in range(len(lens_v))]; skipped = 0
+    for line in open(path, encoding="utf-8"):
+        line = line.strip()
+        if not line:
+            continue
+        r = json.loads(line); g = int(ids[int(str(r["clip"]).replace("clip", ""))])
+        by, j, L = (by_t, g, lens_t) if g < n_train else (by_v, g - n_train, lens_v)
+        if j >= len(by):
+            continue                                                                         # --max-windows cut this window off
+        f0, f1 = r["frames"]
+        if f1 - f0 < min_cover * L[j]:
+            skipped += 1; continue
+        by[j].append(str(r["text"]))
+    strings, index = [], {}
+    def sid_of(t):
+        if t not in index:
+            index[t] = len(strings); strings.append(t)
+        return index[t]
+    if corrupt > 0:
+        import gt_corrupt
+    out = []
+    for by in (by_t, by_v):
         rows = []
-        for p in items:
-            torch.manual_seed(a.seed)
-            vec = tab_fn(p["text"]); text = vec[None, None].expand(a.probe_n, prior.windows, -1).contiguous()
-            codes = cond_sample(prior, text, a.probe_windows, a, dev)
-            d, v = measure(vae, norm, canon, codes, n_null, dt, dev)
-            rows.append(dict(sign=p["sign"], speed=p["speed"], text=p["text"], dyaw_deg=d[:, 1:].reshape(-1) if a.probe_windows > 1 else d.reshape(-1),
-                             speed_ms=v[:, 1:].reshape(-1) if a.probe_windows > 1 else v.reshape(-1)))     # the first window has no earlier window to settle into: skipped
-        res[kind] = rows
+        for tx in by:
+            tx = list(tx)
+            if corrupt > 0:
+                tx += [gt_corrupt.corrupt(t, rng) for t in tx if rng.random() < corrupt]
+            rows.append([sid_of(t) for t in tx])
+        V = max(max((len(r) for r in rows), default=1), 1); sid = np.zeros((len(rows), V), np.int64); has = np.zeros(len(rows), bool)
+        out.append((sid, has, rows))
+    V = max(o[0].shape[1] for o in out); res = []
+    for sid, has, rows in out:
+        sid = np.zeros((len(rows), V), np.int64)
+        for i, r in enumerate(rows):
+            if r:
+                sid[i] = [r[j % len(r)] for j in range(V)]; has[i] = True
+        res.append((sid, has))
+    return strings, res[0], res[1], skipped
+
+
+def load_probes(path):
+    ps = []
+    for line in open(path, encoding="utf-8"):
+        line = line.strip()
+        if line and not line.startswith("#"):
+            r = json.loads(line); r["sign"] = {"left": 1, "right": -1, "straight": 0}[r["turn"]]; r.setdefault("group", "probes"); ps.append(r)
+    return ps
+
+
+def window_ok(sign, speed_range, dyaw_deg, speed):
+    """per window: (turn matches, speed matches). Left = heading change >= +10 deg, right <= -10, straight within +-15."""
+    d = np.asarray(dyaw_deg, np.float64); v = np.asarray(speed, np.float64)
+    t = (d >= 10.0) if sign > 0 else (d <= -10.0) if sign < 0 else (np.abs(d) <= 15.0)
+    return t, (v >= speed_range[0]) & (v < speed_range[1])
+
+
+def summarize(rows):
+    tt = ss = bb = n = 0
+    for r in rows:
+        t, s = window_ok(r["sign"], r["speed"], r["dyaw_deg"], r["speed_ms"]); tt += int(t.sum()); ss += int(s.sum()); bb += int((t & s).sum()); n += len(t)
+    n = max(n, 1)
+    return dict(turn_ok=tt / n, speed_ok=ss / n, both_ok=bb / n, n=n)
+
+
+@torch.no_grad()
+def run_probes(a, dev, prior, vae, norm, canon, dt, n_null, tab_fn, probes, speed_p99):
+    res = {}; skipped = []
+    for p in probes:
+        if p["speed"][0] > 1.1 * speed_p99:
+            skipped.append(p["text"]); continue                                            # the data has no windows that fast: it can not be taught, so it is not asked
+        torch.manual_seed(a.seed)
+        vec = tab_fn(p["text"]); text = vec[None, None].expand(a.probe_n, prior.windows, -1).contiguous()
+        codes = cond_sample(prior, text, a.probe_windows, a, dev); d, v = measure(vae, norm, canon, codes, n_null, dt, dev); s0 = 1 if a.probe_windows > 1 else 0   # the first window has no earlier window to settle into
+        res.setdefault(p["group"], []).append(dict(sign=p["sign"], speed=p["speed"], text=p["text"], dyaw_deg=d[:, s0:].reshape(-1), speed_ms=v[:, s0:].reshape(-1)))
+    if skipped:
+        print(f"note: {len(skipped)} probe(s) skipped because the data has no windows that fast (99th percentile {speed_p99:.2f} m/s), e.g. {skipped[0]!r}")
     return res
 
 
 def report(res, title):
-    print(f"\n{title}\n  {'kind':14s} {'turn ok':>8s} {'speed ok':>9s} {'both ok':>8s}   windows")
-    for kind, rows in res.items():
-        if not rows:
-            continue
-        s = TC.summarize(rows); print(f"  {kind:14s} {s['turn_ok'] * 100:7.0f}% {s['speed_ok'] * 100:8.0f}% {s['both_ok'] * 100:7.0f}%   {s['n']}")
-    return {k: TC.summarize(r) for k, r in res.items() if r}
+    print(f"\n{title}\n  {'group':16s} {'turn ok':>8s} {'speed ok':>9s} {'both ok':>8s}   windows")
+    out = {}
+    for g, rows in res.items():
+        s = summarize(rows); out[g] = s; print(f"  {g:16s} {s['turn_ok'] * 100:7.0f}% {s['speed_ok'] * 100:8.0f}% {s['both_ok'] * 100:7.0f}%   {s['n']}")
+    return out
 
 
 def show_worst(res, k=4):
-    for kind, rows in res.items():
-        sc = sorted(rows, key=lambda r: sum(map(lambda x: x.mean(), TC.window_ok(r["sign"], r["speed"], r["dyaw_deg"], r["speed_ms"]))))[:k]
+    for g, rows in res.items():
+        sc = sorted(rows, key=lambda r: sum(x.mean() for x in window_ok(r["sign"], r["speed"], r["dyaw_deg"], r["speed_ms"])))[:k]
         for r in sc:
-            print(f"  worst {kind:13s} {r['text']!r:44s} wanted turn {r['sign']:+d} {r['speed']:5s}  got {np.mean(r['dyaw_deg']):+6.1f} deg/window  {np.mean(r['speed_ms']):.2f} m/s")
+            print(f"  worst in {g:12s} {r['text']!r:50s} wanted turn {r['sign']:+d} speed {r['speed'][0]}-{r['speed'][1]}  got {np.mean(r['dyaw_deg']):+6.1f} deg/window  {np.mean(r['speed_ms']):.2f} m/s")
 
 
 # ============================================================================================================================ main
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1], formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--data", required=True, help="the window files (train_windows.npz, val_windows.npz)")
-    ap.add_argument("--codes", required=True, help="the folder with codes_train.npz / codes_val.npz (train_cvqvae.py --export-codes)")
+    ap.add_argument("--data", required=True, help="the folder with train_windows.npz / val_windows.npz (nerva-motion-data/vae)")
+    ap.add_argument("--codes", help="the folder with codes_train.npz / codes_val.npz (train_cvqvae.py --export-codes)")
     ap.add_argument("--vae-ckpt", required=True); ap.add_argument("--out", required=True)
+    ap.add_argument("--captions", help="describe_motion.py captions.jsonl made on windows_to_clips.py's window_clips.npz (needed for byte / e5)")
+    ap.add_argument("--clip-map", help="window_map.npz written by windows_to_clips.py"); ap.add_argument("--min-cover", type=float, default=0.7, help="a caption must cover this share of its window")
+    ap.add_argument("--probes", required=True, help="JSONL of test phrases: {text, turn: left|right|straight, speed: [lo, hi], group}")
     ap.add_argument("--encoder", choices=["byte", "e5", "goal"], default="byte"); ap.add_argument("--e5-model", default="intfloat/e5-small-v2")
-    ap.add_argument("--ckpt", help="a text prior trained by this script: skip training, run the tests"); ap.add_argument("--max-windows", type=int, default=0, help="debug: use only the first N windows")
-    ap.add_argument("--variants", type=int, default=4); ap.add_argument("--pool", type=int, default=96); ap.add_argument("--p-corrupt", type=float, default=0.5)
+    ap.add_argument("--ckpt", help="a text prior trained by this script: skip training, run the tests"); ap.add_argument("--max-windows", type=int, default=0, help="debug: only the first N windows")
+    ap.add_argument("--corrupt", type=float, default=0.2, help="share of texts that also get a character-noise copy (typos, no spaces, ...: gt_corrupt.py, no words)")
     ap.add_argument("--windows", type=int, default=4); ap.add_argument("--dim", type=int, default=256); ap.add_argument("--layers", type=int, default=6); ap.add_argument("--heads", type=int, default=4)
     ap.add_argument("--dropout", type=float, default=0.1); ap.add_argument("--epochs", type=int, default=40); ap.add_argument("--batch", type=int, default=256)
     ap.add_argument("--lr", type=float, default=3e-4); ap.add_argument("--wd", type=float, default=0.01); ap.add_argument("--patience", type=int, default=6)
@@ -261,6 +331,12 @@ def main():
     ap.add_argument("--temperature", type=float, default=0.9); ap.add_argument("--top-k", type=int, default=40); ap.add_argument("--top-p", type=float, default=1.0)
     ap.add_argument("--cfg-scale", type=float, default=1.0); ap.add_argument("--show-worst", action="store_true"); ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
+    if a.encoder != "goal" and not (a.captions or a.ckpt):
+        ap.error("--captions and --clip-map are required for --encoder byte / e5 (see windows_to_clips.py and describe_motion.py)")
+    if a.captions and not a.clip_map:
+        ap.error("--clip-map is required with --captions")
+    if not a.codes:
+        ap.error("--codes is required")
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if a.amp == "auto":
         a.amp = ("bf16" if torch.cuda.is_bf16_supported() else "fp16") if dev.type == "cuda" else "none"
@@ -268,74 +344,67 @@ def main():
 
     # ------------------------------------------------------------------ data
     vae, ck, norm = T.load_ckpt(a.vae_ckpt, dev); vae.eval(); canon = not ck["args"].get("no_canon", False); K = vae.vq.K; n_null = len(ck["action_names"])
-    Xt, vt, _, _, dt = T.load_windows(os.path.join(a.data, "train_windows.npz")); Xv, vv, _, _, dtv = T.load_windows(os.path.join(a.data, "val_windows.npz"))
+    pt, pv = os.path.join(a.data, "train_windows.npz"), os.path.join(a.data, "val_windows.npz")
+    Xt, vt, _, _, dt = T.load_windows(pt); Xv, vv, _, _, dtv = T.load_windows(pv)
     zt = np.load(os.path.join(a.codes, "codes_train.npz")); zv = np.load(os.path.join(a.codes, "codes_val.npz"))
     codes_t, codes_v = zt["codes"].astype(np.int64), zv["codes"].astype(np.int64); chain_t, chain_v = zt["chain"].astype(np.int64), zv["chain"].astype(np.int64)
     if len(codes_t) != len(Xt) or len(codes_v) != len(Xv):
         sys.exit(f"codes ({len(codes_t)} / {len(codes_v)}) and windows ({len(Xt)} / {len(Xv)}) do not line up: export the codes from the same --data and --vae-ckpt")
     if a.max_windows:
-        m = a.max_windows; Xt, vt, codes_t, chain_t = Xt[:m], vt[:m], codes_t[:m], chain_t[:m]; mv = max(m // 8, 1000); Xv, vv, codes_v, chain_v = Xv[:mv], vv[:mv], codes_v[:mv], chain_v[:mv]
-    gt = T.goal_features(T.canonicalize(Xt), vt, dt); gv = T.goal_features(T.canonicalize(Xv), vv, dtv); gstats = T.goal_stats(gt)
+        m = a.max_windows; mv = max(m // 8, 1000)
+        Xt, vt, codes_t, chain_t = Xt[:m], vt[:m], codes_t[:m], chain_t[:m]; Xv, vv, codes_v, chain_v = Xv[:mv], vv[:mv], codes_v[:mv], chain_v[:mv]
+    gt = T.goal_features(T.canonicalize(Xt), vt, dt); gstats = T.goal_stats(gt)
     n = codes_t.shape[1]; Lw = a.windows; uni_val = T.unigram_ce(codes_t, codes_v, K); W = Xt.shape[1]
-    sc = TC.keys(gt)[:, 0]; share = np.bincount(sc, minlength=5) / len(sc)
+    p99 = float(np.percentile(gt[:, 3], 99)); probes = load_probes(a.probes)
     print(f"{len(codes_t)} train / {len(codes_v)} val windows, {n} codes each, K {K}, canonical {canon}, device {dev}, amp {a.amp}; unigram baseline {uni_val:.3f} nats")
-    print("windows by speed class: " + ", ".join(f"{c} {s * 100:.1f}%" for c, s in zip(TC.SPEED_CLASSES, share)) + f"   (speed_max {gstats['speed_max']:.2f} m/s)")
-    include_run = share[4] >= 0.005
-    if not include_run:
-        print("note: under 0.5% of the windows are running speed, so 'run' probes are skipped (the data can not teach it)")
+    print(f"window speeds (m/s): median {np.percentile(gt[:, 3], 50):.2f}, 90th {np.percentile(gt[:, 3], 90):.2f}, 99th {p99:.2f}; {len(probes)} probes in groups {sorted(set(p['group'] for p in probes))}")
     at_t, at_v = np.ones(len(codes_t), np.int64), np.ones(len(codes_v), np.int64)             # n_actions = 1: the label prefix is always the NULL token
 
     # ------------------------------------------------------------------ baseline: numeric goals
     if a.encoder == "goal":
-        gdir = os.path.join(a.out, "pilot_goal"); os.makedirs(gdir, exist_ok=True)
+        gv = T.goal_features(T.canonicalize(Xv), vv, dtv); gdir = os.path.join(a.out, "pilot_goal"); os.makedirs(gdir, exist_ok=True)
         ns = argparse.Namespace(prior_windows=Lw, prior_dim=a.dim, prior_layers=a.layers, prior_heads=a.heads, prior_dropout=a.dropout, prior_wd=a.wd, prior_lr=a.lr, prior_batch=a.batch,
                                 prior_epochs=a.epochs, prior_patience=a.patience, prior_cond_drop=0.0, prior_goal_drop=a.text_drop, prior_style_drop=0.0, prior_group_mask_win=0.0,
                                 prior_group_mask_seq=0.0, amp=a.amp, out=gdir)
         prior = T.train_prior(ns, dev, codes_t, codes_v, chain_t, chain_v, at_t, at_v, K, 1, ["null"], W // 2, dt, uni_val, gt, gv, gstats, None, None, None)
-        res = {"numeric_goal": []}
+        res, seen = {}, set()
         with torch.no_grad():
-            for sc_i, name in enumerate(TC.SPEED_CLASSES):
-                if name == "run" and not include_run:
+            for p in probes:                                                           # the same intents as the text probes, asked with numbers: turn 30 deg per window, the middle of the speed range
+                if p["speed"][0] > 1.1 * p99 or (p["sign"], tuple(p["speed"])) in seen:
                     continue
-                for sign in (0, 1, -1):
-                    if name == "stand" and sign != 0:
-                        continue
-                    torch.manual_seed(a.seed); spd = {"stand": 0.0, "slow": 0.5, "walk": 1.2, "fast": 2.0, "run": 3.0}[name]
-                    goals = T.plan_goals(prior, a.probe_n, a.probe_windows, 30.0 * sign, spd, dt, W, dev)
-                    codes = T.generate_codes(prior, torch.full((a.probe_n,), prior.NULL - prior.ACT0, device=dev), a.probe_windows, a.temperature, a.top_k, a.top_p, goals, None, a.cfg_scale)
-                    d, v = measure(vae, norm, canon, codes, n_null, dt, dev)
-                    res["numeric_goal"].append(dict(sign=sign, speed=name, text=f"goal {30 * sign} deg {spd} m/s", dyaw_deg=d[:, 1:].reshape(-1), speed_ms=v[:, 1:].reshape(-1)))
-        report(res, "numeric-goal prior (the upper bound for steering)")
+                seen.add((p["sign"], tuple(p["speed"]))); torch.manual_seed(a.seed); spd = 0.5 * (p["speed"][0] + min(p["speed"][1], 1.05 * p99))
+                goals = T.plan_goals(prior, a.probe_n, a.probe_windows, 30.0 * p["sign"], spd, dt, W, dev)
+                codes = T.generate_codes(prior, torch.full((a.probe_n,), prior.NULL - prior.ACT0, device=dev), a.probe_windows, a.temperature, a.top_k, a.top_p, goals, None, a.cfg_scale)
+                d, v = measure(vae, norm, canon, codes, n_null, dt, dev)
+                res.setdefault("numeric_goal", []).append(dict(sign=p["sign"], speed=p["speed"], text=f"goal turn {30 * p['sign']} deg, {spd:.2f} m/s", dyaw_deg=d[:, 1:].reshape(-1), speed_ms=v[:, 1:].reshape(-1)))
+        report(res, "numeric-goal prior: the upper bound for steering (same intents, asked with numbers)")
         if a.show_worst:
             show_worst(res)
         return
 
     # ------------------------------------------------------------------ captions + tables
-    strings_t, sid_t = TC.build(gt, a.variants, a.pool, a.p_corrupt, a.seed)
-    strings_v, sid_v = TC.build(gv, a.variants, a.pool, a.p_corrupt, a.seed + 1)           # validation captions come from their own pool (same vocabulary, other draws)
-    allstr = list(dict.fromkeys(strings_t + strings_v)); idx = {s_: i for i, s_ in enumerate(allstr)}
-    sid_t = np.array([idx[s_] for s_ in strings_t], np.int64)[sid_t]; sid_v = np.array([idx[s_] for s_ in strings_v], np.int64)[sid_v]
-    print(f"captions: {len(allstr)} distinct phrases; e.g. " + " | ".join(repr(allstr[i]) for i in np.random.RandomState(1).choice(len(allstr), 4, replace=False)))
     ck_in = torch.load(a.ckpt, map_location="cpu", weights_only=False) if a.ckpt else None
+    if a.captions:
+        strings, (sid_t, has_t), (sid_v, has_v), skipped = load_captions(a.captions, a.clip_map, vt, vv, a.min_cover, a.corrupt, a.seed)
+        print(f"captions: {len(strings)} distinct texts; {has_t.mean() * 100:.0f}% of train and {has_v.mean() * 100:.0f}% of val windows have text; {skipped} captions skipped for covering too little of their window; e.g. "
+              + " | ".join(repr(strings[i]) for i in np.random.RandomState(1).choice(len(strings), min(4, len(strings)), replace=False)))
+    else:
+        strings = ["x"]; sid_t, has_t = np.zeros((len(codes_t), 1), np.int64), np.ones(len(codes_t), bool); sid_v, has_v = np.zeros((len(codes_v), 1), np.int64), np.ones(len(codes_v), bool)
     e5_name = (ck_in or {}).get("e5_model") or a.e5_model
-    kind = "byte" if a.encoder == "byte" else "vec"
-    if ck_in is not None:
-        kind = ck_in["cfg"]["kind"]
+    kind = ck_in["cfg"]["kind"] if ck_in is not None else ("byte" if a.encoder == "byte" else "vec")
     if kind == "byte":
-        tab_np = byte_table(allstr); in_dim = 0
+        tab_np = byte_table(strings); in_dim = 0
         tab_fn = lambda s: torch.from_numpy(byte_table([s])[0]).long().to(dev)
     else:
-        tab_np = e5_table(allstr, e5_name, dev); in_dim = tab_np.shape[1]
-        probe_strings = [p["text"] for items in TC.probes(a.seed, include_run).values() for p in items]; probe_vecs = dict(zip(probe_strings, e5_table(probe_strings, e5_name, dev)))
-        tab_fn = lambda s: torch.from_numpy(probe_vecs[s]).float().to(dev)
+        tab_np = e5_table(strings, e5_name, dev); in_dim = tab_np.shape[1]
+        pv_ = dict(zip([p["text"] for p in probes], e5_table([p["text"] for p in probes], e5_name, dev)))
+        tab_fn = lambda s: torch.from_numpy(pv_[s]).float().to(dev)
     tab = torch.from_numpy(tab_np).to(dev)
     Tt = torch.from_numpy(T.make_prior_tokens(codes_t, chain_t, at_t, Lw, K, 1)).to(dev); Tv = torch.from_numpy(T.make_prior_tokens(codes_v, chain_v, at_v, Lw, K, 1)).to(dev)
-    wi_t, ok_t = make_slots(chain_t, Lw); wi_v, ok_v = make_slots(chain_v, Lw)
+    wi_t, ok_t = make_slots(chain_t, Lw); wi_v, ok_v = make_slots(chain_v, Lw); ok_t &= has_t[wi_t]; ok_v &= has_v[wi_v]
     Dt = dict(WI=torch.from_numpy(wi_t).to(dev), OK=torch.from_numpy(ok_t).to(dev), SID=torch.from_numpy(sid_t).to(dev), TAB=tab, kind=kind)
     Dv = dict(WI=torch.from_numpy(wi_v).to(dev), OK=torch.from_numpy(ok_v).to(dev), SID=torch.from_numpy(sid_v).to(dev), TAB=tab, kind=kind)
-    cfg = dict(K=K, n_actions=1, n=n, windows=Lw, d=a.dim, layers=a.layers, heads=a.heads, dropout=a.dropout, kind=kind, in_dim=in_dim)
-    if ck_in is not None:
-        cfg = ck_in["cfg"]
+    cfg = ck_in["cfg"] if ck_in is not None else dict(K=K, n_actions=1, n=n, windows=Lw, d=a.dim, layers=a.layers, heads=a.heads, dropout=a.dropout, kind=kind, in_dim=in_dim)
     prior = TextCodePrior(**cfg).to(dev); npar = sum(p.numel() for p in prior.parameters())
     print(f"text prior ({a.encoder if not ck_in else 'from ' + a.ckpt}): {npar / 1e6:.2f} M parameters, {len(Tt)} train / {len(Tv)} val sequences of up to {Lw} windows")
 
@@ -348,15 +417,13 @@ def main():
         prior.load_state_dict(ck_in["model"])
     prior.eval()
 
-    # ------------------------------------------------------------------ test 1: is the text used?
+    # ------------------------------------------------------------------ test 1: is the text used?   test 2: steering
     tr, sh, nu = (eval_nll(prior, Tv, Dv, a, dev, m) for m in ("true", "shuffled", "null"))
-    print(f"\n1  text is used?   val nll per code: true phrase {tr:.3f} | phrase of another sequence {sh:.3f} | no text {nu:.3f} | unigram {uni_val:.3f}")
-    print(f"   -> {'YES: the true phrase is worth ' + format(sh - tr, '.3f') + ' nats over a wrong one' if sh - tr > 0.03 else 'NO (or barely): a wrong phrase is as good as the right one: the encoder is not being used'}")
-
-    # ------------------------------------------------------------------ tests 2-4: steering
-    res = run_probes(a, dev, prior, vae, norm, canon, dt, n_null, tab_fn, include_run)
-    sm = report(res, "2-4  steering: how often the decoded windows did what the phrase asked (probe phrases are typed once and repeated in every window)")
-    print("   2 = in_vocab, 3 = raw, 4 = unseen_speed / unseen_turn / unseen_both / unseen_dir.  Chance is about 33% for turn (left / right / straight) and 20-25% for speed.")
+    print(f"\n1  text is used?   val nll per code: true text {tr:.3f} | text of another sequence {sh:.3f} | no text {nu:.3f} | unigram {uni_val:.3f}")
+    print(f"   -> {'YES: the true text is worth ' + format(sh - tr, '.3f') + ' nats over a wrong one' if sh - tr > 0.03 else 'NO (or barely): a wrong text is as good as the right one: the encoder is not being used'}")
+    res = run_probes(a, dev, prior, vae, norm, canon, dt, n_null, tab_fn, probes, p99)
+    sm = report(res, "2  steering: how often the decoded windows did what the phrase asked (each probe phrase is repeated in every window)")
+    print("   chance is about 33% for turn (left / right / straight); compare with the numeric-goal run (--encoder goal) for the ceiling.")
     if a.show_worst:
         show_worst(res)
     json.dump(dict(encoder=a.encoder, nll=dict(true=tr, shuffled=sh, null=nu, unigram=uni_val), steering=sm), open(os.path.join(a.out, f"pilot_{a.encoder}.json"), "w"), indent=1)
