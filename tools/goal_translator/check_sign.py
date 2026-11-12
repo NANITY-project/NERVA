@@ -36,7 +36,7 @@ def body_frame_lateral(a):
 
 def check_clips(actions, offsets, W=64, stride=16, dt=1 / 30.0, verbose=True):
     lat_ok = lat_n = 0
-    sign_ok = sign_n = 0
+    sign_ok = sign_n = excluded = 0
     margin = []
     for i in range(len(offsets) - 1):
         a = actions[offsets[i]:offsets[i + 1]]
@@ -46,9 +46,11 @@ def check_clips(actions, offsets, W=64, stride=16, dt=1 / 30.0, verbose=True):
         d = L - R                                        # > 0 when footL is to the +x side of footR
         lat_ok += int((d > 0).sum()); lat_n += len(d); margin.append(float(np.median(d)))
         g = B.window_goals_from_pelvis(a[:, 0], a[:, 2], a[:, 3], W, stride, dt)
-        m = (np.abs(g[:, 0]) > 0.1) & (g[:, 3] > 0.2)
+        turning = (np.abs(g[:, 0]) > 0.1) & (g[:, 3] > 0.2)
+        m = turning & (g[:, 2] > 0.2)                    # FORWARD-moving turning windows only: walking backward or sideways while turning breaks the yaw <-> sideways relation (100STYLE has both)
+        excluded += int((turning & ~m).sum())
         sign_ok += int((np.sign(g[m, 0]) == np.sign(g[m, 1])).sum()); sign_n += int(m.sum())
-    res = dict(foot_frac=lat_ok / max(lat_n, 1), foot_n=lat_n, foot_margin=float(np.median(margin)) if margin else float("nan"), turn_frac=sign_ok / max(sign_n, 1), turn_n=sign_n)
+    res = dict(foot_frac=lat_ok / max(lat_n, 1), foot_n=lat_n, foot_margin=float(np.median(margin)) if margin else float("nan"), turn_frac=sign_ok / max(sign_n, 1), turn_n=sign_n, turn_excluded=excluded)
     return res
 
 
@@ -110,7 +112,7 @@ def main():
         W, stride, dt = int(a.timing.split(",")[0]), int(a.timing.split(",")[1]), float(a.timing.split(",")[2])
     res = check_clips(A, off, W, stride, dt)
     print(f"{len(off) - 1} clips: footL on the +x side of footR in {100 * res['foot_frac']:.1f} % of {res['foot_n']} frames (median gap {res['foot_margin']:+.3f} m); "
-          f"dyaw > 0 moves toward +x in {100 * res['turn_frac']:.1f} % of {res['turn_n']} turning windows")
+          f"dyaw > 0 moves toward +x in {100 * res['turn_frac']:.1f} % of {res['turn_n']} forward-moving turning windows ({res['turn_excluded']} backward / sideways turning windows left out)")
     problems = judge(res)
     if a.clip is not None:
         dyaw, dside = clip_direction(A[off[a.clip]:off[a.clip + 1]])
